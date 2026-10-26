@@ -95,6 +95,25 @@ The core of idexal OS is released under the **MIT License** — see [LICENSE](LI
 Content under the `ee/` directory is governed by the idexal OS Enterprise
 Edition license. Third-party components keep their original licenses.
 
+
+## Documentation
+
+The platform's contracts â€” the parts an integrator, an operator or a contributor
+needs to know exactly â€” are documented in [`docs/`](./docs/README.md):
+
+| Document | Covers |
+| --- | --- |
+| [Getting Started](./docs/getting-started.md) | Install, choose a mode, first workspace |
+| [Architecture](./docs/architecture.md) | How the desktop, platform and MCP gateway fit together |
+| [Sync Contract](./docs/sync-contract.md) | When and why a desktop re-reads its inventory |
+| [Hybrid Combos](./docs/hybrid-combos.md) | One model id routing across several providers |
+| [Numerals Policy](./docs/numerals-policy.md) | Why numbers render with Latin digits everywhere |
+| [Extension Catalog](./docs/extension-catalog.md) | How connectors, skills and plugins reach the app |
+| [Self-Hosting](./docs/self-hosting.md) | Running the platform on your own infrastructure |
+| [Release Process](./docs/release-process.md) | How a release is built, signed and published |
+| [Roadmap](./docs/roadmap.md) | What is being considered, and how to influence it |
+| [Contributing](./docs/contributing.md) | How to propose a change |
+| [FAQ](./docs/faq.md) | The questions we are asked most |
 ## Community
 
 - 🐞 [Report a bug or request a feature](https://github.com/idexal/idexal-OS/issues)
