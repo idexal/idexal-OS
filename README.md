@@ -4,7 +4,7 @@
 
 # idexal OS
 
-**A free, open-source desktop app for doing real work with AI agents — on your own files.**
+**A desktop app for doing real work with AI agents — on your own files.**
 
 Local-first by default. Cloud when you want it. Runs any model from 50+ providers.
 
