@@ -6,8 +6,8 @@ idexal Os renders numbers with **plain ASCII digits and Latin separators** in
 every language and on every surface.
 
 ```text
-9,073,504      â† what we render
-Ù©Ù¬Ù Ù§Ù£Ù¬Ù¥Ù Ù¤      â† what we never render
+9,073,504      ← what we render
+٩٬٠٧٣٬٥٠٤      ← what we never render
 ```
 
 This is not a localisation bug; it is a deliberate policy.
@@ -23,9 +23,9 @@ number that a user copies into an issue should paste as the digits they saw.
 
 Almost everything:
 
-- **Text** â€” labels, headings, messages.
-- **Dates** â€” order, weekday names, month names.
-- **Currency** â€” symbol and placement.
+- **Text** — labels, headings, messages.
+- **Dates** — order, weekday names, month names.
+- **Currency** — symbol and placement.
 
 Only the **digit shape** is pinned. Separators follow the pinned numbering
 system so grouping stays consistent.
@@ -37,8 +37,8 @@ system so grouping stays consistent.
 All formatted numbers go through `number_format`. Two helpers are the only code
 that touches currency and counts:
 
-- `money()` â€” currency amounts.
-- `compact_number()` â€” abbreviated counts (`1.2K`).
+- `money()` — currency amounts.
+- `compact_number()` — abbreviated counts (`1.2K`).
 
 A test asserts that no other path formats a number.
 

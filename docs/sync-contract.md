@@ -9,7 +9,7 @@ Every admin write that can change what a desktop may offer advances a single
 shared *inventory revision*. A desktop compares that revision on a schedule and
 subscribes to an event stream so it reacts immediately. When the revision
 differs from the last one it synced, it reloads its inventory. When it has not
-synced for longer than a maximum age, it reloads anyway â€” so a change the
+synced for longer than a maximum age, it reloads anyway — so a change the
 platform could not attribute still arrives.
 
 ## What the desktop reads
@@ -49,7 +49,7 @@ When the shared sequence moves, the server emits:
 
 ```text
 event: inventory.changed
-data: {"action":"provider.updated","revision":"d41d8â€¦"}
+data: {"action":"provider.updated","revision":"d41d8…"}
 ```
 
 A running app reacts without waiting out its poll interval. The stream is an
@@ -74,7 +74,7 @@ Every admin write path below announces on the shared sequence:
 
 ## Why a shared sequence, not timestamps
 
-A deletion can leave a table's newest `updated_at` unchanged â€” the row that
+A deletion can leave a table's newest `updated_at` unchanged — the row that
 disappeared no longer contributes a timestamp. A sequence that every write
 advances catches deletions that a timestamp-only scheme misses. This is the
 reason the design exists in this shape; see below for the bug that proved the
@@ -84,7 +84,7 @@ point.
 
 On the production cache store (the database), an increment against a **missing**
 key returned `false` and left the key missing rather than starting it at zero.
-The sequence therefore never existed, so the first change â€” and every change â€”
+The sequence therefore never existed, so the first change — and every change —
 was invisible. The sequence is now seeded with an atomic add before it is
 incremented, and a cold-cache regression test keeps it that way.
 

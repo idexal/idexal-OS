@@ -7,7 +7,7 @@ publishes them with the updater manifests.
 ## The pipeline
 
 ```text
-tag â”€â”€â–¶ build â”€â”€â–¶ sign / notarise â”€â”€â–¶ publish assets â”€â”€â–¶ latest*.yml + SHA256SUMS
+tag ──▶ build ──▶ sign / notarise ──▶ publish assets ──▶ latest*.yml + SHA256SUMS
 ```
 
 ## Assets and naming
@@ -37,8 +37,8 @@ manifest for its platform:
 
 | Channel | Base | Manifest |
 | --- | --- | --- |
-| stable | `â€¦/desktop` | `latest.yml` / `latest-mac.yml` |
-| targeted | `â€¦/desktop/v<version>` | the same manifest, in that version's folder |
+| stable | `…/desktop` | `latest.yml` / `latest-mac.yml` |
+| targeted | `…/desktop/v<version>` | the same manifest, in that version's folder |
 
 A *targeted* feed lets a client move to a specific version, which is what the
 recovery path uses.

@@ -24,8 +24,8 @@ treated as a defect.
 ## How a catalog entry reaches a desktop
 
 ```text
-extensions-catalog  â”€â”€â–¶  platform catalog snapshot  â”€â”€â–¶  desktop library
-        â”‚                          â”‚                          â”‚
+extensions-catalog  ──▶  platform catalog snapshot  ──▶  desktop library
+        │                          │                          │
    entry identity          marketplace revision       install / uninstall
    (slug, type, version)   (feeds the inventory       keyed on the slug
                             revision)
@@ -39,13 +39,13 @@ an edit.
 
 An organisation can assign entries centrally. A member then sees exactly the
 assigned set, and the desktop inventory carries it. Because assignment is an
-admin write, it announces itself on the sync sequence â€” see
+admin write, it announces itself on the sync sequence — see
 [Sync Contract](./sync-contract.md).
 
 ## Authoring an entry
 
 Start from the catalog's
-[submission guidelines](https://github.com/idexal/extensions-catalog/blob/main/docs/README.md/Submitting-Entries).
+[submission guidelines](https://github.com/idexal/extensions-catalog/blob/main/docs/submitting-entries.md).
 In short:
 
 1. Give the entry a unique, lowercase, dash-separated slug.

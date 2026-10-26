@@ -1,6 +1,6 @@
 # Hybrid Combos
 
-A **hybrid combo** â€” a *combo* â€” is a model that is defined as a set of other
+A **hybrid combo** — a *combo* — is a model that is defined as a set of other
 models plus a routing strategy. To a client it is a single model id; underneath
 it is several providers.
 
@@ -42,7 +42,7 @@ Both rules keep resolution a single hop and keep ids unambiguous.
 
 While a combo exists, its **member models are hidden from the catalog**. A client
 that asks for a member by name gets the combo's routing instead. When the combo
-is deleted the members return automatically â€” nothing about them was mutated;
+is deleted the members return automatically — nothing about them was mutated;
 they were only claimed by the combo.
 
 ## Client expectations
@@ -63,6 +63,6 @@ they were only claimed by the combo.
 
 ## Related reading
 
-- [Sync Contract](./sync-contract.md) â€” how a combo change reaches a desktop.
-- [Extension Catalog](./extension-catalog.md) â€” how models are surfaced alongside
+- [Sync Contract](./sync-contract.md) — how a combo change reaches a desktop.
+- [Extension Catalog](./extension-catalog.md) — how models are surfaced alongside
   skills and connectors.

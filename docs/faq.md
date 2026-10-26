@@ -21,14 +21,14 @@ model id route across several providers.
 Three common causes, in order:
 
 1. Your plan or organisation does not entitle you to it.
-2. A combo claimed it â€” member models are hidden while the combo exists.
+2. A combo claimed it — member models are hidden while the combo exists.
 3. Your inventory is stale; the revision has not been re-read yet. See
    [Sync Contract](./sync-contract.md).
 
 ### I changed something in the admin console and nothing happened.
 
 If the desktop is running, it should react within seconds. If it does not, the
-write path may be silent â€” that is a bug. Confirm the inventory revision moves:
+write path may be silent — that is a bug. Confirm the inventory revision moves:
 
 ```bash
 curl -fsS -H "Authorization: Bearer $TOKEN" \

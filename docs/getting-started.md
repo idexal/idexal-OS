@@ -28,7 +28,7 @@ credential scoped to your account and organisation.
 
 ## 3. Add at least one model
 
-If you run against a platform, models arrive with your entitlements â€” open the
+If you run against a platform, models arrive with your entitlements — open the
 model picker and they are already there. If you run desktop-only, add a provider
 in settings and supply the key locally.
 
@@ -57,7 +57,7 @@ centrally so every member sees the same set.
 
 ## Next
 
-- [Sync Contract](./sync-contract.md) â€” when and why the desktop re-reads its
+- [Sync Contract](./sync-contract.md) — when and why the desktop re-reads its
   inventory.
-- [Self-Hosting](./self-hosting.md) â€” run the platform on your own infrastructure.
-- [FAQ](./faq.md) â€” the questions we are asked most.
+- [Self-Hosting](./self-hosting.md) — run the platform on your own infrastructure.
+- [FAQ](./faq.md) — the questions we are asked most.
