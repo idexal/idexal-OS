@@ -1,7 +1,7 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/idexal/idexal-OS/main/light_logo_idexal.png
-" alt="idexal OS" width="96" height="96" />
+<img src="[https://raw.githubusercontent.com/idexal/idexal-OS/main/light_logo_idexal.png
+"](https://raw.githubusercontent.com/idexal/idexal-OS/refs/heads/main/light_logo_idexal.png) alt="idexal OS" width="96" height="96" />
 
 # idexal OS
 
