@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/idexal/idexal-OS/main/light_logo_idexal.png" alt="idexal OS" width="100%" height="120" />
+<img src="https://raw.githubusercontent.com/idexal/idexal-OS/main/light_logo_idexal.png" alt="idexal OS" height="120" />
 
 # idexal OS
 
