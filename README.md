@@ -20,12 +20,11 @@ Local-first by default. Cloud when you want it. Runs any model from 50+ provider
 
 ## What is idexal OS?
 
-idexal OS is an open-source workspace where AI agents work directly on the files
+idexal OS is an workspace where AI agents work directly on the files
 already on your computer. Chat with any model, point it at a folder, and let it
 read, write, run commands, browse the web, and follow your own reusable skills —
 without shipping your data to a cloud you did not choose.
 
-It is built on [OpenCode](https://opencode.ai) and ships three surfaces:
 
 | Surface | What it gives you |
 | --- | --- |
