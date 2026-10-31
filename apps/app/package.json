@@ -71,7 +71,7 @@
     "marked": "^17.0.1",
     "marked-emoji": "^2.0.3",
     "marked-katex-extension": "^5.1.10",
-    "mermaid": "^11.17.1",
+    "mermaid": "^12.2.0",
     "motion": "^12.38.0",
     "react": "catalog:",
     "react-dom": "catalog:",
