@@ -1,0 +1,10 @@
+extends: electron-builder.yml
+appId: com.idexal.os.demo.consumer
+productName: idexal Os Demo B
+protocols: []
+directories:
+  output: dist-electron-demo-b
+mac:
+  identity: null
+  target:
+    - dir

@@ -1,0 +1,306 @@
+import { DateTime } from "luxon"
+import { TypeID, typeid } from "typeid-js"
+import { v7 as uuidv7 } from "uuid"
+import { z } from "zod"
+
+export const TYPE_ID_SUFFIX_LENGTH = 26
+
+const BASE32_REGEX = /^[0-9a-hjkmnp-tv-z]+$/
+
+// TypeID prefixes are persisted in DB rows; append new entries instead of changing existing values.
+export const idTypesMapNameToPrefix = {
+  request: "req",
+  user: "usr",
+  session: "ses",
+  account: "acc",
+  verification: "ver",
+  apiKey: "apk",
+  rateLimit: "rli",
+  org: "org",
+  organization: "org",
+  orgMembership: "om",
+  member: "om",
+  invitation: "inv",
+  team: "tem",
+  teamMember: "tmb",
+  configObject: "cob",
+  configObjectVersion: "cov",
+  configObjectAccessGrant: "coa",
+  plugin: "plg",
+  pluginConfigObject: "pco",
+  pluginAccessGrant: "pag",
+  marketplace: "mkt",
+  marketplacePlugin: "mkp",
+  marketplaceAccessGrant: "mag",
+  connectorAccount: "cac",
+  connectorInstance: "cin",
+  connectorInstanceAccessGrant: "cia",
+  connectorTarget: "ctg",
+  connectorMapping: "cmp",
+  connectorSyncEvent: "cse",
+  connectorSourceBinding: "csb",
+  connectorSourceTombstone: "cst",
+  llmProvider: "lpr",
+  llmProviderModel: "lpm",
+  llmProviderAccess: "lpa",
+  llmProviderMemberCredential: "lpc",
+  desktopPolicy: "dpo",
+  desktopPolicyMember: "dpm",
+  organizationRole: "orl",
+  orgSubscription: "osub",
+  scimProvider: "scp",
+  scimGroup: "scg",
+  scimGroupMember: "sgm",
+  scimGroupRole: "sgr",
+  scimGroupRoleGrant: "sgg",
+  scimUserTombstone: "sut",
+  ssoConnection: "ssc",
+  ssoProvider: "ssp",
+  externalIdentity: "xid",
+  scimSyncEvent: "sse",
+  oauthClient: "ocl",
+  oauthAccessToken: "oat",
+  oauthRefreshToken: "ort",
+  oauthConsent: "ocn",
+  inferenceKey: "ink",
+  inferenceOrgLimitPolicy: "iolp",
+  inferenceOrgUsageBucket: "ioub",
+  inferenceOrgProviderKey: "iopk",
+  inferenceRequest: "ireq",
+  inferenceUsageLedgerEntry: "iule",
+  inferenceUsageLedgerBucketCharge: "iulc",
+  inferenceModelAlias: "ima",
+  adminAllowlist: "aal",
+  worker: "wrk",
+  workerInstance: "wki",
+  daytonaSandbox: "dts",
+  cloudRuntimeInstance: "cri",
+  workerToken: "wkt",
+  workerBundle: "wkb",
+  automation: "atm",
+  automationRevision: "atv",
+  automationRun: "atr",
+  automationRunEvent: "ate",
+  automationThread: "ath",
+  remoteSessionCommand: "rsc",
+  remoteSessionRequest: "rsr",
+  codemodeRun: "cmr",
+  workflowRun: "wfr",
+  artifactView: "arv",
+  artifactViewRevision: "avr",
+  auditEvent: "aev",
+  telemetryEvent: "tev",
+  telemetrySessionDimension: "tsd",
+  workspaceBootstrap: "wbt",
+  workspaceClaim: "wcl",
+  installLink: "inl",
+  orgOAuthClient: "ooc",
+  connectedAccount: "cta",
+  externalMcpConnection: "emc",
+  externalMcpConnectionAccessGrant: "emg",
+  pluginMcpRequirementBinding: "pmr",
+
+
+  tempFile: "tmpf",
+  inferenceProvider: "ipr",
+  inferenceProviderModel: "ipm",
+  inferenceProviderCredential: "ipc",
+  inferenceProviderAccess: "ipa",
+  inferenceProviderOauthState: "ipos",
+  inferenceRequestLog: "irl",
+  inferenceUsageRollup: "iur",
+  gatewayKey: "gky",
+  gatewayModelGroup: "gmg",
+  gatewayModelGroupModel: "gmm",
+  gatewayCredentialSet: "gcs",
+  organizationWebOrigin: "owo",
+  deviceCode: "dvc",
+  workspaceClaimCode: "wcc",
+  auditOperation: "aop",
+  auditEventResource: "aer",
+  auditUsageFact: "auf",
+  platformAuditEvent: "pae",
+  permissionSet: "pms",
+  permissionSetPermission: "psp",
+  permissionSetTeam: "pst",
+  capabilityUsageEvent: "cue",
+  capabilityUsageRollup: "cur",
+  agentPermissionPolicy: "agp",
+  agentPermissionSetting: "aps",
+  orgDefaultModel: "odm",
+} as const
+
+export const denTypeIdPrefixes = idTypesMapNameToPrefix
+
+type IdTypesMapNameToPrefix = typeof idTypesMapNameToPrefix
+type IdTypesMapPrefixToName = {
+  [K in keyof IdTypesMapNameToPrefix as IdTypesMapNameToPrefix[K]]: K
+}
+
+const idTypesMapPrefixToName = Object.fromEntries(
+  Object.entries(idTypesMapNameToPrefix).map(([name, prefix]) => [prefix, name]),
+) as IdTypesMapPrefixToName
+
+export type IdTypePrefixNames = keyof typeof idTypesMapNameToPrefix
+export type DenTypeIdName = IdTypePrefixNames
+export type TypeId<T extends IdTypePrefixNames> = `${IdTypesMapNameToPrefix[T]}_${string}`
+export type DenTypeId<TName extends DenTypeIdName> = TypeId<TName>
+
+type TypeIdSchema<T extends IdTypePrefixNames> = z.ZodType<TypeId<T>, string>
+
+const schemaCache = new Map<IdTypePrefixNames, z.ZodType<string, string>>()
+
+function acceptedTypeIdPrefixes(name: IdTypePrefixNames): readonly string[] {
+  const prefix = idTypesMapNameToPrefix[name]
+  return name === "workflowRun" ? [prefix, idTypesMapNameToPrefix.codemodeRun] : [prefix]
+}
+
+function isTypeIdPrefix(prefix: string): prefix is keyof IdTypesMapPrefixToName {
+  return Object.hasOwn(idTypesMapPrefixToName, prefix)
+}
+
+const buildTypeIdSchema = <const T extends IdTypePrefixNames>(prefix: T): TypeIdSchema<T> => {
+  const expectedPrefix = idTypesMapNameToPrefix[prefix]
+  const expectedLength = TYPE_ID_SUFFIX_LENGTH + expectedPrefix.length + 1
+  const acceptedPrefixes = acceptedTypeIdPrefixes(prefix)
+
+  return z
+    .string()
+    .length(expectedLength, {
+      message: `TypeID must be ${expectedLength} characters (${expectedPrefix}_<26 char suffix>)`,
+    })
+    .refine(
+      (input) => acceptedPrefixes.some((acceptedPrefix) => input.startsWith(`${acceptedPrefix}_`)),
+      { message: `TypeID must start with '${expectedPrefix}_'` },
+    )
+    .refine(
+      (input) => {
+        const separator = input.indexOf("_")
+        const suffix = input.slice(separator + 1)
+        return BASE32_REGEX.test(suffix)
+      },
+      { message: "TypeID suffix contains invalid base32 characters" },
+    )
+    .refine(
+      (input) => {
+        try {
+          TypeID.fromString(input)
+          return true
+        } catch {
+          return false
+        }
+      },
+      { message: "TypeID is structurally invalid" },
+    )
+    .transform((input) => TypeID.fromString(input).toString() as TypeId<T>)
+}
+
+const typeIdZodSchema = <const T extends IdTypePrefixNames>(prefix: T): TypeIdSchema<T> => {
+  let schema = schemaCache.get(prefix)
+  if (!schema) {
+    schema = buildTypeIdSchema(prefix)
+    schemaCache.set(prefix, schema)
+  }
+  return schema as TypeIdSchema<T>
+}
+
+const typeIdGenerator = <const T extends IdTypePrefixNames>(
+  prefix: T,
+) => typeid(idTypesMapNameToPrefix[prefix]).toString() as TypeId<T>
+
+const validateTypeId = <const T extends IdTypePrefixNames>(
+  prefix: T,
+  data: unknown,
+): data is TypeId<T> => typeIdZodSchema(prefix).safeParse(data).success
+
+function inferTypeId<T extends keyof IdTypesMapPrefixToName>(
+  input: `${T}_${string}`,
+): IdTypesMapPrefixToName[T]
+function inferTypeId(input: string): DenTypeIdName
+function inferTypeId(input: string): DenTypeIdName {
+  const parsed = TypeID.fromString(input)
+  const rawPrefix = parsed.getType()
+  if (!isTypeIdPrefix(rawPrefix)) {
+    throw new Error(
+      `Unknown TypeID prefix '${rawPrefix}'. Registered prefixes: ${Object.keys(idTypesMapPrefixToName).join(", ")}`,
+    )
+  }
+
+  return idTypesMapPrefixToName[rawPrefix]
+}
+
+const typeIdFromString = <const T extends IdTypePrefixNames>(
+  typeName: T,
+  input: string,
+): TypeId<T> => {
+  const parsed = TypeID.fromString(input)
+  const expectedPrefix = idTypesMapNameToPrefix[typeName]
+  const actualPrefix = parsed.getType()
+
+  if (!acceptedTypeIdPrefixes(typeName).includes(actualPrefix)) {
+    throw new Error(
+      `TypeID prefix mismatch: expected '${expectedPrefix}' but got '${actualPrefix}'`,
+    )
+  }
+
+  return parsed.toString() as TypeId<T>
+}
+
+const typeIdWithTimestamp = <const T extends IdTypePrefixNames>(
+  typeName: T,
+  timestamp?: Date | number,
+): TypeId<T> => {
+  let msecs: number
+
+  if (timestamp === undefined) {
+    msecs = DateTime.now().toMillis()
+  } else if (timestamp instanceof Date) {
+    msecs = timestamp.getTime()
+  } else {
+    msecs = timestamp
+  }
+
+  if (!Number.isFinite(msecs)) {
+    throw new Error(`Invalid timestamp: expected finite number, got ${msecs}`)
+  }
+  if (msecs < 0) {
+    throw new Error(`Invalid timestamp: expected non-negative number, got ${msecs}`)
+  }
+
+  const uuid = uuidv7({ msecs })
+  const prefix = idTypesMapNameToPrefix[typeName]
+  return TypeID.fromUUID(prefix, uuid).toString() as TypeId<T>
+}
+
+const getColumnLength = <const T extends IdTypePrefixNames>(typeName: T) =>
+  idTypesMapNameToPrefix[typeName].length + 1 + TYPE_ID_SUFFIX_LENGTH
+
+export const typeId = {
+  schema: typeIdZodSchema,
+  generator: typeIdGenerator,
+  generatorWithTimestamp: typeIdWithTimestamp,
+  validator: validateTypeId,
+  infer: inferTypeId,
+  fromString: typeIdFromString,
+  suffixLength: TYPE_ID_SUFFIX_LENGTH,
+  prefix: idTypesMapNameToPrefix,
+  columnLength: getColumnLength,
+}
+
+export function createDenTypeId<TName extends DenTypeIdName>(name: TName): DenTypeId<TName> {
+  return typeId.generator(name)
+}
+
+export function normalizeDenTypeId<TName extends DenTypeIdName>(
+  name: TName,
+  value: string,
+): DenTypeId<TName> {
+  return typeId.fromString(name, value)
+}
+
+export function isDenTypeId<TName extends DenTypeIdName>(
+  name: TName,
+  value: unknown,
+): value is DenTypeId<TName> {
+  return typeId.validator(name, value)
+}

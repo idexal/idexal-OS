@@ -1,0 +1,72 @@
+The idexal Os Enterprise Edition (EE) License (the "EE License")
+Copyright (c) 2026-present Idexal, Inc.
+
+With regard to the idexal Os Software in this directory:
+
+This software and associated documentation files (the "Software") may only
+be used in production if you (and any entity that you represent) hold a
+valid idexal Os subscription for the correct number of users, as set out in
+the idexal Os Subscription Terms available at
+https://os.idexal.com/terms/subscription, or another written agreement
+between you and Idexal, Inc. governing the use of the Software.
+
+No subscription is required for the following uses:
+
+  (a) production use by an organization with up to five (5) total users
+      of the Software, excluding the Enterprise Features (as defined in
+      the idexal Os Subscription Terms);
+
+  (b) internal evaluation of the Software for a period of up to thirty
+      (30) days from first deployment, regardless of user count, or such
+      longer period as Idexal, Inc. agrees to in writing; and
+
+  (c) use for development and testing purposes.
+
+Subject to the foregoing, you are free to modify the Software and publish
+patches to the Software. You agree that Idexal, Inc. and/or its
+licensors (as applicable) retain all right, title and interest in and to
+all such modifications and/or patches, and all such modifications and/or
+patches may only be used, copied, modified, displayed, distributed, or
+otherwise exploited in accordance with this EE License, including, where
+applicable, a valid idexal Os subscription for the correct number of users.
+You are not granted any other rights beyond what is expressly stated
+herein. Subject to the foregoing, it is forbidden to copy, merge, publish,
+distribute, sublicense, and/or sell the Software.
+
+You must not remove or alter any copyright, license, or other proprietary
+notices provided in or with the Software. Except for identifying
+Idexal, Inc. as the origin of the Software, you have no right under
+this EE License to use Idexal's trademarks, trade names, service
+marks, or product names.
+
+Grant of Future License: Idexal, Inc. hereby irrevocably grants you
+an additional license to use each version of the Software under the MIT
+license, effective on the second anniversary of the date that version of
+the Software is first made publicly available. On or after that date, you
+may use that version of the Software under the MIT license.
+
+This EE License applies only to the part of this Software that is not
+distributed as part of the MIT-licensed portions of idexal Os. Any part of
+this Software that is served client-side as an image, font, cascading
+style sheet (CSS), or file which produces or is compiled, arranged,
+augmented, or combined into client-side JavaScript, in whole or in part,
+is licensed under the MIT license. The full text of this EE License shall
+be included in all copies or substantial portions of the Software.
+
+Software distributed under a prior license of Idexal, Inc.
+(including the Functional Source License, Version 1.1, MIT Future License)
+remains governed by the license under which that version was distributed.
+This EE License applies to versions of the Software made available on or
+after the date this file is added to the repository.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+For all third party components incorporated into the idexal Os Software,
+those components are licensed under the original license provided by the
+owner of the applicable component.

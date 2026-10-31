@@ -1,0 +1,24 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: idexal-os-den-allow-eval-mock-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: idexal-os-ee
+      app.kubernetes.io/instance: idexal-os-ee
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values:
+          - den-api
+          - den-web
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: ${IDEXAL_EVAL_KUBE_ALLOWED_HOST_IP}/32
+      ports:
+        - protocol: TCP
+          port: ${IDEXAL_EVAL_KUBE_ALLOWED_MOCK_PORT}

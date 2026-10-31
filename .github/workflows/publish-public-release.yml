@@ -1,0 +1,359 @@
+# Publish a public release to the distribution repository.
+#
+# This workflow runs in the source repository, builds signed/ready artifacts
+# per platform, renames them to the stable public convention, and publishes a
+# GitHub Release on idexal/idexal-OS.
+#
+# Public asset convention:
+#   macOS   idexal-OS-<version>.dmg
+#           idexal-OS-<version>-mac.zip
+#           latest-mac.yml
+#   Windows idexal-OS-Setup-<version>.exe
+#           idexal-OS-Setup-<version>-arm64.exe
+#           latest.yml
+#   Linux   idexal-OS-<version>.AppImage
+#           idexal-OS-<version>.deb
+#           idexal-OS-<version>.rpm
+#           idexal-OS-<version>-linux.tar.gz
+#           idexal-os-server-linux-x64-<version>.tar.gz
+#
+# Requires a `RELEASE_TOKEN` secret: a fine-grained PAT with `contents: write`
+# on idexal/idexal-OS (and read access to this source repository).
+
+name: Publish Public Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (X.Y.Z). Defaults to apps/desktop/package.json.'
+        required: false
+        type: string
+      prerelease:
+        description: 'Mark the release as a prerelease.'
+        required: false
+        type: boolean
+        default: false
+      draft:
+        description: 'Create the release as a draft.'
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-public-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.flags.outputs.prerelease }}
+      draft: ${{ steps.flags.outputs.draft }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version and tag
+        id: version
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(node -p "require('./apps/desktop/package.json').version")"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version ${VERSION}"
+
+      - name: Resolve release flags
+        id: flags
+        run: |
+          set -euo pipefail
+          PRERELEASE="${{ github.event.inputs.prerelease }}"
+          DRAFT="${{ github.event.inputs.draft }}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # Tags that carry a hyphen (v1.2.3-rc.1) are prereleases by convention.
+            case "${GITHUB_REF_NAME}" in *-*) PRERELEASE="true";; esac
+          fi
+          echo "prerelease=${PRERELEASE:-false}" >> "$GITHUB_OUTPUT"
+          echo "draft=${DRAFT:-false}" >> "$GITHUB_OUTPUT"
+
+  macos:
+    name: Build macOS
+    needs: resolve
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.4.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build and package (dmg + zip)
+        env:
+          CSC_LINK: ${{ secrets.APPLE_CODESIGN_CERT_P12_BASE64 }}
+          CSC_KEY_PASSWORD: ${{ secrets.APPLE_CODESIGN_CERT_PASSWORD }}
+          MACOS_NOTARIZE: ${{ secrets.APPLE_CODESIGN_CERT_P12_BASE64 != '' && 'true' || 'false' }}
+          APPLE_API_KEY: ${{ secrets.APPLE_NOTARY_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_NOTARY_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          pnpm --filter @idexal/desktop run build:electron
+          pnpm --dir apps/desktop exec electron-builder --config electron-builder.yml --mac dmg zip --publish never
+
+      - name: Rename to public convention
+        run: |
+          set -euo pipefail
+          V="${{ needs.resolve.outputs.version }}"
+          OUT="apps/desktop/dist-electron"
+          mkdir -p public
+          dmg="$(find "$OUT" -maxdepth 1 -name '*.dmg' | head -1)"
+          zip="$(find "$OUT" -maxdepth 1 -name '*.zip' | head -1)"
+          cp "$dmg" "public/idexal-OS-${V}.dmg"
+          cp "$zip" "public/idexal-OS-${V}-mac.zip"
+          cp "$OUT/latest-mac.yml" public/latest-mac.yml
+          ls -lh public
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: public/*
+
+  windows:
+    name: Build Windows
+    needs: resolve
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.4.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build and package (NSIS)
+        env:
+          WIN_CSC_LINK: ${{ secrets.WINDOWS_CODESIGN_CERT_P12_BASE64 }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_CERT_PASSWORD }}
+        run: |
+          pnpm --filter @idexal/desktop run build:electron
+          pnpm --dir apps/desktop exec electron-builder --config electron-builder.yml --win nsis --publish never
+
+      - name: Rename to public convention
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ needs.resolve.outputs.version }}"
+          OUT="apps/desktop/dist-electron"
+          mkdir -p public
+          exe="$(find "$OUT" -maxdepth 1 -name '*setup*.exe' -o -maxdepth 1 -name '*.exe' | grep -v -i blockmap | head -1)"
+          cp "$exe" "public/idexal-OS-Setup-${V}.exe"
+          cp "$OUT/latest.yml" public/latest.yml
+          ls -lh public
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: public/*
+
+  windows-arm64:
+    name: Build Windows arm64
+    needs: resolve
+    runs-on: windows-latest
+    # New in this release and not yet exercised: an arm64 release that fails
+    # must not hold back the x64, macOS and Linux assets that already ship.
+    # Remove this once a tagged release has produced the arm64 installer.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.4.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build and package (NSIS, arm64)
+        env:
+          # The engine sidecar is fetched per target; without this the x64
+          # binary is embedded in an arm64 app.
+          TAURI_ENV_TARGET_TRIPLE: aarch64-pc-windows-msvc
+          WIN_CSC_LINK: ${{ secrets.WINDOWS_CODESIGN_CERT_P12_BASE64 }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_CERT_PASSWORD }}
+        run: |
+          pnpm --filter @idexal/desktop run build:electron
+          pnpm --dir apps/desktop exec electron-builder --config electron-builder.yml --win nsis --arm64 --publish never
+
+      - name: Rename to public convention
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ needs.resolve.outputs.version }}"
+          OUT="apps/desktop/dist-electron"
+          mkdir -p public
+          exe="$(find "$OUT" -maxdepth 1 -name '*arm64*.exe' ! -name '*.blockmap' | head -1)"
+          if [ -z "$exe" ]; then echo "::error::No arm64 installer produced"; exit 1; fi
+          cp "$exe" "public/idexal-OS-Setup-${V}-arm64.exe"
+          ls -lh public
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-arm64
+          path: public/*
+
+  linux-desktop:
+    name: Build Linux desktop
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.4.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The desktop app is packaged for Linux here and nowhere else: the local
+      # packaging on a developer's machine cannot prepare a Linux engine, and
+      # the release is the only place a Linux desktop build is produced. The
+      # targets match apps/desktop/electron-builder.base.yml.
+      - name: Build and package (AppImage + deb + rpm + tar.gz)
+        run: |
+          set -euo pipefail
+          pnpm --filter @idexal/desktop run build:electron
+          pnpm --dir apps/desktop exec electron-builder --config electron-builder.yml --linux AppImage deb rpm tar.gz --publish never
+
+      - name: Rename to public convention
+        run: |
+          set -euo pipefail
+          V="${{ needs.resolve.outputs.version }}"
+          OUT="apps/desktop/dist-electron"
+          mkdir -p public
+          pick() {
+            local pattern="$1" label="$2"
+            local found
+            found="$(find "$OUT" -maxdepth 1 -name "$pattern" | head -1)"
+            if [ -z "$found" ]; then echo "::error::No Linux $label produced"; exit 1; fi
+            printf '%s' "$found"
+          }
+          cp "$(pick '*.AppImage' 'AppImage')" "public/idexal-OS-${V}.AppImage"
+          cp "$(pick '*.deb' 'deb package')" "public/idexal-OS-${V}.deb"
+          cp "$(pick '*.rpm' 'rpm package')" "public/idexal-OS-${V}.rpm"
+          cp "$(pick '*.tar.gz' 'portable archive')" "public/idexal-OS-${V}-linux.tar.gz"
+          ls -lh public
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: public/*
+
+  linux-server:
+    name: Build Linux server
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.4.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Compile Linux x64 server binary
+        run: pnpm --filter idexal-os-server run build:bin:all
+
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          V="${{ needs.resolve.outputs.version }}"
+          mkdir -p public/stage/idexal-os-server
+          bin="$(find apps/server/dist/bin -type f -name '*linux-x64*' ! -name '*.map' | head -1)"
+          if [ -z "$bin" ]; then
+            echo "::error::No linux-x64 server binary produced"; exit 1
+          fi
+          cp "$bin" public/stage/idexal-os-server/idexal-os-server
+          chmod +x public/stage/idexal-os-server/idexal-os-server
+          tar -C public/stage -czf "public/idexal-os-server-linux-x64-${V}.tar.gz" idexal-os-server
+          rm -rf public/stage
+          ls -lh public
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-server
+          path: public/*
+
+  publish:
+    name: Publish GitHub Release
+    needs: [resolve, macos, windows, windows-arm64, linux-desktop, linux-server]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: idexal/idexal-OS
+          token: ${{ secrets.RELEASE_TOKEN }}
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: idexal Os ${{ needs.resolve.outputs.version }}
+          draft: ${{ needs.resolve.outputs.draft == 'true' }}
+          prerelease: ${{ needs.resolve.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          files: assets/*

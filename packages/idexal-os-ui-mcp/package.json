@@ -1,0 +1,30 @@
+{
+  "name": "idexal-os-ui-mcp",
+  "version": "0.2.0",
+  "description": "MCP server for idexal Os app context and semantic UI control",
+  "author": "idexal Os <os@idexal.com>",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "idexal-os-ui-mcp": "index.mjs"
+  },
+  "files": [
+    "index.mjs"
+  ],
+  "scripts": {
+    "check": "node --check index.mjs",
+    "test": "node --check index.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/idexal/idexalOs.git",
+    "directory": "packages/idexal-os-ui-mcp"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "zod": "^3.25.76"
+  }
+}

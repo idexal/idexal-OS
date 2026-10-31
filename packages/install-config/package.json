@@ -1,0 +1,30 @@
+{
+  "name": "@idexal/install-config",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/index.d.ts",
+        "default": "./src/index.ts"
+      },
+      "development": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsup && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "tsup": "^8.5.0",
+    "typescript": "^5.6.3"
+  }
+}

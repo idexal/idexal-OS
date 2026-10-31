@@ -1,0 +1,1454 @@
+import { access, readdir, rm } from "node:fs/promises";
+import { basename, extname, join, resolve } from "node:path";
+import { styleText } from "node:util";
+import { eventsPath, readEvents, tailEvents, type WorldEvent } from "./events.ts";
+import { ledgerPath, readLedger } from "./ledger.ts";
+import { discoverWorlds, displayWorldPath, resolveWorldScript } from "./loader.ts";
+import { formatOutputLines, MASK } from "./outputs.ts";
+import { checksForPlace, nodeCheck, preflightSymbol, runPreflight, unmetRequirements, type PreflightCheck, type PreflightResult } from "./preflight.ts";
+import { describeSourceCommit, sourceCommitLines, type SourceCommit } from "./drift.ts";
+import { DEFAULT_DEV_SOURCE, EXAMPLE_PLACEHOLDERS, SEED_MEANINGS, WORLD_GUIDES, guideSeeds, type WorldGuide } from "./catalog.ts";
+import { builtinReapers, reapLedger, type ReapReport, type Reaper } from "./reaper.ts";
+import { receiptName, resolveStage, sanitizeStage } from "./stage.ts";
+import { WorldStateStore } from "./store.ts";
+import {
+  computeRecipeHash,
+  computeInvocationHash,
+  computeLocalSourceHash,
+  downScriptWorld,
+  isProcessAlive,
+  launchScriptWorld,
+  readScriptWorldSnapshot,
+  readLastLogLines,
+  scriptWorldLogPath,
+  scriptWorldSnapshotDirectory,
+  scriptWorldSnapshotPath,
+} from "./script-world.ts";
+import { createWorldView, detectViewMode, type ViewSink, type WorldView } from "./view.ts";
+import { OS_ENV, PLACE_ENV, WORLD_PROVIDERS, formatTarget, isWorldProvider, resolveTarget, type WorldProvider, type WorldTarget } from "./target.ts";
+import { SOURCES_ENV, gitRefResolver, parseSourceFlag, resolveSources, type SourceRequest, type WorldSource, type WorldSources } from "./source.ts";
+import { SEEDS_ENV, parseSeedFlag, type WorldSeed } from "./seed.ts";
+import { assertWorldSupport, readWorldSummary, readWorldSupport, supportedTargetDescription, targetMatches, type WorldSupport } from "./support.ts";
+
+/** Web worlds whose Daytona placement builds Den from one pinned commit (origin/dev unless --source names one). */
+const PINNED_WEB_WORLDS: ReadonlySet<string> = new Set(["acme-web", "preview-workbot"]);
+
+export type WorldCommand =
+  | {
+      kind: "up";
+      source: string;
+      detach?: boolean;
+      timeoutMs?: number;
+      stage?: string;
+      place?: WorldProvider;
+      os?: string;
+      sources?: SourceRequest[];
+      seeds?: WorldSeed[];
+      env?: string[];
+      plain?: true;
+      args: string[];
+    }
+  | { kind: "attach"; name: string; stage?: string; plain?: true }
+  | { kind: "down"; name: string; stage?: string; purge?: true }
+  | { kind: "outputs"; name: string; stage?: string; reveal?: true; json?: true }
+  | { kind: "plan"; source: string; stage?: string; place?: WorldProvider; os?: string; json?: true }
+  | { kind: "list"; json?: true }
+  | { kind: "forget"; name: string }
+  | { kind: "help"; error?: string; name?: string; json?: true };
+
+export interface WorldCliOptions {
+  cwd: string;
+  worldsDirectory: string;
+  print?: (line: string) => void;
+  progress?: (line: string) => void;
+  preflight?: PreflightCheck[];
+  viewMode?: "tty" | "plain";
+  reapers?: Record<string, Reaper>;
+  /** Recognise known provider failures in a failed world's error and log tail; returns fixes. */
+  diagnose?: (text: string) => string[];
+  /**
+   * Paths the world driver and recipes load from this checkout. A remote world
+   * building another commit gets a note when these differ from that commit.
+   */
+  recipePaths?: readonly string[];
+}
+
+function helpError(message: string): WorldCommand {
+  return { kind: "help", error: message };
+}
+
+function parseStageOptions(options: string[]): { stage?: string; error?: string } {
+  let stage: string | undefined;
+  for (let index = 0; index < options.length; index += 1) {
+    const option = options[index];
+    if (option === "--stage" && stage === undefined) {
+      const value = options[index + 1];
+      try {
+        stage = sanitizeStage(value ?? "");
+      } catch {
+        return { error: "Use --stage followed by a non-empty stage value." };
+      }
+      index += 1;
+      continue;
+    }
+    return { error: `Unknown world CLI option ${JSON.stringify(option)}.` };
+  }
+  return stage === undefined ? {} : { stage };
+}
+
+const SHELL_SAFE = /^[A-Za-z0-9_./:=@%+,-]+$/;
+
+function shellQuote(value: string): string {
+  return SHELL_SAFE.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/** The exact invocation, so a requirement can print a command to rerun as-is. */
+function worldCommandLine(argv: readonly string[]): string {
+  return ["pnpm", "world", ...argv.map(shellQuote)].join(" ");
+}
+
+function providerOf(entry: string): WorldProvider | undefined {
+  const provider = entry.split("/", 1)[0];
+  return isWorldProvider(provider) ? provider : undefined;
+}
+
+type RequirementInfo = { id: string; label: string; places: WorldProvider[]; needs?: string; fix?: string };
+
+/** Blocking checks that can apply to at least one of a world's placements. */
+function requirementsFor(support: WorldSupport, checks: readonly PreflightCheck[]): RequirementInfo[] {
+  const providers = new Set((support ?? ["local/host"]).map(providerOf).filter((provider) => provider !== undefined));
+  return checks
+    .filter((check) => check.blocking === true)
+    .map((check) => {
+      const declared: readonly WorldProvider[] = check.places ?? WORLD_PROVIDERS;
+      return { check, places: declared.filter((place) => providers.has(place)) };
+    })
+    .filter(({ places }) => places.length > 0)
+    .map(({ check, places }) => ({
+      id: check.id,
+      label: check.label,
+      places,
+      ...(check.needs === undefined ? {} : { needs: check.needs }),
+      ...(check.fix === undefined ? {} : { fix: check.fix }),
+    }));
+}
+
+function usedPlaceholders(guide: WorldGuide): Record<string, string> {
+  const text = guide.examples.map((example) => example.command).join(" ");
+  return Object.fromEntries(Object.entries(EXAMPLE_PLACEHOLDERS).filter(([placeholder]) => text.includes(placeholder)));
+}
+
+/**
+ * Everything an agent needs to choose and start a world in one call: what it
+ * is, which seeds and sources each target accepts, what an omitted source
+ * means, the logins or keys each placement needs, and commands by intent.
+ * Keys appear only when the world declares them.
+ */
+async function describeWorld(script: { name: string; path: string }, options: WorldCliOptions) {
+  const support = await readWorldSupport(script.path);
+  const summary = await readWorldSummary(script.path);
+  const guide = WORLD_GUIDES[script.name];
+  const requirements = requirementsFor(support, options.preflight ?? []);
+  const seeds = guide ? guideSeeds(guide) : [];
+  return {
+    name: script.name,
+    path: displayWorldPath(script.path, options.cwd),
+    supportedTargets: support ?? null,
+    ...(summary === undefined ? {} : { summary }),
+    ...(guide ? { sources: [...guide.components], seeds } : {}),
+    ...(guide ? {
+      targets: guide.targets.map((target) => ({
+        ...target,
+        requires: requirements.filter((requirement) => {
+          const provider = providerOf(target.target);
+          return provider !== undefined && requirement.places.includes(provider);
+        }).map((requirement) => requirement.id),
+      })),
+    } : {}),
+    ...(seeds.length > 0 ? { seedMeanings: Object.fromEntries(seeds.map((seed) => [seed, SEED_MEANINGS[seed] ?? ""])) } : {}),
+    ...(requirements.length > 0 ? { requirements } : {}),
+    ...(guide ? { examples: guide.examples, placeholders: usedPlaceholders(guide) } : {}),
+    ...(guide?.caveats ? { caveats: guide.caveats } : {}),
+  };
+}
+
+function describeWorldText(info: Awaited<ReturnType<typeof describeWorld>>): string {
+  const lines = [
+    `${info.name}: ${info.path}`,
+    ...(info.summary === undefined ? [] : [info.summary]),
+    `Supported targets: ${supportedTargetDescription(info.supportedTargets ?? undefined)}`,
+    ...("sources" in info ? [`Sources: ${info.sources?.join(", ")}`, `Seeds: ${info.seeds?.join(", ") || "(none)"}`] : []),
+  ];
+  if (info.targets) {
+    lines.push("", "Per target:");
+    for (const target of info.targets) {
+      lines.push(`  ${target.target}: seeds ${target.seeds.join(", ") || "(none)"}; sources ${target.sources.join(", ")}${target.requires.length > 0 ? `; requires ${target.requires.join(", ")}` : ""}`);
+      lines.push(`    omitted --source: ${target.defaultSource ?? "required"}`);
+      if (target.note) lines.push(`    ${target.note}`);
+    }
+  }
+  if (info.seedMeanings) {
+    lines.push("", "Seeds:");
+    for (const [seed, meaning] of Object.entries(info.seedMeanings)) lines.push(`  ${seed}: ${meaning}`);
+  }
+  if (info.requirements) {
+    lines.push("", "Requirements (checked by world plan and world up before anything is created):");
+    for (const requirement of info.requirements) {
+      lines.push(`  ${requirement.id} (${requirement.places.join(", ")}): ${requirement.needs ?? requirement.label}${requirement.fix ? `\n    fix: ${requirement.fix}` : ""}`);
+    }
+  }
+  if (info.examples) {
+    lines.push("", "Examples:");
+    for (const example of info.examples) lines.push(`  ${example.intent}:`, `    ${example.command}`);
+    for (const [placeholder, meaning] of Object.entries(info.placeholders ?? {})) lines.push(`  ${placeholder} = ${meaning}`);
+  }
+  if (info.caveats) {
+    lines.push("", "Caveats:", ...info.caveats.map((caveat) => `  ${caveat}`));
+  }
+  return lines.join("\n");
+}
+
+/** Where a seed is available, so a refusal can point at a world that has it. */
+function seedAvailability(seed: string): string[] {
+  return Object.entries(WORLD_GUIDES).flatMap(([name, guide]) => {
+    const targets = guide.targets.filter((target) => target.seeds.includes(seed)).map((target) => target.target);
+    return targets.length > 0 ? [`${name} on ${targets.join(", ")}`] : [];
+  });
+}
+
+/**
+ * Refuse a `--seed` the chosen target cannot apply before the script starts,
+ * naming the worlds and placements that do offer it.
+ */
+function assertGuidedSeeds(name: string, target: WorldTarget, seeds: readonly WorldSeed[]): void {
+  const guide = WORLD_GUIDES[name];
+  const targetGuide = guide?.targets.find((entry) => targetMatches(entry.target, target));
+  if (!targetGuide || seeds.length === 0) return;
+  const refused = seeds.find((seed) => !targetGuide.seeds.includes(seed.name));
+  if (!refused) return;
+  const accepted = targetGuide.seeds.length > 0 ? `accepts --seed ${targetGuide.seeds.join(", ")}` : "takes no --seed";
+  const elsewhere = seedAvailability(refused.name);
+  throw new Error(`${name} on ${formatTarget(target)} ${accepted}; ${JSON.stringify(refused.name)} is not available here.${elsewhere.length > 0 ? ` ${refused.name} is available in: ${elsewhere.join("; ")}.` : ""} See pnpm world help ${name}.`);
+}
+
+/**
+ * Which commit a remote world builds (short SHA, subject, origin/dev) and a
+ * note when this checkout's recipes are not that commit's. Best effort: a git
+ * problem never blocks a launch.
+ */
+async function sourceNotes(options: WorldCliOptions, sources: WorldSources, pinnedEvalRef: string | undefined, pinnedDev: string | undefined): Promise<string[]> {
+  const candidates: ReadonlyArray<readonly [string | undefined, WorldSource | undefined]> = [["desktop", sources.desktop], ["den", sources.den], [undefined, sources["*"]]];
+  const [component, source] = candidates.find(([, candidate]) => candidate !== undefined) ?? [undefined, undefined];
+  const release = source?.kind === "release" ? `release:${source.version}/${source.distribution}` : undefined;
+  const sha = source?.kind === "sha" ? source.sha : pinnedEvalRef;
+  if (!sha || !/^[0-9a-f]{40}$/.test(sha)) return release ? [`source  ${component ? `${component} ` : ""}${release}`] : [];
+  const label = sha === pinnedDev ? "origin/dev" : source?.kind === "sha" && source.ref ? `origin/${source.ref}` : undefined;
+  try {
+    const commit = await describeSourceCommit(options.cwd, sha, options.recipePaths ?? []);
+    const lines = sourceCommitLines(commit, { ...(label ? { label } : {}), ...(component && !release ? { component } : {}) });
+    if (!release) return lines;
+    return [`source  ${component ? `${component} ` : ""}${release}; preview tooling ${(lines[0] ?? "").replace(/^source {2}/, "")}`, ...lines.slice(1)];
+  } catch {
+    return [];
+  }
+}
+
+type DefaultSource = { commit?: SourceCommit; lines: string[] };
+
+/** What an omitted --source resolves to right now, for world plan. */
+async function defaultDevSource(options: WorldCliOptions): Promise<DefaultSource> {
+  try {
+    const sha = await gitRefResolver(options.cwd)("dev");
+    const commit = await describeSourceCommit(options.cwd, sha, options.recipePaths ?? []);
+    return { commit, lines: sourceCommitLines(commit, { label: "origin/dev" }) };
+  } catch (error) {
+    return { lines: [`source  origin/dev (not resolved: ${messageText(error)})`] };
+  }
+}
+
+function diagnoseFailure(options: WorldCliOptions, ...texts: string[]): string[] {
+  if (!options.diagnose) return [];
+  try {
+    return [...new Set(options.diagnose(texts.join("\n")))];
+  } catch {
+    return [];
+  }
+}
+
+function unmetRequirementLines(name: string, target: WorldTarget, unmet: readonly PreflightResult[]): string[] {
+  const lines = [`${name} cannot start on ${formatTarget(target)}: ${unmet.length === 1 ? "a requirement is" : `${unmet.length} requirements are`} not met. Nothing was created.`];
+  for (const result of unmet) {
+    lines.push(`  ✖ ${result.label}: ${result.detail ?? "not ready"}`);
+    if (result.hint) lines.push(`    fix: ${result.hint}`);
+  }
+  return lines;
+}
+
+export function parseWorldArgs(argv: string[]): WorldCommand {
+  const [command, ...args] = argv;
+  if (!command || command === "help") {
+    if (args.length === 0) return { kind: "help" };
+    if (args.length === 1 && args[0] === "--json") return { kind: "help", json: true };
+    if (args[0] && !args[0].startsWith("--") && (args.length === 1 || (args.length === 2 && args[1] === "--json"))) {
+      return { kind: "help", name: args[0], ...(args.length === 2 ? { json: true } : {}) };
+    }
+    return helpError("Use world help [name] [--json].");
+  }
+  if (command === "up") {
+    const [source, ...rest] = args;
+    if (!source || source === "--" || source.startsWith("--")) {
+      return helpError("The up command needs a script path or world name.");
+    }
+    const separator = rest.indexOf("--");
+    const options = separator === -1 ? rest : rest.slice(0, separator);
+    const scriptArgs = separator === -1 ? [] : rest.slice(separator + 1);
+    let detach = false;
+    let timeoutMs: number | undefined;
+    let stage: string | undefined;
+    let place: WorldProvider | undefined;
+    let os: string | undefined;
+    let plain = false;
+    const env: string[] = [];
+    const sources: SourceRequest[] = [];
+    const seeds: WorldSeed[] = [];
+    for (let index = 0; index < options.length; index += 1) {
+      const option = options[index];
+      if (option === "--env") {
+        const key = options[index + 1];
+        if (!key || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || key.startsWith("IDEXAL_WORLD_") || /TOKEN|SECRET|PASSWORD|KEY|CREDENTIAL|AUTHORIZATION|COOKIE/i.test(key)) {
+          return helpError("Use --env only for nonsecret configuration outside the reserved IDEXAL_WORLD_ namespace; credential-like key names are rejected.");
+        }
+        env.push(key);
+        index += 1;
+        continue;
+      }
+      if (option === "--detach" && !detach) {
+        detach = true;
+        continue;
+      }
+      if (option === "--timeout" && timeoutMs === undefined) {
+        const value = options[index + 1];
+        const parsed = value === undefined ? Number.NaN : Number(value);
+        if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+          return helpError("Use --timeout followed by a positive number of milliseconds.");
+        }
+        timeoutMs = parsed;
+        index += 1;
+        continue;
+      }
+      if (option === "--stage" && stage === undefined) {
+        const value = options[index + 1];
+        try {
+          stage = sanitizeStage(value ?? "");
+        } catch {
+          return helpError("Use --stage followed by a non-empty stage value.");
+        }
+        index += 1;
+        continue;
+      }
+      if (option === "--place" && place === undefined) {
+        const value = options[index + 1];
+        if (!isWorldProvider(value)) {
+          return helpError(`Use --place followed by ${WORLD_PROVIDERS.slice(0, -1).join(", ")}, or ${WORLD_PROVIDERS.at(-1)}.`);
+        }
+        place = value;
+        index += 1;
+        continue;
+      }
+      if (option === "--os" && os === undefined) {
+        os = options[index + 1];
+        if (!os) return helpError("Use --os followed by linux, macos, or windows.");
+        index += 1;
+        continue;
+      }
+      if (option === "--source") {
+        const value = options[index + 1];
+        if (!value) return helpError("Use --source followed by [component=]local|sha:<sha>|ref:<branch>|release:<version>/<distribution>.");
+        try { sources.push(parseSourceFlag(value)); } catch (error) { return helpError(messageText(error)); }
+        index += 1;
+        continue;
+      }
+      if (option === "--seed") {
+        const value = options[index + 1];
+        if (!value) return helpError("Use --seed followed by comma-separated seed names.");
+        try { seeds.push(...parseSeedFlag(value)); } catch (error) { return helpError(messageText(error)); }
+        index += 1;
+        continue;
+      }
+      if (option === "--plain" && !plain) {
+        plain = true;
+        continue;
+      }
+      return helpError(`Unknown world CLI option ${JSON.stringify(option)}. Pass script arguments after --.`);
+    }
+    if (timeoutMs !== undefined && !detach) return helpError("Use --timeout only with --detach.");
+    return {
+      kind: "up",
+      source,
+      ...(detach ? { detach: true } : {}),
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      ...(stage === undefined ? {} : { stage }),
+      ...(place === undefined ? {} : { place }),
+      ...(os === undefined ? {} : { os }),
+      ...(sources.length === 0 ? {} : { sources }),
+      ...(seeds.length === 0 ? {} : { seeds }),
+      ...(env.length === 0 ? {} : { env }),
+      ...(plain ? { plain: true } : {}),
+      args: scriptArgs,
+    };
+  }
+  if (command === "attach") {
+    const [name, ...options] = args;
+    if (!name || name === "--" || name.startsWith("--")) {
+      return helpError("The attach command needs exactly one world name.");
+    }
+    let stage: string | undefined;
+    let plain = false;
+    for (let index = 0; index < options.length; index += 1) {
+      const option = options[index];
+      if (option === "--stage" && stage === undefined) {
+        try {
+          stage = sanitizeStage(options[index + 1] ?? "");
+        } catch {
+          return helpError("Use --stage followed by a non-empty stage value.");
+        }
+        index += 1;
+        continue;
+      }
+      if (option === "--plain" && !plain) {
+        plain = true;
+        continue;
+      }
+      return helpError(`Unknown world CLI option ${JSON.stringify(option)}.`);
+    }
+    return {
+      kind: "attach",
+      name,
+      ...(stage === undefined ? {} : { stage }),
+      ...(plain ? { plain: true } : {}),
+    };
+  }
+  if (command === "plan") {
+    const [source, ...options] = args;
+    if (!source || source === "--" || source.startsWith("--")) {
+      return helpError("The plan command needs a script path or world name.");
+    }
+    let place: WorldProvider | undefined;
+    let os: string | undefined;
+    let json = false;
+    const stageOptions: string[] = [];
+    for (let index = 0; index < options.length; index += 1) {
+      const option = options[index];
+      if (option === "--place" && place === undefined) {
+        const value = options[index + 1];
+        if (!isWorldProvider(value)) {
+          return helpError(`Use --place followed by ${WORLD_PROVIDERS.slice(0, -1).join(", ")}, or ${WORLD_PROVIDERS.at(-1)}.`);
+        }
+        place = value;
+        index += 1;
+        continue;
+      }
+      if (option === "--os" && os === undefined) {
+        os = options[index + 1];
+        if (!os) return helpError("Use --os followed by linux, macos, or windows.");
+        index += 1;
+        continue;
+      }
+      if (option === "--json" && !json) {
+        json = true;
+        continue;
+      }
+      stageOptions.push(option ?? "");
+      if (option === "--stage") {
+        stageOptions.push(options[index + 1] ?? "");
+        index += 1;
+      }
+    }
+    const parsed = parseStageOptions(stageOptions);
+    if (parsed.error) return helpError(parsed.error);
+    return {
+      kind: "plan",
+      source,
+      ...(parsed.stage === undefined ? {} : { stage: parsed.stage }),
+      ...(place === undefined ? {} : { place }),
+      ...(os === undefined ? {} : { os }),
+      ...(json ? { json: true } : {}),
+    };
+  }
+  if (command === "outputs") {
+    const [name, ...options] = args;
+    if (!name || name === "--" || name.startsWith("--")) {
+      return helpError("The outputs command needs exactly one world name.");
+    }
+    let stage: string | undefined;
+    let reveal = false;
+    let json = false;
+    for (let index = 0; index < options.length; index += 1) {
+      const option = options[index];
+      if (option === "--stage" && stage === undefined) {
+        try {
+          stage = sanitizeStage(options[index + 1] ?? "");
+        } catch {
+          return helpError("Use --stage followed by a non-empty stage value.");
+        }
+        index += 1;
+        continue;
+      }
+      if (option === "--reveal" && !reveal) {
+        reveal = true;
+        continue;
+      }
+      if (option === "--json" && !json) {
+        json = true;
+        continue;
+      }
+      return helpError(`Unknown world CLI option ${JSON.stringify(option)}.`);
+    }
+    return {
+      kind: "outputs",
+      name,
+      ...(stage === undefined ? {} : { stage }),
+      ...(reveal ? { reveal: true } : {}),
+      ...(json ? { json: true } : {}),
+    };
+  }
+  if (command === "list") {
+    if (args.length === 0) return { kind: "list" };
+    return args.length === 1 && args[0] === "--json" ? { kind: "list", json: true } : helpError("The list command takes only --json.");
+  }
+  if (command === "down") {
+    const [name, ...options] = args;
+    if (!name || name === "--" || name.startsWith("--")) {
+      return helpError("The down command needs exactly one world name.");
+    }
+    let stage: string | undefined;
+    let purge = false;
+    for (let index = 0; index < options.length; index += 1) {
+      const option = options[index];
+      if (option === "--stage" && stage === undefined) {
+        const value = options[index + 1];
+        try {
+          stage = sanitizeStage(value ?? "");
+        } catch {
+          return helpError("Use --stage followed by a non-empty stage value.");
+        }
+        index += 1;
+        continue;
+      }
+      if (option === "--purge" && !purge) {
+        purge = true;
+        continue;
+      }
+      return helpError(`Unknown world CLI option ${JSON.stringify(option)}.`);
+    }
+    return {
+      kind: "down",
+      name,
+      ...(stage === undefined ? {} : { stage }),
+      ...(purge ? { purge: true } : {}),
+    };
+  }
+  if (command === "forget") {
+    return args.length === 1 && args[0]
+      ? { kind: "forget", name: args[0] }
+      : helpError("The forget command needs exactly one world name.");
+  }
+  return helpError(`Unknown command ${JSON.stringify(command)}. Script worlds support up, attach, outputs, plan, down, list, forget, and help.`);
+}
+
+function messageText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function helpText(options: WorldCliOptions): Promise<string> {
+  const discovered = await discoverWorlds(options.worldsDirectory);
+  const worlds = await Promise.all(discovered.map(async (world) => {
+    const summary = await readWorldSummary(world.path).catch(() => undefined);
+    return `  ${world.name}${summary ? `  ${summary}` : ""} (${displayWorldPath(world.path, options.cwd)})`;
+  }));
+  const composing = Object.entries(WORLD_GUIDES);
+  return `Usage:
+  pnpm world up <script-path-or-name> [--detach] [--timeout <ms>] [--stage <value>] [--place <local|daytona|freestyle>] [--os <linux|macos|windows>] [--source <[component=]spec>]... [--seed <preset>] [--env <KEY>]... [--plain] [-- <script args...>]
+  pnpm world attach <name> [--stage <value>] [--plain]
+  pnpm world outputs <name> [--stage <value>] [--reveal] [--json]
+  pnpm world plan <script-path-or-name> [--stage <value>] [--place <local|daytona|freestyle>] [--os <linux|macos|windows>] [--json]
+  pnpm world down <name> [--stage <value>] [--purge]
+  pnpm world list [--json]
+  pnpm world forget <name>
+  pnpm world help [name] [--json]
+
+Agents: pnpm world help <name> --json lists each target's seeds and sources, what an omitted --source means,
+the logins or keys each placement needs (with the fix), and ready-to-run commands by intent.
+pnpm world plan <name> --place <place> checks those requirements without creating anything; world up checks them again.
+World scripts run in the foreground by default; use --detach for background lifecycle receipts.
+Use --env KEY only for nonsecret configuration whose value must match before reusing a running world. Never select credentials.
+Desktop previews on local and Daytona also pass the selected keys to the app (for example IDEXAL_ENGINE_V2_PREVIEW=1 ... --env IDEXAL_ENGINE_V2_PREVIEW).
+--source composes ${composing.map(([name]) => name).join(", ")}; --seed composes ${composing.filter(([, guide]) => guideSeeds(guide).length > 0).map(([name]) => name).join(", ")}. Other worlds reject them.
+Available world scripts:
+${worlds.join("\n") || "  (none)"}`;
+}
+
+type ScriptReceiptState =
+  | { kind: "create" }
+  | { kind: "running" | "changed" | "orphaned"; snapshot: NonNullable<Awaited<ReturnType<typeof readScriptWorldSnapshot>>> };
+
+export async function classifyScriptReceipt(path: string, recipeHash: string, invocationHash?: string, defaultInvocation = false): Promise<ScriptReceiptState> {
+  const snapshot = await readScriptWorldSnapshot(path);
+  if (!snapshot) return { kind: "create" };
+  if (!isProcessAlive(snapshot.pid)) return { kind: "orphaned", snapshot };
+  if (invocationHash !== undefined && snapshot.invocationHash !== invocationHash
+    && !(snapshot.invocationHash === undefined && defaultInvocation && snapshot.recipeHash === recipeHash
+      && (snapshot.place === undefined || snapshot.place === "local"))) return { kind: "changed", snapshot };
+  return snapshot.recipeHash === undefined || snapshot.recipeHash === recipeHash
+    ? { kind: "running", snapshot }
+    : { kind: "changed", snapshot };
+}
+
+function printOutputs(
+  snapshot: NonNullable<Awaited<ReturnType<typeof readScriptWorldSnapshot>>>,
+  print: (line: string) => void,
+): void {
+  for (const line of formatOutputLines(snapshot.outputs, snapshot.outputMeta ?? {}, { reveal: false })) {
+    print(line);
+  }
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  return access(path).then(() => true, () => false);
+}
+
+const LEDGER_SUFFIX = ".ledger.jsonl";
+
+async function ledgerWorldNames(directory: string): Promise<string[]> {
+  try {
+    return (await readdir(directory))
+      .filter((name) => name.endsWith(LEDGER_SUFFIX))
+      .map((name) => name.slice(0, -LEDGER_SUFFIX.length))
+      .sort();
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+}
+
+async function reapAndReport(
+  path: string,
+  stagedName: string,
+  name: string,
+  stage: string | undefined,
+  purge: boolean,
+  print: (line: string) => void,
+  options: WorldCliOptions,
+): Promise<ReapReport> {
+  const report = await reapLedger(path, {
+    cwd: options.cwd,
+    purge,
+    reapers: { ...builtinReapers, ...options.reapers },
+  });
+  if (report.reaped.length > 0) {
+    print(`Reaped ${report.reaped.length} leaked resources from ${JSON.stringify(stagedName)}.`);
+  }
+  for (const { entry, reason } of report.skipped) {
+    print(`Skipped ${entry.kind} ${entry.id}: ${reason}.`);
+  }
+  if (report.retained.length > 0 && !purge) {
+    print(`Retained ${report.retained.length} resources for ${JSON.stringify(stagedName)}; run pnpm world down ${name}${stage ? ` --stage ${stage}` : ""} --purge to remove them.`);
+  }
+  return report;
+}
+
+function createCliView(
+  options: WorldCliOptions,
+  flags: { plain?: boolean },
+): { view: WorldView; mode: "tty" | "plain" } {
+  const detected = detectViewMode(process.env, flags);
+  const mode = options.progress || flags.plain
+    ? "plain"
+    : options.viewMode ?? detected.mode;
+  const progress = options.progress ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const sink: ViewSink = mode === "plain"
+    ? {
+        write(text): void {
+          progress(text.endsWith("\n") ? text.slice(0, -1) : text);
+        },
+        isTTY: false,
+      }
+    : {
+        write: (text) => { process.stderr.write(text); },
+        isTTY: process.stderr.isTTY === true,
+        ...(process.stderr.columns === undefined ? {} : { columns: process.stderr.columns }),
+      };
+  return {
+    mode,
+    view: createWorldView({
+      sink,
+      mode,
+      color: mode === "tty" && detected.color,
+    }),
+  };
+}
+
+function reportProgress(options: WorldCliOptions, line: string): void {
+  if (options.progress) options.progress(line);
+  else process.stderr.write(`${line}\n`);
+}
+
+async function finishEventTail(
+  path: string,
+  tail: { stop(): void },
+  rendered: { count: number },
+  view: WorldView,
+): Promise<WorldEvent[]> {
+  tail.stop();
+  const events = await readEvents(path);
+  for (const event of events.slice(rendered.count)) {
+    rendered.count += 1;
+    view.apply(event);
+  }
+  return events;
+}
+
+async function resourceCount(path: string): Promise<number> {
+  return (await readLedger(path)).length;
+}
+
+function lastStepLabel(events: WorldEvent[]): string | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.type === "step" && event.status !== "ok") return event.label;
+  }
+  return undefined;
+}
+
+async function stagedReceiptCandidate(
+  snapshotDirectory: string,
+  name: string,
+  stage: string | undefined,
+  print: (line: string) => void,
+): Promise<{ kind: "found"; stagedName: string; path: string } | { kind: "missing" } | { kind: "multiple"; candidates: string[] }> {
+  const exactName = receiptName(name, stage);
+  const exactPath = scriptWorldSnapshotPath(snapshotDirectory, exactName);
+  if (await pathExists(exactPath)) return { kind: "found", stagedName: exactName, path: exactPath };
+  if (stage !== undefined) return { kind: "missing" };
+  const prefix = `${name}--`;
+  const candidates = (await new WorldStateStore(snapshotDirectory).list())
+    .map((candidatePath) => basename(candidatePath, extname(candidatePath)))
+    .filter((candidate) => candidate.startsWith(prefix))
+    .sort();
+  if (candidates.length > 1) {
+    print(`Multiple staged world receipts match ${JSON.stringify(name)}:`);
+    for (const candidate of candidates) print(`  ${candidate}`);
+    return { kind: "multiple", candidates };
+  }
+  return candidates[0]
+    ? {
+        kind: "found",
+        stagedName: candidates[0],
+        path: scriptWorldSnapshotPath(snapshotDirectory, candidates[0]),
+      }
+    : { kind: "missing" };
+}
+
+function eventElapsed(events: WorldEvent[]): number {
+  if (events.length < 2) return 0;
+  const first = Date.parse(events[0]?.t ?? "");
+  const ready = [...events].reverse().find((event) => event.type === "ready");
+  const last = Date.parse(ready?.t ?? events[events.length - 1]?.t ?? "");
+  return Number.isFinite(first) && Number.isFinite(last) ? Math.max(0, last - first) : 0;
+}
+
+function planSymbolColor(kind: ScriptReceiptState["kind"]): "green" | "cyan" | "yellow" | "red" {
+  if (kind === "create") return "green";
+  if (kind === "running") return "cyan";
+  if (kind === "changed") return "yellow";
+  return "red";
+}
+
+export async function main(argv: string[], options: WorldCliOptions): Promise<number> {
+  const print = options.print ?? console.log;
+  const command = parseWorldArgs(argv);
+  if (command.kind === "help") {
+    if (command.error) print(command.error);
+    if (command.name) {
+      try {
+        const info = await describeWorld(await resolveWorldScript(command.name, options), options);
+        print(command.json ? JSON.stringify(info) : describeWorldText(info));
+        return 0;
+      } catch (error) {
+        print(messageText(error));
+        return 1;
+      }
+    }
+    if (command.json) {
+      const scripts = await discoverWorlds(options.worldsDirectory);
+      print(JSON.stringify(await Promise.all(scripts.map(async (script) => {
+        const summary = await readWorldSummary(script.path);
+        return {
+          name: script.name,
+          path: displayWorldPath(script.path, options.cwd),
+          supportedTargets: await readWorldSupport(script.path) ?? null,
+          ...(summary === undefined ? {} : { summary }),
+        };
+      }))));
+      return 0;
+    }
+    print(await helpText(options));
+    return command.error ? 1 : 0;
+  }
+  if (command.kind === "up") {
+    try {
+      const script = await resolveWorldScript(command.source, options);
+      const stage = resolveStage(process.env, command.stage);
+      const recipeHash = await computeRecipeHash(script.path);
+      const target = resolveTarget({
+        provider: command.place ?? process.env[PLACE_ENV],
+        os: command.os ?? process.env[OS_ENV],
+      });
+      const place = target.provider;
+      assertWorldSupport(script.name, await readWorldSupport(script.path), target);
+      if (target.os === "windows" && target.provider === "daytona" && script.name !== "preview-desktop") {
+        throw new Error(`World ${script.name} cannot run on daytona/windows. Only a blank published preview-desktop release is supported.`);
+      }
+      if (target.os === "windows" && script.name === "preview-desktop" && !(command.args.includes("--release") || command.sources?.some((source) => source.component === "desktop" && source.spec.kind === "release"))) {
+        throw new Error("Daytona Windows requires a blank published preview-desktop release; use --source desktop=release:<version>/<distribution> --seed blank.");
+      }
+      // These are opt-in for now: never silently accept inputs a recipe cannot apply.
+      const preview = WORLD_GUIDES[script.name]?.family === "preview";
+      const web = WORLD_GUIDES[script.name]?.family === "web";
+      assertGuidedSeeds(script.name, target, command.seeds ?? []);
+      // The evidence viewer reads one pushed app-web source and takes no seed.
+      const evidence = script.name === "evidence-web";
+      if (evidence && (command.seeds?.length ?? 0) > 0) throw new Error("evidence-web does not accept --seed.");
+      if (!preview && !web && !evidence && ((command.sources?.length ?? 0) > 0 || (command.seeds?.length ?? 0) > 0)) {
+        throw new Error(`World ${script.name} does not yet declare --source/--seed support. Use its existing script arguments after --.`);
+      }
+      const resolveRemoteRef = gitRefResolver(options.cwd);
+      // Remember what origin/dev resolved to, so the header can say which commit this is.
+      let pinnedDev: string | undefined;
+      const resolveRef = async (ref: string): Promise<string> => {
+        const sha = await resolveRemoteRef(ref);
+        if (ref === "dev") pinnedDev = sha;
+        return sha;
+      };
+      const sources = { ...await resolveSources(command.sources ?? [], resolveRef) };
+      const seeds = command.seeds ?? [];
+      let scriptArgs = command.args;
+      if (web && ((command.sources?.length ?? 0) > 0 || seeds.length > 0)) {
+        const webSource = sources["*"];
+        if (seeds.length > 0 || Object.keys(sources).length !== 1 || !webSource || command.args.includes("--ref")
+          || (place === "local" ? webSource.kind !== "local" : webSource.kind !== "sha")) {
+          throw new Error(`${script.name} --source accepts local on this computer or one pushed SHA/ref on remote placements; do not combine it with -- --ref or --seed.`);
+        }
+        if (webSource.kind === "sha" && (script.name === "preview-app-web" || place === "freestyle")) {
+          scriptArgs = ["--ref", webSource.sha, ...command.args];
+        }
+      }
+      const env: NodeJS.ProcessEnv = Object.fromEntries((command.env ?? []).map((key) => [key, process.env[key]]));
+      // Existing previews use origin/dev by default. Resolve it before adoption,
+      // otherwise a moved branch silently reuses an older running world.
+      if (script.name === "preview-desktop" && place === "daytona" && !sources["*"]) {
+        // The app alone: pin its source commit, or for a published release the
+        // commit whose preview tooling installs and launches those bytes.
+        const sha = process.env.IDEXAL_EVAL_REF?.trim() || await resolveRef("dev");
+        if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("Preview desktop source must be a full reviewed, pushed commit SHA.");
+        const release = command.args.includes("--release") || sources.desktop?.kind === "release";
+        if (release) env.IDEXAL_EVAL_REF = sha;
+        else if (!sources.desktop) sources.desktop = { kind: "sha", sha };
+      } else if ((preview || PINNED_WEB_WORLDS.has(script.name)) && place === "daytona" && !sources.den && !sources["*"]) {
+        const pinned = process.env.IDEXAL_EVAL_REF?.trim();
+        const sha = pinned ?? await resolveRef("dev");
+        if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("Preview Den source must be a full reviewed, pushed commit SHA.");
+        sources.den = { kind: "sha", sha };
+      }
+      // A Freestyle snapshot is built from one pushed commit. Pin it before
+      // adoption, exactly as Daytona previews pin their Den source.
+      if (script.name === "preview-desktop" && place === "freestyle" && !sources.desktop && !sources["*"]) {
+        const sha = process.env.IDEXAL_EVAL_REF?.trim() || await resolveRef("dev");
+        if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("Freestyle desktop source must be a full reviewed, pushed commit SHA.");
+        sources.desktop = { kind: "sha", sha };
+      }
+      if (PINNED_WEB_WORLDS.has(script.name) && place === "daytona") {
+        if (command.args.length > 0) throw new Error(`Daytona ${script.name} uses --source to select a ref; script arguments after -- are not supported.`);
+        const webSource = sources["*"] ?? sources.den;
+        if (webSource?.kind !== "sha") throw new Error(`Daytona ${script.name} requires a pinned commit SHA.`);
+        env.IDEXAL_EVAL_REF = webSource.sha;
+      }
+      if (place === "daytona" && script.name !== "preview-app-web" && !preview && !PINNED_WEB_WORLDS.has(script.name)) {
+        const pinned = process.env.IDEXAL_EVAL_REF?.trim() || process.env.GITHUB_SHA?.trim() || await resolveRef("dev");
+        if (!/^[0-9a-f]{40}$/.test(pinned)) throw new Error("Daytona world source must be a full reviewed, pushed commit SHA.");
+        env.IDEXAL_EVAL_REF = pinned;
+      }
+      if ((preview || evidence) && Object.keys(sources).length > 0) env[SOURCES_ENV] = JSON.stringify(sources);
+      if (preview && seeds.length > 0) env[SEEDS_ENV] = JSON.stringify(seeds);
+      const sourceHash = place === "local" ? await computeLocalSourceHash(options.cwd) : undefined;
+      // Keep existing placement-only receipts adoptable when --os was omitted.
+      const targetIdentity = command.os === undefined && !process.env[OS_ENV] ? place : formatTarget(target);
+      const invocationHash = computeInvocationHash(recipeHash, scriptArgs, targetIdentity, env, sourceHash);
+      const snapshotDirectory = scriptWorldSnapshotDirectory(options.cwd);
+      const stagedName = receiptName(script.name, stage);
+      const snapshotPath = scriptWorldSnapshotPath(snapshotDirectory, stagedName);
+      const worldLedgerPath = ledgerPath(snapshotDirectory, stagedName);
+       const state = await classifyScriptReceipt(snapshotPath, recipeHash, invocationHash, place === "local" && command.args.length === 0 && Object.keys(env).length === 0);
+      if (state.kind === "running") {
+        printOutputs(state.snapshot, print);
+        print(`World ${JSON.stringify(stagedName)} is already running (pid ${state.snapshot.pid}); adopted.`);
+        return 0;
+      }
+      if (state.kind === "changed") {
+        const reason = state.snapshot.recipeHash !== undefined && state.snapshot.recipeHash !== recipeHash
+          ? "recipe changed"
+          : state.snapshot.invocationHash === undefined ? "invocation identity is missing" : "invocation changed";
+        print(`World ${JSON.stringify(stagedName)} is running but its ${reason}; run pnpm world down ${script.name}${stage ? ` --stage ${stage}` : ""} first.`);
+        return 1;
+      }
+      // Logins and keys come before any side effect: a missing requirement
+      // should cost one fast, actionable failure, not a half-provisioned world.
+      const [preflight, notes] = await Promise.all([
+        runPreflight(checksForPlace([nodeCheck(), ...(options.preflight ?? [])], place), undefined, {
+          place,
+          command: worldCommandLine(argv),
+        }),
+        place === "local" ? Promise.resolve([]) : sourceNotes(options, sources, env.IDEXAL_EVAL_REF, pinnedDev),
+      ]);
+      const unmet = unmetRequirements(preflight);
+      if (unmet.length > 0) {
+        for (const line of [...unmetRequirementLines(script.name, target, unmet), ...notes]) print(line);
+        return 1;
+      }
+      if (state.kind === "orphaned") {
+        await reapAndReport(worldLedgerPath, stagedName, script.name, stage, false, print, options);
+        await rm(snapshotPath, { force: true });
+        print(`Removed stale world receipt ${JSON.stringify(stagedName)} (pid ${state.snapshot.pid}); recreating.`);
+      } else if (await pathExists(worldLedgerPath)) {
+        await reapAndReport(worldLedgerPath, stagedName, script.name, stage, false, print, options);
+      }
+      const logPath = scriptWorldLogPath(snapshotDirectory, stagedName);
+      const eventPath = eventsPath(snapshotDirectory, stagedName);
+      await rm(eventPath, { force: true });
+      const { view, mode } = createCliView(options, { plain: command.plain });
+      view.header({
+        name: stagedName,
+        ...(stage === undefined ? {} : { stage }),
+        place,
+        receipt: snapshotPath,
+        ...(command.detach || mode === "tty" ? { log: logPath } : {}),
+        preflight,
+        notes,
+      });
+      const startedAt = Date.now();
+      const rendered = { count: 0 };
+      const tail = tailEvents(eventPath, (event) => {
+        rendered.count += 1;
+        view.apply(event);
+      }, { intervalMs: 50 });
+      let childPid: number | undefined;
+      let readyShown = false;
+      let stopped = false;
+      const showReady = async (): Promise<void> => {
+        if (readyShown) return;
+        const snapshot = await readScriptWorldSnapshot(snapshotPath);
+        if (!snapshot) return;
+        readyShown = true;
+        const events = await readEvents(eventPath);
+        for (const event of events.slice(rendered.count)) {
+          rendered.count += 1;
+          view.apply(event);
+        }
+        view.ready({
+          name: stagedName,
+          outputs: snapshot.outputs,
+          ...(snapshot.outputMeta === undefined ? {} : { outputMeta: snapshot.outputMeta }),
+          elapsedMs: Date.now() - startedAt,
+          resources: await resourceCount(worldLedgerPath),
+          downHint: `pnpm world down ${script.name}${stage ? ` --stage ${stage}` : ""}`,
+          ...(command.detach || mode === "tty" ? { log: logPath } : {}),
+        });
+      };
+      const receiptPoll = setInterval(() => {
+        void showReady().catch((error: unknown) => {
+          view.apply({ t: new Date().toISOString(), type: "note", text: `Could not read world receipt: ${messageText(error)}` });
+        });
+      }, 50);
+      receiptPoll.unref();
+      const onSigint = (): void => {
+        if (stopped || childPid === undefined) return;
+        stopped = true;
+        view.apply({ t: new Date().toISOString(), type: "note", text: "stopping…" });
+        try { process.kill(childPid, "SIGINT"); } catch {}
+      };
+      if (!command.detach && mode === "tty") process.on("SIGINT", onSigint);
+      let code: number;
+      try {
+        code = await launchScriptWorld({
+          path: script.path,
+          name: script.name,
+          args: scriptArgs,
+          snapshotDirectory,
+          detach: command.detach === true,
+          ...(command.timeoutMs === undefined ? {} : { timeoutMs: command.timeoutMs }),
+          ...(stage === undefined ? {} : { stage }),
+          recipeHash,
+          invocationHash,
+          env,
+          selectedEnvKeys: command.env ?? [],
+          place,
+          os: target.os,
+          print,
+          foregroundLog: !command.detach && mode === "tty",
+          quietReady: mode === "tty",
+          onSpawn: (pid) => { childPid = pid; },
+        });
+      } catch (error) {
+        clearInterval(receiptPoll);
+        if (!command.detach && mode === "tty") process.off("SIGINT", onSigint);
+        const events = await finishEventTail(eventPath, tail, rendered, view);
+        view.failed({
+          name: stagedName,
+          ...(lastStepLabel(events) === undefined ? {} : { step: lastStepLabel(events) }),
+          elapsedMs: Date.now() - startedAt,
+          lastLog: await readLastLogLines(logPath, 40),
+          logPath,
+          hint: messageText(error),
+          hints: diagnoseFailure(options, messageText(error), ...await readLastLogLines(logPath, 200)),
+        });
+        view.stop();
+        throw error;
+      }
+      clearInterval(receiptPoll);
+      if (!command.detach && mode === "tty") process.off("SIGINT", onSigint);
+      const events = await finishEventTail(eventPath, tail, rendered, view);
+      await showReady();
+      if (code === 0 && events.every((event) => event.type === "ready")) {
+        await rm(eventPath, { force: true });
+      }
+      if (code !== 0) {
+        view.failed({
+          name: stagedName,
+          ...(lastStepLabel(events) === undefined ? {} : { step: lastStepLabel(events) }),
+          elapsedMs: Date.now() - startedAt,
+          lastLog: await readLastLogLines(logPath, 40),
+          logPath,
+          hints: diagnoseFailure(options, ...await readLastLogLines(logPath, 200)),
+        });
+      } else if (!command.detach) {
+        view.stop();
+        reportProgress(options, `World ${JSON.stringify(stagedName)} stopped.`);
+      } else {
+        view.stop();
+      }
+      return code;
+    } catch (error) {
+      print(messageText(error));
+      return 1;
+    }
+  }
+  if (command.kind === "attach") {
+    const snapshotDirectory = scriptWorldSnapshotDirectory(options.cwd);
+    const candidate = await stagedReceiptCandidate(
+      snapshotDirectory,
+      command.name,
+      command.stage,
+      print,
+    );
+    if (candidate.kind !== "found") {
+      if (candidate.kind === "multiple") return 1;
+      print(`World receipt ${JSON.stringify(receiptName(command.name, command.stage))} does not exist.`);
+      return 1;
+    }
+    try {
+      const snapshot = await readScriptWorldSnapshot(candidate.path);
+      if (!snapshot) {
+        print(`World receipt ${JSON.stringify(candidate.stagedName)} does not exist.`);
+        return 1;
+      }
+      const { view, mode } = createCliView(options, { plain: command.plain });
+      const eventPath = eventsPath(snapshotDirectory, candidate.stagedName);
+      const logPath = scriptWorldLogPath(snapshotDirectory, candidate.stagedName);
+      view.header({
+        name: candidate.stagedName,
+        ...(snapshot.stage === undefined ? {} : { stage: snapshot.stage }),
+        ...(snapshot.place === undefined ? {} : { place: snapshot.place }),
+        receipt: candidate.path,
+        log: logPath,
+      });
+      const events = await readEvents(eventPath);
+      for (const event of events) view.apply(event);
+      view.ready({
+        name: candidate.stagedName,
+        outputs: snapshot.outputs,
+        ...(snapshot.outputMeta === undefined ? {} : { outputMeta: snapshot.outputMeta }),
+        elapsedMs: eventElapsed(events),
+        resources: await resourceCount(ledgerPath(snapshotDirectory, candidate.stagedName)),
+        downHint: `pnpm world down ${command.name}${snapshot.stage ? ` --stage ${snapshot.stage}` : ""}`,
+        log: logPath,
+      });
+      if (mode === "plain") {
+        view.stop();
+        return 0;
+      }
+      const tail = tailEvents(eventPath, (event) => view.apply(event), { intervalMs: 50 });
+      process.stdin.resume();
+      await new Promise<void>((done) => {
+        let finished = false;
+        const finish = (): void => {
+          if (finished) return;
+          finished = true;
+          clearInterval(alivePoll);
+          process.off("SIGINT", detach);
+          tail.stop();
+          view.stop();
+          process.stdin.pause();
+          done();
+        };
+        const detach = (): void => finish();
+        const alivePoll = setInterval(() => {
+          if (isProcessAlive(snapshot.pid)) return;
+          reportProgress(options, `World ${JSON.stringify(candidate.stagedName)} stopped.`);
+          finish();
+        }, 250);
+        alivePoll.unref();
+        process.once("SIGINT", detach);
+      });
+      return 0;
+    } catch (error) {
+      print(messageText(error));
+      return 1;
+    }
+  }
+  if (command.kind === "outputs") {
+    const snapshotDirectory = scriptWorldSnapshotDirectory(options.cwd);
+    // With --json, "no such world" is a structured answer too; agents use this
+    // to decide between reopening an existing preview and creating one.
+    const missing = (name: string, candidates?: string[]): number => {
+      if (command.json) print(JSON.stringify({ name, exists: false, ...(candidates ? { candidates } : {}) }));
+      else if (!candidates) print(`World receipt ${JSON.stringify(name)} does not exist.`);
+      return 1;
+    };
+    const candidate = await stagedReceiptCandidate(
+      snapshotDirectory,
+      command.name,
+      command.stage,
+      command.json ? () => {} : print,
+    );
+    if (candidate.kind === "multiple") return missing(command.name, candidate.candidates);
+    if (candidate.kind === "missing") return missing(receiptName(command.name, command.stage));
+    try {
+      const snapshot = await readScriptWorldSnapshot(candidate.path);
+      if (!snapshot) return missing(candidate.stagedName);
+      const outputMeta = snapshot.outputMeta ?? {};
+      if (!command.json) {
+        for (const line of formatOutputLines(snapshot.outputs, outputMeta, { reveal: command.reveal === true })) {
+          print(line);
+        }
+        return 0;
+      }
+      const outputs: Record<string, {
+        value: string;
+        secret: boolean;
+        group?: string;
+        note?: string;
+      }> = {};
+      for (const [key, value] of Object.entries(snapshot.outputs)) {
+        const meta = outputMeta[key];
+        const isSecret = meta?.secret === true;
+        outputs[key] = {
+          value: command.reveal || !isSecret ? value : MASK,
+          secret: isSecret,
+          ...(meta?.group === undefined ? {} : { group: meta.group }),
+          ...(meta?.note === undefined ? {} : { note: meta.note }),
+        };
+      }
+      print(JSON.stringify({
+        name: candidate.stagedName,
+        exists: true,
+        ...(snapshot.stage === undefined ? {} : { stage: snapshot.stage }),
+        ...(snapshot.place === undefined ? {} : { place: snapshot.place }),
+        ...(snapshot.os === undefined ? {} : { os: snapshot.os }),
+        alive: isProcessAlive(snapshot.pid),
+        outputs,
+      }));
+      return 0;
+    } catch (error) {
+      print(messageText(error));
+      return 1;
+    }
+  }
+  if (command.kind === "plan") {
+    try {
+      const script = await resolveWorldScript(command.source, options);
+      const stage = resolveStage(process.env, command.stage);
+      const target = resolveTarget({
+        provider: command.place ?? process.env[PLACE_ENV],
+        os: command.os ?? process.env[OS_ENV],
+      });
+      assertWorldSupport(script.name, await readWorldSupport(script.path), target);
+      const recipeHash = await computeRecipeHash(script.path);
+      const snapshotDirectory = scriptWorldSnapshotDirectory(options.cwd);
+      const stagedName = receiptName(script.name, stage);
+      const snapshotPath = scriptWorldSnapshotPath(snapshotDirectory, stagedName);
+      const state = await classifyScriptReceipt(snapshotPath, recipeHash);
+      // Only requirements run here: health badges stay a world up concern, and
+      // a plan must not be slowed or failed by them. When the target defaults
+      // to origin/dev, say which commit that is and whether this checkout's
+      // recipes match it.
+      const guideTarget = WORLD_GUIDES[script.name]?.targets.find((entry) => targetMatches(entry.target, target));
+      const [requirements, source] = await Promise.all([
+        runPreflight(
+          checksForPlace(options.preflight ?? [], target.provider).filter((check) => check.blocking === true),
+          undefined,
+          { place: target.provider },
+        ),
+        target.provider !== "local" && guideTarget?.defaultSource === DEFAULT_DEV_SOURCE
+          ? defaultDevSource(options)
+          : Promise.resolve<DefaultSource>({ lines: [] }),
+      ]);
+      const unmet = unmetRequirements(requirements);
+      const worldLedgerPath = ledgerPath(snapshotDirectory, stagedName);
+      const entries = await pathExists(worldLedgerPath) ? await readLedger(worldLedgerPath) : [];
+      const leaked = entries.filter((entry) => entry.retain !== true).length;
+      const retained = entries.filter((entry) => entry.retain === true).length;
+      if (command.json) {
+        print(JSON.stringify({
+          name: stagedName,
+          ...(stage === undefined ? {} : { stage }),
+          target: formatTarget(target),
+          state: state.kind,
+          receipt: snapshotPath,
+          ready: unmet.length === 0,
+          requirements: requirements.map((result) => ({
+            id: result.id,
+            label: result.label,
+            ok: result.ok,
+            ...(result.detail === undefined ? {} : { detail: result.detail }),
+            ...(result.hint === undefined ? {} : { fix: result.hint }),
+            ...(result.warning ? { warning: true } : {}),
+            ...(result.timedOut ? { timedOut: true } : {}),
+          })),
+          ...(source.commit ? {
+            source: {
+              sha: source.commit.sha,
+              ref: "origin/dev",
+              ...(source.commit.subject ? { subject: source.commit.subject } : {}),
+              ...(source.commit.recipeDrift ? { recipeDrift: source.commit.recipeDrift.length } : {}),
+            },
+          } : {}),
+          ...(source.lines.length > 1 ? { notes: source.lines.slice(1) } : {}),
+          ...(leaked > 0 && (state.kind === "create" || state.kind === "orphaned") ? { leaked } : {}),
+          ...(retained > 0 ? { retained } : {}),
+        }));
+        return unmet.length === 0 ? 0 : 1;
+      }
+      const labels = {
+        create: "+ create",
+        running: state.kind === "running" && state.snapshot.invocationHash !== undefined ? "• running (invocation unverified)" : "• running (attachable)",
+        changed: "~ stale (recipe changed)",
+        orphaned: "- orphaned (stale receipt, will recreate)",
+      };
+      const detected = detectViewMode(process.env, {});
+      const tty = options.progress === undefined && (options.viewMode ?? detected.mode) === "tty";
+      const color = tty && detected.color;
+      const label = labels[state.kind];
+      print(color ? `${styleText(planSymbolColor(state.kind), label[0] ?? "")} ${label.slice(2)}` : label);
+      print(`receipt  ${snapshotPath}`);
+      if (command.place !== undefined || command.os !== undefined || requirements.length > 0) print(`target  ${formatTarget(target)}`);
+      if (requirements.length > 0) {
+        print(`requires  ${requirements.map((result) => `${result.label} ${preflightSymbol(result)}`).join("  ")}`);
+        for (const result of requirements) {
+          const symbol = preflightSymbol(result);
+          if (symbol === "✔") {
+            // Passing requirements still say who: "which org are you using?" should not need a question.
+            if (result.detail) print(`  ${result.label}: ${result.detail}`);
+            continue;
+          }
+          print(`  ${symbol} ${result.label}: ${result.detail ?? "not ready"}${result.timedOut ? " (not blocking)" : ""}`);
+          if (result.hint) print(`    fix: ${result.hint}`);
+        }
+      }
+      for (const line of source.lines) print(line);
+      if (state.kind !== "create") printOutputs(state.snapshot, print);
+      if (leaked > 0 && (state.kind === "create" || state.kind === "orphaned")) print(`leaked  ${leaked} resources`);
+      if (retained > 0) print(`retained  ${retained} resources`);
+      if (unmet.length > 0) print(`${script.name} cannot start on ${formatTarget(target)} until ${unmet.length === 1 ? "this requirement is" : "these requirements are"} met.`);
+      return unmet.length === 0 ? 0 : 1;
+    } catch (error) {
+      print(messageText(error));
+      return 1;
+    }
+  }
+  if (command.kind === "down") {
+    try {
+      const snapshotDirectory = scriptWorldSnapshotDirectory(options.cwd);
+      let stagedName = receiptName(command.name, command.stage);
+      let path = scriptWorldSnapshotPath(snapshotDirectory, stagedName);
+      let worldLedgerPath = ledgerPath(snapshotDirectory, stagedName);
+      if (
+        command.stage === undefined
+        && !await pathExists(path)
+        && !await pathExists(worldLedgerPath)
+      ) {
+        const prefix = `${command.name}--`;
+        const receiptCandidates = (await new WorldStateStore(snapshotDirectory).list())
+          .map((candidatePath) => basename(candidatePath, extname(candidatePath)))
+          .filter((candidate) => candidate.startsWith(prefix));
+        const ledgerCandidates = (await ledgerWorldNames(snapshotDirectory))
+          .filter((candidate) => candidate.startsWith(prefix));
+        const candidates = [...new Set([...receiptCandidates, ...ledgerCandidates])].sort();
+        if (candidates.length > 1) {
+          print(`Multiple staged world receipts match ${JSON.stringify(command.name)}:`);
+          for (const candidate of candidates) print(`  ${candidate}`);
+          return 1;
+        }
+        if (candidates[0]) {
+          stagedName = candidates[0];
+          path = scriptWorldSnapshotPath(snapshotDirectory, stagedName);
+          worldLedgerPath = ledgerPath(snapshotDirectory, stagedName);
+        }
+      }
+      const receiptExists = await pathExists(path);
+      const ledgerExists = await pathExists(worldLedgerPath);
+      if (!receiptExists) {
+        if (!ledgerExists) {
+          print(`World receipt ${JSON.stringify(stagedName)} does not exist.`);
+          return 1;
+        }
+        await reapAndReport(
+          worldLedgerPath,
+          stagedName,
+          command.name,
+          command.stage,
+          command.purge === true,
+          print,
+          options,
+        );
+        print(`World ${JSON.stringify(stagedName)} has no receipt; reaped its ledger.`);
+        return 0;
+      }
+      const result = await downScriptWorld(path);
+      if (!result.found) {
+        print(`World receipt ${JSON.stringify(stagedName)} does not exist.`);
+        return 1;
+      }
+      if (result.forced) {
+        print(`World ${JSON.stringify(stagedName)} teardown was forced (pid ${result.pid}).`);
+      } else {
+        print(`World ${JSON.stringify(stagedName)} torn down.`);
+      }
+      await reapAndReport(
+        worldLedgerPath,
+        stagedName,
+        command.name,
+        command.stage,
+        command.purge === true,
+        print,
+        options,
+      );
+      return 0;
+    } catch (error) {
+      print(messageText(error));
+      return 1;
+    }
+  }
+  if (command.kind === "list") {
+    const discovered = await discoverWorlds(options.worldsDirectory);
+    const worlds = await Promise.all(discovered.map(async (world) => ({
+      name: world.name,
+      path: displayWorldPath(world.path, options.cwd),
+      supportedTargets: await readWorldSupport(world.path),
+      summary: await readWorldSummary(world.path).catch(() => undefined),
+    })));
+    type Listed = { name: string; createdAt?: string; pid?: number; alive?: boolean; stage?: string; place?: string; os?: string; leaked: number; retained: number };
+    const receipts: Listed[] = [];
+    const warnings: string[] = [];
+    const receiptsDirectory = scriptWorldSnapshotDirectory(options.cwd);
+    const receiptNames = new Set<string>();
+    for (const path of await new WorldStateStore(receiptsDirectory).list()) {
+      const receiptFileName = basename(path, extname(path));
+      receiptNames.add(receiptFileName);
+      try {
+        const receipt = await readScriptWorldSnapshot(path);
+        if (!receipt) continue;
+        const entries = await readLedger(ledgerPath(receiptsDirectory, receiptFileName));
+        receipts.push({
+          name: receipt.name,
+          createdAt: receipt.createdAt,
+          pid: receipt.pid,
+          alive: isProcessAlive(receipt.pid),
+          ...(receipt.stage === undefined ? {} : { stage: receipt.stage }),
+          ...(receipt.place === undefined ? {} : { place: receipt.place }),
+          ...(receipt.os === undefined ? {} : { os: receipt.os }),
+          leaked: entries.filter((entry) => entry.retain !== true).length,
+          retained: entries.filter((entry) => entry.retain === true).length,
+        });
+      } catch (error) {
+        warnings.push(`skipped ${displayWorldPath(path, options.cwd)}: ${messageText(error)}`);
+      }
+    }
+    for (const stagedName of await ledgerWorldNames(receiptsDirectory)) {
+      if (receiptNames.has(stagedName)) continue;
+      try {
+        const entries = await readLedger(ledgerPath(receiptsDirectory, stagedName));
+        const leaked = entries.filter((entry) => entry.retain !== true).length;
+        const retained = entries.filter((entry) => entry.retain === true).length;
+        if (leaked === 0 && retained === 0) continue;
+        receipts.push({ name: stagedName, leaked, retained });
+      } catch (error) {
+        warnings.push(`skipped ${displayWorldPath(ledgerPath(receiptsDirectory, stagedName), options.cwd)}: ${messageText(error)}`);
+      }
+    }
+    if (command.json) {
+      print(JSON.stringify({
+        worlds: worlds.map((world) => ({
+          name: world.name,
+          path: world.path,
+          supportedTargets: world.supportedTargets ?? null,
+          ...(world.summary === undefined ? {} : { summary: world.summary }),
+        })),
+        receipts: receipts.map((receipt) => ({
+          ...receipt,
+          state: receipt.alive === undefined ? "down" : receipt.alive ? "alive" : "dead",
+        })),
+        ...(warnings.length > 0 ? { warnings } : {}),
+      }));
+      return 0;
+    }
+    print(`World scripts: ${worlds.map((world) => `${world.name} (${world.path}, script; ${supportedTargetDescription(world.supportedTargets)})`).join(", ") || "(none)"}`);
+    let count = 0;
+    for (const warning of warnings) print(`Warning: ${warning}`);
+    for (const receipt of receipts) {
+      let line: string;
+      if (receipt.alive === undefined) {
+        line = `${receipt.name}  -  script  down`;
+        if (receipt.retained > 0) line += `  retained ${receipt.retained}`;
+        if (receipt.leaked > 0) line += `  leaked ${receipt.leaked}`;
+      } else {
+        line = `${receipt.name}  ${receipt.createdAt}  script  ${receipt.alive ? "alive" : `dead(pid ${receipt.pid})`}${receipt.place ? `  place ${receipt.place}${receipt.os ? `/${receipt.os}` : ""}` : ""}`;
+        if (!receipt.alive && receipt.leaked > 0) line += `  leaked ${receipt.leaked}`;
+        if (receipt.retained > 0) line += `  retained ${receipt.retained}`;
+      }
+      print(line);
+      count += 1;
+    }
+    if (count === 0) print("No script world receipts.");
+    return 0;
+  }
+
+  try {
+    const store = new WorldStateStore(scriptWorldSnapshotDirectory(options.cwd));
+    if (!await store.forget(command.name)) {
+      print(`World receipt ${JSON.stringify(command.name)} does not exist.`);
+      return 1;
+    }
+    print(`Removed receipt metadata for ${JSON.stringify(command.name)}. The script process was not stopped.`);
+    return 0;
+  } catch (error) {
+    print(messageText(error));
+    return 1;
+  }
+}
+
+export function defaultWorldCliPaths(repoRoot: string): { cwd: string; worldsDirectory: string } {
+  const cwd = resolve(repoRoot);
+  return { cwd, worldsDirectory: join(cwd, "worlds") };
+}

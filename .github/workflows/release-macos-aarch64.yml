@@ -1,0 +1,1403 @@
+name: Release App
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      benchmark_only:
+        description: "Build the release matrix for timing only; never create tags or publish artifacts"
+        required: false
+        type: boolean
+        default: false
+      bump:
+        description: "Cut a fresh release: bump from the highest v* tag and tag origin/dev HEAD"
+        required: false
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+      version:
+        description: "Explicit version for a fresh release (X.Y.Z, overrides bump)"
+        required: false
+        type: string
+      tag:
+        description: "Existing tag to re-run for recovery (e.g., v0.1.2). Skips tag creation."
+        required: false
+        type: string
+      release_name:
+        description: "Release title (defaults to idexal Os <tag>)"
+        required: false
+        type: string
+      release_body:
+        description: "Release notes body in Markdown (defaults to a short placeholder)"
+        required: false
+        type: string
+      draft:
+        description: "Create the GitHub Release as a draft until assets are ready (publish-release flips it public)"
+        required: false
+        type: boolean
+        default: true
+      prerelease:
+        description: "Mark the GitHub Release as a prerelease"
+        required: false
+        type: boolean
+        default: false
+      notarize:
+        description: "Notarize macOS builds (requires Apple team configured)"
+        required: false
+        type: boolean
+        default: true
+      publish_npm:
+        description: "Publish idexal-os-server to npm if its version changed"
+        required: false
+        type: boolean
+        default: true
+      publish_daytona_snapshot:
+        description: "Build + push Daytona worker snapshot"
+        required: false
+        type: boolean
+        default: true
+      build_electron:
+        description: "Build + publish Electron desktop artifacts (macOS/Linux/Windows)"
+        required: false
+        type: boolean
+        default: true
+      sign_windows:
+        description: "Sign Windows Electron installers with Azure Artifact Signing"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  # Tag pushes dedupe per tag ref; dispatches keyed on the recovery tag or the
+  # run id so cutting a fresh release never cancels another in-flight release.
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref || inputs.tag || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  resolve-production:
+    name: Resolve Release Metadata
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # WARDEN_PRIVATE_KEY lives in this environment; its deployment policy
+    # (dev + v* tags) means the key is only reachable from reviewed code —
+    # a feature-branch workflow edit cannot mint the tag-push token.
+    environment: warden-clearance
+    # Fresh dispatch cuts push their tag with the diff-warden app token, and
+    # app-token pushes DO retrigger this workflow via push (unlike
+    # GITHUB_TOKEN). The dispatch run that created the tag owns the release,
+    # so the duplicate push run skips here — and with it every job that
+    # needs resolve-release.
+    if: github.event.inputs.benchmark_only != 'true' && (github.event_name != 'push' || github.actor != 'diff-warden[bot]')
+    outputs:
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      release_version: ${{ steps.resolve.outputs.release_version }}
+      release_mode: ${{ steps.tag.outputs.release_mode }}
+      release_name: ${{ steps.resolve.outputs.release_name }}
+      release_body: ${{ steps.resolve.outputs.release_body }}
+      draft: ${{ steps.resolve.outputs.draft }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      notarize: ${{ steps.resolve.outputs.notarize }}
+      build_electron: ${{ steps.freeze.outputs.build_electron }}
+      sign_windows: ${{ steps.resolve.outputs.sign_windows }}
+      publish_npm: ${{ steps.resolve.outputs.publish_npm }}
+      publish_daytona_snapshot: ${{ steps.resolve.outputs.publish_daytona_snapshot }}
+      benchmark_only: "false"
+    steps:
+      # Tag creation was admin-only before the app-token flow (the v* tag
+      # ruleset gated it at push time). The app token would let ANY dispatch
+      # release, so restore the old bar here: dispatching actor must be a
+      # repo admin, or explicitly listed in the RELEASE_MANAGERS repo
+      # variable (comma-separated GitHub logins). Tag pushes skip this —
+      # they are still gated by the ruleset itself. This check lives on a
+      # protected branch, and the token mint below is environment-gated to
+      # dev + v* refs, so a feature-branch copy of this workflow can neither
+      # drop the check nor reach the key.
+      - name: Require release permission
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          RELEASE_MANAGERS: ${{ vars.RELEASE_MANAGERS }}
+        run: |
+          set -euo pipefail
+          for allowed in ${RELEASE_MANAGERS//,/ }; do
+            if [ "$allowed" = "$ACTOR" ]; then
+              echo "${ACTOR} is listed in RELEASE_MANAGERS."
+              exit 0
+            fi
+          done
+          permission="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${ACTOR}/permission" --jq .permission)"
+          if [ "$permission" != "admin" ]; then
+            echo "::error::Release dispatch is restricted: ${ACTOR} has '${permission}' but needs repo admin (or a RELEASE_MANAGERS listing)." >&2
+            exit 1
+          fi
+          echo "${ACTOR} is a repo admin."
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # Tag resolution compares against every v* tag, and fresh dispatch
+          # releases tag origin/dev HEAD — both need full history + tags.
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      # The built-in GitHub Actions app cannot be a ruleset bypass actor
+      # (GitHub rejects it), so fresh cuts push their tag as the org-owned
+      # diff-warden app, which is on the v* ruleset bypass list.
+      - name: Mint tag-push token
+        id: tag-token
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.tag == ''
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ secrets.WARDEN_APP_ID }}
+          private-key: ${{ secrets.WARDEN_PRIVATE_KEY }}
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_BUMP: ${{ github.event.inputs.bump }}
+          TAG_PUSH_TOKEN: ${{ steps.tag-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            # Manual tag-first push (admin expedited path). The tag already
+            # exists; the Expedited Release Audit workflow covers tags whose
+            # commit is not on dev.
+            TAG="${GITHUB_REF_NAME}"
+            MODE="fresh"
+          elif [ -n "${INPUT_TAG:-}" ]; then
+            TAG="${INPUT_TAG}"
+            if [[ "$TAG" != v* ]]; then
+              TAG="v${TAG}"
+            fi
+            if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+              echo "Recovery dispatch requires an existing tag; ${TAG} was not found." >&2
+              exit 1
+            fi
+            MODE="recovery"
+          else
+            # Fresh release with no commits anywhere: versions live only in
+            # git tags, so compute the next one and tag origin/dev HEAD.
+            VERSION="${INPUT_VERSION:-}"
+            if [ -n "$VERSION" ]; then
+              VERSION="${VERSION#v}"
+            else
+              VERSION="$(node scripts/release/versions.mjs next --bump "${INPUT_BUMP:-patch}")"
+            fi
+            TAG="v${VERSION}"
+            MODE="fresh"
+            if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+              echo "Tag ${TAG} already exists. Re-run with tag=${TAG} (recovery) instead." >&2
+              exit 1
+            fi
+            git fetch origin dev
+            SHA="$(git rev-parse origin/dev)"
+            # Create the tag ref via REST as the diff-warden app (a v* tag
+            # ruleset bypass actor). Ruleset bypass attributes REST ref
+            # creation to the app; a git-over-https push with the same
+            # installation token is NOT attributed and gets rejected —
+            # proven by the tag-push smoke — so keep this a REST call. The
+            # app-created tag retriggers this workflow, but the duplicate
+            # run is skipped by the actor guard on this job.
+            if [ -n "${TAG_PUSH_TOKEN:-}" ]; then
+              if ! GH_TOKEN="${TAG_PUSH_TOKEN}" gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+                  -f ref="refs/tags/${TAG}" -f sha="${SHA}"; then
+                echo "::error::Creating ${TAG} was rejected by the v* tag ruleset. Ensure the diff-warden app is on its bypass list (Settings → Rules → Protect v* release tags), or push the tag manually as an admin and rerun." >&2
+                exit 1
+              fi
+            else
+              echo "::warning::diff-warden app token unavailable (WARDEN_APP_ID / WARDEN_PRIVATE_KEY in the warden-clearance environment); trying GITHUB_TOKEN."
+              git tag "$TAG" "$SHA"
+              if ! git push origin "refs/tags/${TAG}"; then
+                echo "::error::Pushing ${TAG} was rejected by the v* tag ruleset. Push the tag manually as an admin and rerun." >&2
+                exit 1
+              fi
+            fi
+            echo "Created ${TAG} at ${SHA} (origin/dev HEAD)."
+          fi
+
+          echo "release_tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "release_mode=${MODE}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve metadata
+        id: resolve
+        shell: bash
+        env:
+          RESOLVED_TAG: ${{ steps.tag.outputs.release_tag }}
+          INPUT_RELEASE_NAME: ${{ github.event.inputs.release_name }}
+          INPUT_RELEASE_BODY: ${{ github.event.inputs.release_body }}
+          INPUT_DRAFT: ${{ github.event.inputs.draft }}
+          INPUT_PRERELEASE: ${{ github.event.inputs.prerelease }}
+          INPUT_NOTARIZE: ${{ github.event.inputs.notarize }}
+          INPUT_BUILD_ELECTRON: ${{ github.event.inputs.build_electron }}
+          INPUT_SIGN_WINDOWS: ${{ github.event.inputs.sign_windows }}
+          INPUT_PUBLISH_NPM: ${{ github.event.inputs.publish_npm }}
+          INPUT_PUBLISH_DAYTONA_SNAPSHOT: ${{ github.event.inputs.publish_daytona_snapshot }}
+          DEFAULT_PUBLISH_NPM: ${{ vars.RELEASE_PUBLISH_NPM }}
+          DEFAULT_PUBLISH_DAYTONA_SNAPSHOT: ${{ vars.RELEASE_PUBLISH_DAYTONA_SNAPSHOT }}
+          DEFAULT_NOTARIZE: ${{ vars.MACOS_NOTARIZE }}
+          DEFAULT_BUILD_ELECTRON: ${{ vars.RELEASE_PUBLISH_ELECTRON }}
+          DEFAULT_SIGN_WINDOWS: ${{ vars.RELEASE_SIGN_WINDOWS }}
+        run: |
+          set -euo pipefail
+
+          TAG="${RESOLVED_TAG}"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release tag: $TAG (expected stable vX.Y.Z)" >&2
+            exit 1
+          fi
+
+          RELEASE_NAME_INPUT="${INPUT_RELEASE_NAME:-}"
+          if [ -n "$RELEASE_NAME_INPUT" ]; then
+            RELEASE_NAME="$RELEASE_NAME_INPUT"
+          else
+            RELEASE_NAME="idexal Os $TAG"
+          fi
+
+          RELEASE_BODY_INPUT="${INPUT_RELEASE_BODY:-}"
+          if [ -n "$RELEASE_BODY_INPUT" ]; then
+            RELEASE_BODY="$RELEASE_BODY_INPUT"
+          else
+            printf -v RELEASE_BODY '%s\n\nIdexalOs %s desktop release.\n\n%s\n%s\n%s\n%s' \
+              "## What's new" \
+              "$TAG" \
+              "- Public artifacts use the idexal-os-* naming convention." \
+              "- Cloud artifacts use idexal-os-cloud-* and require sign-in without enterprise activation." \
+              "- Enterprise artifacts use idexal-os-enterprise-* while retaining the standard idexal Os app identity." \
+              "- Public, Cloud, and enterprise Electron builds use separate updater manifests on this release."
+          fi
+
+          # A release must never be public while its artifacts are still
+          # building: default to draft for every entry path (tag push AND
+          # fresh dispatch). publish-release flips it public at the end.
+          draft="${INPUT_DRAFT:-true}"
+          prerelease="${INPUT_PRERELEASE:-false}"
+          notarize="${INPUT_NOTARIZE:-}"
+          if [ -z "$notarize" ]; then
+            notarize="${DEFAULT_NOTARIZE:-true}"
+          fi
+
+          build_electron="${INPUT_BUILD_ELECTRON:-}"
+          if [ -z "$build_electron" ]; then
+            build_electron="${DEFAULT_BUILD_ELECTRON:-true}"
+          fi
+
+          sign_windows="${INPUT_SIGN_WINDOWS:-}"
+          if [ -z "$sign_windows" ]; then
+            sign_windows="${DEFAULT_SIGN_WINDOWS:-false}"
+          fi
+
+          if [ "$sign_windows" = "true" ]; then
+            WINDOWS_SIGNED_NOTE='*Windows installers are signed using Microsoft Artifact Signing.*'
+            printf -v RELEASE_BODY '%s\n\n%s' "$RELEASE_BODY" "$WINDOWS_SIGNED_NOTE"
+          else
+            WINDOWS_UNSIGNED_NOTE='*Windows installer is temporarily unsigned while production code signing is being finalized.*'
+            printf -v RELEASE_BODY '%s\n\n%s' "$RELEASE_BODY" "$WINDOWS_UNSIGNED_NOTE"
+          fi
+
+          publish_npm="${INPUT_PUBLISH_NPM:-}"
+          if [ -z "$publish_npm" ]; then
+            publish_npm="${DEFAULT_PUBLISH_NPM:-true}"
+          fi
+
+          publish_daytona_snapshot="${INPUT_PUBLISH_DAYTONA_SNAPSHOT:-}"
+          if [ -z "$publish_daytona_snapshot" ]; then
+            publish_daytona_snapshot="${DEFAULT_PUBLISH_DAYTONA_SNAPSHOT:-true}"
+          fi
+
+          TAG="${TAG//$'\n'/}"
+          TAG="${TAG//$'\r'/}"
+          RELEASE_NAME="${RELEASE_NAME//$'\n'/ }"
+          RELEASE_NAME="${RELEASE_NAME//$'\r'/ }"
+
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "release_version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "release_name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
+          echo "draft=$draft" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "notarize=$notarize" >> "$GITHUB_OUTPUT"
+          echo "build_electron=$build_electron" >> "$GITHUB_OUTPUT"
+          echo "sign_windows=$sign_windows" >> "$GITHUB_OUTPUT"
+          echo "publish_npm=$publish_npm" >> "$GITHUB_OUTPUT"
+          echo "publish_daytona_snapshot=$publish_daytona_snapshot" >> "$GITHUB_OUTPUT"
+          {
+            echo "release_body<<__IDEXAL_RELEASE_BODY_EOF__"
+            printf '%s\n' "$RELEASE_BODY"
+            echo "__IDEXAL_RELEASE_BODY_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create release if missing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          BODY_FILE="$RUNNER_TEMP/release_body.md"
+          printf '%s\n' "${{ steps.resolve.outputs.release_body }}" > "$BODY_FILE"
+
+          if gh release view "${{ steps.resolve.outputs.release_tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release ${{ steps.resolve.outputs.release_tag }} already exists; skipping create."
+            exit 0
+          fi
+
+          PRERELEASE_FLAG=""
+          if [ "${{ steps.resolve.outputs.prerelease }}" = "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          # A new release must never be public while its artifacts are still
+          # building. The final publish-release job is the only place that
+          # removes draft status, after every required asset has been checked.
+          gh release create "${{ steps.resolve.outputs.release_tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "${{ steps.resolve.outputs.release_name }}" \
+            --notes-file "$BODY_FILE" \
+            --draft $PRERELEASE_FLAG
+
+      # A published release's desktop assets are immutable. Rebuilding them
+      # re-signs every installer, and the build legs upload with --clobber
+      # while the updater manifests are only rewritten if the whole run
+      # reaches publish-release. A recovery run that fails in between leaves
+      # latest*.yml describing bytes that no longer exist, and every
+      # auto-update fails with "sha512 checksum mismatch" (v0.18.52).
+      # Recovery runs on a published release therefore replay only the
+      # non-desktop channels; ship desktop fixes as the next patch.
+      - name: Freeze desktop assets on published releases
+        id: freeze
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
+          BUILD_ELECTRON: ${{ steps.resolve.outputs.build_electron }}
+        run: |
+          set -euo pipefail
+          build_electron="$BUILD_ELECTRON"
+          is_draft="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)"
+          if [ "$build_electron" = "true" ] && [ "$is_draft" != "true" ]; then
+            echo "::warning::$RELEASE_TAG is already published; skipping desktop builds so its installers and updater manifests stay consistent. Cut the next patch to ship new desktop bytes."
+            build_electron="false"
+          fi
+          echo "build_electron=$build_electron" >> "$GITHUB_OUTPUT"
+
+  resolve-benchmark:
+    name: Resolve Benchmark Metadata
+    if: github.event.inputs.benchmark_only == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      release_version: ${{ steps.resolve.outputs.release_version }}
+      release_mode: ${{ steps.resolve.outputs.release_mode }}
+      notarize: ${{ steps.resolve.outputs.notarize }}
+      build_electron: ${{ steps.resolve.outputs.build_electron }}
+      sign_windows: ${{ steps.resolve.outputs.sign_windows }}
+      publish_npm: ${{ steps.resolve.outputs.publish_npm }}
+      publish_daytona_snapshot: ${{ steps.resolve.outputs.publish_daytona_snapshot }}
+      benchmark_only: ${{ steps.resolve.outputs.benchmark_only }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - name: Resolve non-publishing benchmark context
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "release_tag=${GITHUB_SHA}"
+            echo "release_version=0.0.0-benchmark.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+            echo "release_mode=benchmark"
+            echo "notarize=true"
+            echo "build_electron=true"
+            echo "sign_windows=true"
+            echo "publish_npm=false"
+            echo "publish_daytona_snapshot=false"
+            echo "benchmark_only=true"
+            echo "prerelease=true"
+          } >> "$GITHUB_OUTPUT"
+
+  resolve-release:
+    name: Select Release Context
+    needs: [resolve-production, resolve-benchmark]
+    if: |
+      always() &&
+      (needs.resolve-production.result == 'success' || needs.resolve-benchmark.result == 'success')
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      release_tag: ${{ needs.resolve-production.outputs.release_tag || needs.resolve-benchmark.outputs.release_tag }}
+      release_version: ${{ needs.resolve-production.outputs.release_version || needs.resolve-benchmark.outputs.release_version }}
+      release_mode: ${{ needs.resolve-production.outputs.release_mode || needs.resolve-benchmark.outputs.release_mode }}
+      notarize: ${{ needs.resolve-production.outputs.notarize || needs.resolve-benchmark.outputs.notarize }}
+      build_electron: ${{ needs.resolve-production.outputs.build_electron || needs.resolve-benchmark.outputs.build_electron }}
+      sign_windows: ${{ needs.resolve-production.outputs.sign_windows || needs.resolve-benchmark.outputs.sign_windows }}
+      publish_npm: ${{ needs.resolve-production.outputs.publish_npm || needs.resolve-benchmark.outputs.publish_npm }}
+      publish_daytona_snapshot: ${{ needs.resolve-production.outputs.publish_daytona_snapshot || needs.resolve-benchmark.outputs.publish_daytona_snapshot }}
+      benchmark_only: ${{ needs.resolve-production.outputs.benchmark_only || needs.resolve-benchmark.outputs.benchmark_only }}
+      prerelease: ${{ needs.resolve-production.outputs.prerelease || needs.resolve-benchmark.outputs.prerelease }}
+    steps:
+      - run: true
+
+  verify-release:
+    name: Verify Release Versions
+    needs: resolve-release
+    # Benchmark mode intentionally skips resolve-production. Override the
+    # implicit success() check so that skipped sibling does not propagate
+    # through the selected release context and suppress verification.
+    if: always() && needs.resolve-release.result == 'success'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    env:
+      RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+      RELEASE_MODE: ${{ needs.resolve-release.outputs.release_mode }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Verify release tag
+        if: needs.resolve-release.outputs.benchmark_only != 'true'
+        run: node scripts/release/verify-tag.mjs --tag "$RELEASE_TAG" --mode "$RELEASE_MODE"
+
+      - name: Release review (strict)
+        run: node scripts/release/review.mjs --strict
+
+  publish-electron-unix:
+    name: Build + publish Electron (${{ matrix.artifact }})
+    needs: [resolve-release, verify-release]
+    if: |
+      always() &&
+      needs.resolve-release.result == 'success' &&
+      needs.verify-release.result == 'success' &&
+      needs.resolve-release.outputs.build_electron == 'true'
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 120
+    env:
+      RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+      RELEASE_VERSION: ${{ needs.resolve-release.outputs.release_version }}
+      MACOS_NOTARIZE: ${{ needs.resolve-release.outputs.notarize }}
+      SIGN_WINDOWS: ${{ needs.resolve-release.outputs.sign_windows }}
+      BENCHMARK_ONLY: ${{ needs.resolve-release.outputs.benchmark_only }}
+      # A filtered frozen install already materializes the complete desktop
+      # dependency closure. Without this, pnpm may "repair" the intentionally
+      # partial workspace with a second all-workspace install before scripts.
+      PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN: "false"
+      IDEXAL_DESKTOP_SENTRY_DSN: ${{ secrets.IDEXAL_DESKTOP_SENTRY_DSN || vars.IDEXAL_DESKTOP_SENTRY_DSN }}
+      IDEXAL_DESKTOP_SENTRY_TRACES_SAMPLE_RATE: ${{ vars.IDEXAL_DESKTOP_SENTRY_TRACES_SAMPLE_RATE || '0.01' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: blacksmith-12vcpu-macos-15
+            os_type: macos
+            artifact: electron-macos-arm64
+            builder_config: electron-builder.yml
+            asset_prefix: idexal-os
+            manifest_pattern: latest*.yml
+            electron_args: "--mac --arm64"
+            target_triple: aarch64-apple-darwin
+          - platform: blacksmith-12vcpu-macos-15
+            os_type: macos
+            artifact: electron-macos-x64
+            builder_config: electron-builder.yml
+            asset_prefix: idexal-os
+            manifest_pattern: latest*.yml
+            electron_args: "--mac --x64"
+            target_triple: x86_64-apple-darwin
+          - platform: blacksmith-16vcpu-ubuntu-2204
+            os_type: linux
+            artifact: electron-linux-x64
+            builder_config: electron-builder.yml
+            asset_prefix: idexal-os
+            manifest_pattern: latest*.yml
+            electron_args: "--linux --x64"
+            target_triple: x86_64-unknown-linux-gnu
+          # electron-builder can package ARM64 without executing the target
+          # binaries. Cross-package on the faster x64 compression runner; the
+          # workspace installs both CPU variants of optional native packages.
+          - platform: blacksmith-16vcpu-ubuntu-2204
+            os_type: linux
+            artifact: electron-linux-arm64
+            builder_config: electron-builder.yml
+            asset_prefix: idexal-os
+            manifest_pattern: latest*.yml
+            electron_args: "--linux --arm64"
+            target_triple: aarch64-unknown-linux-gnu
+          - platform: blacksmith-12vcpu-macos-15
+            os_type: macos
+            artifact: electron-cloud-macos-arm64
+            builder_config: electron-builder.cloud.yml
+            asset_prefix: idexal-os-cloud
+            manifest_pattern: cloud*.yml
+            electron_args: "--mac --arm64"
+            target_triple: aarch64-apple-darwin
+          - platform: blacksmith-12vcpu-macos-15
+            os_type: macos
+            artifact: electron-cloud-macos-x64
+            builder_config: electron-builder.cloud.yml
+            asset_prefix: idexal-os-cloud
+            manifest_pattern: cloud*.yml
+            electron_args: "--mac --x64"
+            target_triple: x86_64-apple-darwin
+          - platform: blacksmith-16vcpu-ubuntu-2204
+            os_type: linux
+            artifact: electron-cloud-linux-x64
+            builder_config: electron-builder.cloud.yml
+            asset_prefix: idexal-os-cloud
+            manifest_pattern: cloud*.yml
+            electron_args: "--linux --x64"
+            target_triple: x86_64-unknown-linux-gnu
+          - platform: blacksmith-16vcpu-ubuntu-2204
+            os_type: linux
+            artifact: electron-cloud-linux-arm64
+            builder_config: electron-builder.cloud.yml
+            asset_prefix: idexal-os-cloud
+            manifest_pattern: cloud*.yml
+            electron_args: "--linux --arm64"
+            target_triple: aarch64-unknown-linux-gnu
+          - platform: blacksmith-12vcpu-macos-15
+            os_type: macos
+            artifact: electron-enterprise-macos-arm64
+            builder_config: electron-builder.enterprise.yml
+            asset_prefix: idexal-os-enterprise
+            manifest_pattern: enterprise*.yml
+            electron_args: "--mac --arm64"
+            target_triple: aarch64-apple-darwin
+          - platform: blacksmith-12vcpu-macos-15
+            os_type: macos
+            artifact: electron-enterprise-macos-x64
+            builder_config: electron-builder.enterprise.yml
+            asset_prefix: idexal-os-enterprise
+            manifest_pattern: enterprise*.yml
+            electron_args: "--mac --x64"
+            target_triple: x86_64-apple-darwin
+          - platform: blacksmith-16vcpu-ubuntu-2204
+            os_type: linux
+            artifact: electron-enterprise-linux-x64
+            builder_config: electron-builder.enterprise.yml
+            asset_prefix: idexal-os-enterprise
+            manifest_pattern: enterprise*.yml
+            electron_args: "--linux --x64"
+            target_triple: x86_64-unknown-linux-gnu
+          - platform: blacksmith-16vcpu-ubuntu-2204
+            os_type: linux
+            artifact: electron-enterprise-linux-arm64
+            builder_config: electron-builder.enterprise.yml
+            asset_prefix: idexal-os-enterprise
+            manifest_pattern: enterprise*.yml
+            electron_args: "--linux --arm64"
+            target_triple: aarch64-unknown-linux-gnu
+
+    steps: &electron-build-steps
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # Source is always pinned to the tag. Recovery reruns pick up
+          # workflow-file fixes from the dispatched ref automatically (the
+          # workflow definition runs from github.ref), while the shipped code
+          # stays exactly what the tag names.
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 1
+
+      - name: Enable git long paths (Windows)
+        if: matrix.os_type == 'windows'
+        shell: pwsh
+        run: git config --global core.longpaths true
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.4.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          # Bun >= 1.3.10 is required by the server build and package-time helpers.
+          bun-version: 1.3.10
+
+      - name: Get pnpm store path
+        id: pnpm-store
+        shell: bash
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v5
+        continue-on-error: true
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-electron-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-electron-pnpm-
+
+      - name: Install dependencies
+        run: pnpm --filter @idexal/desktop... --filter @idexal/app... --filter idexal-os-server... install --frozen-lockfile --prefer-offline
+
+      # The repo commits a permanent 0.0.0-dev placeholder; the release
+      # version exists only as the git tag. Stamp it into the workspace so
+      # electron-builder, app.getVersion(), and the Vite bundle carry it.
+      # Pre-redesign tags carry real committed versions and no stamp script —
+      # skipping is exactly the old behavior for them.
+      - name: Stamp release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f scripts/release/stamp-version.mjs ]; then
+            node scripts/release/stamp-version.mjs --version "$RELEASE_VERSION"
+          else
+            echo "Pre-redesign tag: committed package.json versions are in effect."
+          fi
+
+      - name: Write Electron notary API key (macOS)
+        if: matrix.os_type == 'macos' && env.MACOS_NOTARIZE == 'true'
+        env:
+          APPLE_NOTARY_API_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_API_KEY_P8_BASE64 }}
+          APPLE_NOTARY_API_KEY_ID: ${{ secrets.APPLE_NOTARY_API_KEY_ID }}
+          APPLE_NOTARY_API_ISSUER_ID: ${{ secrets.APPLE_NOTARY_API_ISSUER_ID }}
+          APPLE_CODESIGN_CERT_P12_BASE64: ${{ secrets.APPLE_CODESIGN_CERT_P12_BASE64 }}
+          APPLE_CODESIGN_CERT_PASSWORD: ${{ secrets.APPLE_CODESIGN_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          missing=()
+          for name in \
+            APPLE_NOTARY_API_KEY_P8_BASE64 \
+            APPLE_NOTARY_API_KEY_ID \
+            APPLE_NOTARY_API_ISSUER_ID \
+            APPLE_CODESIGN_CERT_P12_BASE64 \
+            APPLE_CODESIGN_CERT_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf 'Missing Electron macOS notarization/signing secrets: %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+
+          NOTARY_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s' "$APPLE_NOTARY_API_KEY_P8_BASE64" | base64 --decode > "$NOTARY_KEY_PATH"
+          chmod 600 "$NOTARY_KEY_PATH"
+
+          echo "NOTARY_KEY_PATH=$NOTARY_KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Reject unnotarized macOS Electron release
+        if: matrix.os_type == 'macos' && env.MACOS_NOTARIZE != 'true'
+        shell: bash
+        run: |
+          echo "macOS Electron release assets must be notarized. Re-run with notarize=true or set MACOS_NOTARIZE=true." >&2
+          exit 1
+
+      - name: Build Electron app
+        shell: bash
+        env:
+          # TARGET tells prepare-sidecar.mjs which architecture's opencode binary
+          # to download (critical for cross-arch builds like x64 on arm64 mac).
+          TARGET: ${{ matrix.target_triple }}
+        run: pnpm --filter @idexal/desktop build:electron
+
+      - name: Package Electron (macOS, signed + notarized)
+        if: matrix.os_type == 'macos' && env.MACOS_NOTARIZE == 'true'
+        env:
+          CSC_LINK: ${{ secrets.APPLE_CODESIGN_CERT_P12_BASE64 }}
+          CSC_KEY_PASSWORD: ${{ secrets.APPLE_CODESIGN_CERT_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_NOTARY_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_NOTARY_API_ISSUER_ID }}
+          APPLE_API_KEY_PATH: ${{ env.NOTARY_KEY_PATH }}
+        run: |
+          set -euo pipefail
+          pnpm --dir apps/desktop exec electron-builder \
+            --config ${{ matrix.builder_config }} \
+            ${{ matrix.electron_args }} \
+            --publish never
+
+      - name: Package Electron (Linux)
+        if: matrix.os_type == 'linux'
+        run: |
+          set -euo pipefail
+          pnpm --dir apps/desktop exec electron-builder \
+            --config ${{ matrix.builder_config }} \
+            ${{ matrix.electron_args }} \
+            --publish never
+
+      - name: Package Electron (Windows)
+        if: matrix.os_type == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm --dir apps/desktop exec electron-builder \
+            --config ${{ matrix.builder_config }} \
+            ${{ matrix.electron_args }} \
+            --publish never
+
+      # Belt-and-braces: a broken or skipped stamp would otherwise ship
+      # 0.0.0-dev artifacts silently. Every packaged build must produce at
+      # least one artifact carrying the release version (also holds for
+      # pre-redesign tags — their committed version equals the tag).
+      - name: Assert artifact versions match the tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          matches=(apps/desktop/dist-electron/*"$RELEASE_VERSION"*)
+          if [ ${#matches[@]} -eq 0 ]; then
+            echo "No packaged artifact carries version $RELEASE_VERSION — version stamping failed?" >&2
+            ls apps/desktop/dist-electron >&2 || true
+            exit 1
+          fi
+          printf 'Version-checked artifact: %s\n' "${matches[@]}"
+
+      - name: Use unsigned Windows installer fallback
+        if: matrix.os_type == 'windows' && env.SIGN_WINDOWS != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::warning::Publishing unsigned Windows installer because SIGN_WINDOWS is not enabled."
+
+      # electron-builder may still emit latest*.yml for a custom distribution.
+      # Normalize each non-public feed so it cannot update into another flavor.
+      - name: Normalize custom distribution updater manifests
+        if: matrix.asset_prefix != 'idexal-os'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd apps/desktop/dist-electron
+          shopt -s nullglob
+          channel="${{ matrix.asset_prefix }}"
+          channel="${channel#idexal-os-}"
+          for manifest in latest*.yml; do
+            target="${channel}${manifest#latest}"
+            if [ -e "$target" ]; then
+              rm -f "$manifest"
+            else
+              mv "$manifest" "$target"
+            fi
+          done
+          manifests=("${channel}"*.yml)
+          if [ ${#manifests[@]} -eq 0 ]; then
+            echo "${channel} build produced no updater manifest." >&2
+            exit 1
+          fi
+          printf '%s\n' "${manifests[@]}"
+
+      - name: Validate Azure Artifact Signing configuration
+        if: matrix.os_type == 'windows' && env.SIGN_WINDOWS == 'true'
+        shell: pwsh
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID || secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID || secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID || secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT || secrets.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          AZURE_ARTIFACT_SIGNING_ACCOUNT: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT || secrets.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+          AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE || secrets.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
+        run: |
+          $required = @(
+            "AZURE_CLIENT_ID",
+            "AZURE_TENANT_ID",
+            "AZURE_SUBSCRIPTION_ID",
+            "AZURE_ARTIFACT_SIGNING_ENDPOINT",
+            "AZURE_ARTIFACT_SIGNING_ACCOUNT",
+            "AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE"
+          )
+          $missing = $required | Where-Object { -not [Environment]::GetEnvironmentVariable($_) }
+          if ($missing.Count -gt 0) {
+            throw "Missing windows-signing environment variables: $($missing -join ', ')"
+          }
+
+          $dist = Join-Path $env:GITHUB_WORKSPACE "apps\desktop\dist-electron"
+          $installers = Get-ChildItem $dist -Filter "*.exe"
+          if ($installers.Count -ne 1) {
+            throw "Expected one unsigned Windows installer, found $($installers.Count)"
+          }
+
+      - name: Azure login with GitHub OIDC
+        if: matrix.os_type == 'windows' && env.SIGN_WINDOWS == 'true'
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3.0.1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID || secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID || secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID || secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Windows installer
+        if: matrix.os_type == 'windows' && env.SIGN_WINDOWS == 'true'
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT || secrets.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT || secrets.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE || secrets.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
+          files-folder: ${{ github.workspace }}\apps\desktop\dist-electron
+          files-folder-filter: exe
+          files-folder-recurse: false
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify Windows signature
+        if: matrix.os_type == 'windows' && env.SIGN_WINDOWS == 'true'
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:GITHUB_WORKSPACE "apps\desktop\dist-electron"
+          $installers = Get-ChildItem $dist -Filter "*.exe"
+          if ($installers.Count -ne 1) {
+            throw "Expected one signed Windows installer, found $($installers.Count)"
+          }
+
+          $signature = Get-AuthenticodeSignature $installers[0].FullName
+          Write-Host "$($installers[0].Name): $($signature.Status) - $($signature.SignerCertificate.Subject)"
+          if ($signature.Status -ne "Valid") {
+            throw "$($installers[0].Name) signature is $($signature.Status)"
+          }
+
+      - name: Refresh signed installer blockmap and manifest
+        if: matrix.os_type == 'windows' && env.SIGN_WINDOWS == 'true'
+        shell: bash
+        run: node scripts/release/refresh-signed-windows-artifacts.mjs apps/desktop/dist-electron 1
+
+      - name: Upload Electron release assets
+        if: env.BENCHMARK_ONLY != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(apps/desktop/dist-electron/${{ matrix.asset_prefix }}-*)
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "No Electron release assets found in apps/desktop/dist-electron" >&2
+            exit 1
+          fi
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Retain benchmark Electron assets
+        if: env.BENCHMARK_ONLY == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ matrix.artifact }}
+          path: |
+            apps/desktop/dist-electron/${{ matrix.asset_prefix }}-*
+            apps/desktop/dist-electron/${{ matrix.manifest_pattern }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload Electron updater manifest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: apps/desktop/dist-electron/${{ matrix.manifest_pattern }}
+          if-no-files-found: error
+
+  publish-electron-windows:
+    name: Build + publish Electron (${{ matrix.artifact }})
+    needs: [resolve-release, verify-release]
+    if: |
+      always() &&
+      needs.resolve-release.result == 'success' &&
+      needs.verify-release.result == 'success' &&
+      needs.resolve-release.outputs.build_electron == 'true'
+    runs-on: ${{ matrix.platform }}
+    environment: windows-signing
+    timeout-minutes: 120
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+      RELEASE_VERSION: ${{ needs.resolve-release.outputs.release_version }}
+      MACOS_NOTARIZE: ${{ needs.resolve-release.outputs.notarize }}
+      SIGN_WINDOWS: ${{ needs.resolve-release.outputs.sign_windows }}
+      BENCHMARK_ONLY: ${{ needs.resolve-release.outputs.benchmark_only }}
+      PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN: "false"
+      IDEXAL_DESKTOP_SENTRY_DSN: ${{ secrets.IDEXAL_DESKTOP_SENTRY_DSN || vars.IDEXAL_DESKTOP_SENTRY_DSN }}
+      IDEXAL_DESKTOP_SENTRY_TRACES_SAMPLE_RATE: ${{ vars.IDEXAL_DESKTOP_SENTRY_TRACES_SAMPLE_RATE || '0.01' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: blacksmith-8vcpu-windows-2025
+            os_type: windows
+            artifact: electron-windows-x64
+            builder_config: electron-builder.yml
+            asset_prefix: idexal-os
+            manifest_pattern: latest*.yml
+            electron_args: "--win --x64"
+            target_triple: x86_64-pc-windows-msvc
+          # electron-builder cross-packages ARM64 on the faster x64 runner.
+          # pnpm-workspace.yaml installs both Windows CPU variants so native
+          # optional dependencies remain correct in the ARM64 artifact.
+          - platform: blacksmith-8vcpu-windows-2025
+            os_type: windows
+            artifact: electron-windows-arm64
+            builder_config: electron-builder.yml
+            asset_prefix: idexal-os
+            manifest_pattern: latest*.yml
+            electron_args: "--win --arm64"
+            target_triple: aarch64-pc-windows-msvc
+          - platform: blacksmith-8vcpu-windows-2025
+            os_type: windows
+            artifact: electron-cloud-windows-x64
+            builder_config: electron-builder.cloud.yml
+            asset_prefix: idexal-os-cloud
+            manifest_pattern: cloud*.yml
+            electron_args: "--win --x64"
+            target_triple: x86_64-pc-windows-msvc
+          - platform: blacksmith-8vcpu-windows-2025
+            os_type: windows
+            artifact: electron-cloud-windows-arm64
+            builder_config: electron-builder.cloud.yml
+            asset_prefix: idexal-os-cloud
+            manifest_pattern: cloud*.yml
+            electron_args: "--win --arm64"
+            target_triple: aarch64-pc-windows-msvc
+          - platform: blacksmith-8vcpu-windows-2025
+            os_type: windows
+            artifact: electron-enterprise-windows-x64
+            builder_config: electron-builder.enterprise.yml
+            asset_prefix: idexal-os-enterprise
+            manifest_pattern: enterprise*.yml
+            electron_args: "--win --x64"
+            target_triple: x86_64-pc-windows-msvc
+          - platform: blacksmith-8vcpu-windows-2025
+            os_type: windows
+            artifact: electron-enterprise-windows-arm64
+            builder_config: electron-builder.enterprise.yml
+            asset_prefix: idexal-os-enterprise
+            manifest_pattern: enterprise*.yml
+            electron_args: "--win --arm64"
+            target_triple: aarch64-pc-windows-msvc
+
+    steps: *electron-build-steps
+
+  publish-release:
+    name: Publish Electron Assets + GitHub Release
+    needs:
+      - resolve-release
+      - verify-release
+      - publish-electron-unix
+      - publish-electron-windows
+      - publish-npm
+      - publish-daytona-snapshot
+    # publish-daytona-snapshot is allowed to fail without blocking the release:
+    # the sandbox snapshot is rebuildable after the fact, while installable
+    # desktop artifacts should never be held back by it.
+    if: |
+      always() &&
+      needs.resolve-release.result == 'success' &&
+      needs.verify-release.result == 'success' &&
+      needs.resolve-release.outputs.benchmark_only != 'true' &&
+      (needs.resolve-release.outputs.build_electron != 'true' || needs.publish-electron-unix.result == 'success') &&
+      (needs.resolve-release.outputs.build_electron != 'true' || needs.publish-electron-windows.result == 'success') &&
+      (needs.publish-npm.result == 'success' || needs.publish-npm.result == 'skipped') &&
+      needs.publish-daytona-snapshot.result != 'cancelled'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      published_stable: ${{ steps.publish.outputs.published_stable }}
+    env:
+      RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+      RELEASE_PRERELEASE: ${{ needs.resolve-release.outputs.prerelease }}
+    steps:
+      - name: Checkout
+        if: needs.resolve-release.outputs.build_electron == 'true'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 1
+
+      - name: Setup Node
+        if: needs.resolve-release.outputs.build_electron == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Download Electron updater manifest artifacts
+        if: needs.resolve-release.outputs.build_electron == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: electron-*
+          path: ${{ runner.temp }}/electron-dist
+
+      - name: Upload merged updater manifests
+        if: needs.resolve-release.outputs.build_electron == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/release/publish-electron-assets.mjs --manifests-only "${{ runner.temp }}/electron-dist" "$RELEASE_TAG"
+
+      - name: Publish release after assets are ready
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Dispatch-based recovery runs default draft=false but may target a
+          # draft release created by an earlier tag push; always flip drafts
+          # here so AUR and updater feeds see public download URLs.
+          is_draft="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)"
+          if [ "$is_draft" != "true" ]; then
+            echo "Release $RELEASE_TAG is already published; nothing to do."
+            exit 0
+          fi
+
+          if [ "${RELEASE_PRERELEASE}" = "true" ]; then
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
+          else
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+            echo "published_stable=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  dispatch-changelog:
+    name: Dispatch changelog
+    needs: [resolve-release, publish-release]
+    # always() is required: resolve-benchmark is a skipped ancestor on every
+    # production release, and the implicit success() would skip this job.
+    if: |
+      always() &&
+      needs.publish-release.result == 'success' &&
+      needs.publish-release.outputs.published_stable == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # This job deliberately checks out nothing and runs no repository code, so
+    # actions: write is never available to code executed from the release tag.
+    permissions:
+      actions: write
+    env:
+      RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+    steps:
+      - name: Dispatch changelog.yml for the published stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # GitHub does not start workflows from `release: published` events
+          # created by GITHUB_TOKEN, so hand the stable tag to the changelog
+          # workflow explicitly. It writes docs + rewrites the release notes.
+          if ! gh workflow run changelog.yml --repo "$GITHUB_REPOSITORY" --ref dev -f "tag=$RELEASE_TAG"; then
+            echo "::warning::Could not dispatch changelog.yml for $RELEASE_TAG; run it manually: gh workflow run changelog.yml -f tag=$RELEASE_TAG"
+          fi
+
+  prepare-npm:
+    name: Prepare idexal-os-server npm package
+    needs: [resolve-release, verify-release]
+    if: |
+      always() &&
+      needs.resolve-release.result == 'success' &&
+      needs.verify-release.result == 'success' &&
+      needs.resolve-release.outputs.benchmark_only != 'true' &&
+      needs.resolve-release.outputs.publish_npm == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      publish_server: ${{ steps.npm-versions.outputs.publish_server }}
+    env:
+      RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+      RELEASE_VERSION: ${{ needs.resolve-release.outputs.release_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 1
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.4.0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          # Bun bundles idexal-os-server for Node (build:npm-bundle) before npm publish.
+          bun-version: "1.3.10"
+
+      - name: Get pnpm store path
+        id: pnpm-store
+        shell: bash
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v5
+        continue-on-error: true
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ubuntu-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ubuntu-pnpm-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      # idexal-os-server publishes with the tag-derived version; the committed
+      # package.json holds the permanent 0.0.0-dev placeholder. Pre-redesign
+      # tags carry real committed versions and no stamp script.
+      - name: Stamp release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f scripts/release/stamp-version.mjs ]; then
+            node scripts/release/stamp-version.mjs --version "$RELEASE_VERSION"
+          else
+            echo "Pre-redesign tag: committed package.json versions are in effect."
+          fi
+
+      - name: Check npm versions
+        id: npm-versions
+        shell: bash
+        env:
+          SERVER_VERSION: ${{ env.RELEASE_VERSION }}
+        run: |
+          set -euo pipefail
+          # npm view exits non-zero for packages that don't exist yet (404).
+          # Treat missing packages as "not published" so release can publish them.
+          server_current="$(npm view idexal-os-server version 2>/dev/null || true)"
+
+          if [ "$server_current" = "$SERVER_VERSION" ]; then
+            echo "publish_server=false" >> "$GITHUB_OUTPUT"
+            echo "publish_any=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish_server=true" >> "$GITHUB_OUTPUT"
+            echo "publish_any=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare idexal-os-server
+        if: steps.npm-versions.outputs.publish_server == 'true'
+        run: pnpm --filter idexal-os-server publish:npm --dry-run
+
+      - name: Upload npm package
+        if: steps.npm-versions.outputs.publish_server == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: idexal-os-server-npm-${{ env.RELEASE_VERSION }}
+          path: apps/server/dist/npm
+          if-no-files-found: error
+
+  verify-npm-hosts:
+    name: Verify npm server (${{ matrix.target }}, Node ${{ matrix.node }})
+    needs: [resolve-release, prepare-npm]
+    # always() is required: resolve-benchmark is skipped on every production
+    # release, and a job whose `if` lacks a status function is skipped when
+    # any transitive dependency was skipped. Without it this matrix never
+    # runs and publish-npm silently skips (v0.18.51, v0.18.52).
+    if: |
+      always() &&
+      needs.resolve-release.result == 'success' &&
+      needs.prepare-npm.result == 'success' &&
+      needs.prepare-npm.outputs.publish_server == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.13.0 is the package's engines floor (node:sqlite without a flag).
+          - os: ubuntu-24.04
+            target: linux-x64
+            node: "22.13.0"
+          - os: macos-15-intel
+            target: darwin-x64
+            node: "24"
+          - os: macos-15
+            target: darwin-arm64
+            node: "24"
+          - os: windows-2022
+            target: windows-x64
+            node: "24"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout smoke script
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve-release.outputs.release_tag }}
+          sparse-checkout: apps/server/scripts/npm-web-smoke.mjs
+          sparse-checkout-cone-mode: false
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Download npm package
+        uses: actions/download-artifact@v4
+        with:
+          name: idexal-os-server-npm-${{ needs.resolve-release.outputs.release_version }}
+          path: ${{ runner.temp }}/idexal-os-server-npm
+      # Install the exact tarball that will be published, as a user would,
+      # then run `idexal-os-server web` on a fresh profile: first-run engine
+      # download, web UI, API, engine plugins and session creation.
+      - name: Install the package tarball and run idexal-os-server web
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.resolve-release.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          packs="$RUNNER_TEMP/npm-packs"
+          prefix="$RUNNER_TEMP/npm-prefix"
+          mkdir -p "$packs" "$prefix"
+          (cd "$RUNNER_TEMP/idexal-os-server-npm" && npm pack --pack-destination "$packs")
+          npm install -g --prefix "$prefix" "$packs/idexal-os-server-$RELEASE_VERSION.tgz"
+          launcher="$(npm root -g --prefix "$prefix")/idexal-os-server/bin/idexal-os-server.mjs"
+          node apps/server/scripts/npm-web-smoke.mjs "$launcher" "$RELEASE_VERSION"
+
+  publish-npm:
+    name: Publish idexal-os-server
+    needs: [resolve-release, verify-release, prepare-npm, verify-npm-hosts]
+    if: |
+      always() &&
+      needs.resolve-release.result == 'success' &&
+      needs.verify-release.result == 'success' &&
+      needs.prepare-npm.result == 'success' &&
+      needs.verify-npm-hosts.result == 'success' &&
+      needs.prepare-npm.outputs.publish_server == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    env:
+      RELEASE_VERSION: ${{ needs.resolve-release.outputs.release_version }}
+    steps:
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Download npm package
+        uses: actions/download-artifact@v4
+        with:
+          name: idexal-os-server-npm-${{ env.RELEASE_VERSION }}
+          path: ${{ runner.temp }}/idexal-os-server-npm
+
+      - name: Pack and verify package contents
+        id: npm-pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/idexal-os-server-npm"
+          chmod 755 bin/idexal-os-server.mjs
+          npm pack --json --pack-destination "$RUNNER_TEMP" > "$RUNNER_TEMP/npm-pack.json"
+          filename="$(node -p 'require(process.env.RUNNER_TEMP + "/npm-pack.json")[0].filename')"
+          tarball="$RUNNER_TEMP/$filename"
+          unpacked="$(mktemp -d)"
+          tar -xzf "$tarball" -C "$unpacked"
+          package="$unpacked/package"
+          test -x "$package/bin/idexal-os-server.mjs"
+          test -f "$package/bin/platform.mjs"
+          test -f "$package/dist/idexal-os-server.mjs"
+          test -f "$package/dist/pdfium.wasm"
+          test -f "$package/dist/opencode-plugins/idexal-os-extensions-preview.js"
+          test -f "$package/web/index.html"
+          test ! -e "$package/dist/bin"
+          test "$(node -p "require('$package/package.json').version")" = "$RELEASE_VERSION"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+
+      - name: Publish idexal-os-server
+        shell: bash
+        env:
+          NPM_TARBALL: ${{ steps.npm-pack.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          if [ "$(npm view "idexal-os-server@$RELEASE_VERSION" version 2>/dev/null || true)" = "$RELEASE_VERSION" ]; then
+            echo "idexal-os-server@$RELEASE_VERSION is already published; skipping."
+            exit 0
+          fi
+          npm publish "$NPM_TARBALL" --access public --provenance
+
+      - name: Install the published package from npm
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6; do
+            prefix="$(mktemp -d)"
+            if npm install -g --prefix "$prefix" "idexal-os-server@$RELEASE_VERSION" \
+              && actual="$("$prefix/bin/idexal-os-server" --version)" \
+              && [ "$actual" = "$RELEASE_VERSION" ]; then
+              echo "npm install -g idexal-os-server@$RELEASE_VERSION runs $actual"
+              exit 0
+            fi
+            echo "Registry not serving idexal-os-server@$RELEASE_VERSION yet (attempt $attempt); retrying in 30s."
+            sleep 30
+          done
+          exit 1
+
+  publish-daytona-snapshot:
+    name: Build + Push Daytona Snapshot
+    needs: [resolve-release, verify-release, publish-npm]
+    if: |
+      always() &&
+      needs.resolve-release.result == 'success' &&
+      needs.verify-release.result == 'success' &&
+      needs.resolve-release.outputs.benchmark_only != 'true' &&
+      (needs.publish-npm.result == 'success' || needs.publish-npm.result == 'skipped') &&
+      needs.resolve-release.outputs.publish_daytona_snapshot == 'true'
+    uses: ./.github/workflows/release-daytona-snapshot.yml
+    with:
+      tag: ${{ needs.resolve-release.outputs.release_tag }}
+    secrets: inherit
+
+  aur-publish:
+    name: Publish AUR
+    needs: [resolve-release, publish-electron-unix, publish-release]
+    if: |
+      always() &&
+      needs.resolve-release.result == 'success' &&
+      needs.resolve-release.outputs.benchmark_only != 'true' &&
+      needs.publish-electron-unix.result == 'success' &&
+      needs.publish-release.result == 'success'
+    # AUR is a community distribution channel hosted on aur.archlinux.org.
+    # Outages there (e.g. "The AUR is down due to maintenance", 2026-08-04)
+    # must not mark an otherwise-published release run as failed.
+    continue-on-error: true
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@v6
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      # packaging/aur holds a version-agnostic template (pkgver=0.0.0).
+      # publish-aur.sh renders the real version + checksums from the published
+      # release assets in the CI workspace and pushes ONLY to the AUR remote —
+      # the commit to aur.archlinux.org is AUR's publish protocol, and nothing
+      # is ever committed to this repo.
+      - name: Publish to AUR
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_REPO: ${{ vars.AUR_REPO || 'idexalos' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AUR_SSH_PRIVATE_KEY:-}" ]; then
+            echo "AUR_SSH_PRIVATE_KEY not set; skipping publish to AUR."
+            exit 0
+          fi
+          scripts/aur/publish-aur.sh "$RELEASE_TAG"

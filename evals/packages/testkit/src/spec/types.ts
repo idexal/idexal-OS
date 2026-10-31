@@ -1,0 +1,169 @@
+import type { DenSession, DenFetchResult, FieldTypingOptions } from "@idexal/behaviors";
+import type { BrowserEvaluation, Surface, Target, Viewport } from "@idexal/cdp";
+import type {
+  MockHandle,
+  Place,
+  Seed,
+  TestNeeds,
+} from "@idexal/env";
+import type { ScreenshotArtifact, StepRecord, TestEvidenceRecorder, TestOutcome, TraceEntry } from "@idexal/test-evidence";
+import type { TestAPI } from "vitest";
+import type { EventuallyOptions } from "@idexal/env";
+
+export interface SeeOptions {
+  timeoutMs?: number;
+  editable?: boolean;
+  value?: string;
+  text?: string | RegExp;
+}
+
+export interface ClickOptions {
+  /** Last resort for an intentionally covered target; still clicks its trusted CDP center. */
+  hitTest?: boolean;
+}
+
+export interface TypeOptions extends FieldTypingOptions {
+  /** Optional visible character pacing for recorded journeys. */
+  intervalMs?: number;
+  /** Replace existing text with a real select-all key chord before typing. Defaults to append. */
+  replace?: boolean;
+}
+
+export interface ProbeEvalOptions {
+  awaitPromise?: true;
+  timeoutMs?: number;
+}
+
+export interface User {
+  click(target: Target, options?: ClickOptions): Promise<void>;
+  rightClick(target: Target, options?: ClickOptions): Promise<void>;
+  dblclick(target: Target): Promise<void>;
+  type(target: Target, text: string, options?: TypeOptions): Promise<void>;
+  press(key: string): Promise<void>;
+  hover(target: Target): Promise<void>;
+  /** Trusted wheel input at an observed point, without locator auto-scrolling. */
+  wheelAt(input: { x: number; y: number; deltaY: number; deltaX?: number }): Promise<void>;
+  see(target: Target, options?: SeeOptions): Promise<void>;
+  notSee(target: Target, options?: { timeoutMs?: number }): Promise<void>;
+  reload(): Promise<void>;
+  resizeViewport(viewport: Viewport): Promise<void>;
+  navigate(url: string): Promise<void>;
+  screenshot(): Promise<ScreenshotArtifact>;
+  /**
+   * Save a reopenable checkpoint of this moment and record its image. Only when the
+   * run asked for checkpoints (`--checkpoints`) and the world can capture this
+   * surface; otherwise a one-line warning is printed and nothing is saved.
+   */
+  checkpoint(caption?: string): Promise<ScreenshotArtifact | undefined>;
+  looks(expectations: string[]): Promise<void>;
+  on(surface: Surface): User;
+}
+
+export interface Agent {
+  browserTask(input: import("@idexal/behaviors").BrowserTaskInput): Promise<import("@idexal/behaviors").BrowserTaskReply>;
+  browserRequest(input: { url: string; method?: string; body?: string }): Promise<{ reached: boolean; error?: string }>;
+  desktopApi(path: string, input: { method: string; body?: unknown }): Promise<{ status: number; body: unknown }>;
+  run(action: string, args?: unknown): Promise<unknown>;
+  send(text: string): Promise<unknown>;
+  createSession(title?: string): Promise<string>;
+  list(): Promise<{ sessionId: string; title: string }[]>;
+  actions(): Promise<unknown>;
+  on(surface: Surface): Agent;
+}
+
+export interface CredentialInputState {
+  dialogPresent: boolean;
+  dialogExcludedFromCapture: boolean;
+  inputExcludedFromCapture: boolean;
+  inputType: string | null;
+  autoComplete: string | null;
+  empty: boolean;
+  inputContainsSecret: boolean;
+  bodyContainsSecret: boolean;
+  urlContainsSecret: boolean;
+  historyContainsSecret: boolean;
+  storageContainsSecret: boolean;
+  consoleContainsSecret: boolean;
+}
+
+export interface Probe {
+  credentialInputState(selector: string, candidate?: string): Promise<CredentialInputState>;
+  /** Applied CSS-to-DIP page zoom from Chromium, not the stored zoom preference. */
+  zoom(): Promise<number>;
+  browserState(): Promise<import("@idexal/behaviors").BrowserState>;
+  browserTabMetrics(targetId: string): ReturnType<typeof import("@idexal/behaviors").readBrowserTabMetrics>;
+  browserFixtureState(origin: string): Promise<import("@idexal/env").BrowserFixtureState>;
+  text(): Promise<string>;
+  /** Fixed, read-only DOM projection for layout, focus and element presence assertions. */
+  dom(selector: string): ReturnType<typeof import("@idexal/cdp").readDom>;
+  has(text: string): Promise<boolean>;
+  composer(): ReturnType<typeof import("@idexal/behaviors").readComposerState>;
+  connectorCatalog(): ReturnType<typeof import("@idexal/behaviors").readConnectorCatalog>;
+  storage(key: string): Promise<unknown>;
+  storage<T>(key: string, pick: (value: unknown) => T): Promise<T>;
+  /** The app route as "#/workspace/...": the hash on the desktop, the path on the app in a browser. */
+  url(): Promise<string>;
+  linkTargets(selector: string): Promise<string[]>;
+  hash(): Promise<string>;
+  eval<T>(expression: BrowserEvaluation<T>, options?: ProbeEvalOptions): Promise<Awaited<T>>;
+  eval<T>(surface: Surface, expression: BrowserEvaluation<T>, options?: ProbeEvalOptions): Promise<Awaited<T>>;
+  connectState(app: Surface): ReturnType<typeof import("../state.ts").readConnectState>;
+  api(session: DenSession, path: string, init?: RequestInit): Promise<DenFetchResult>;
+  /** GET from the bound desktop's local server; authentication stays in the renderer. */
+  desktopApi(path: string): Promise<{ status: number; body: unknown }>;
+  toolCalls(mock: MockHandle, options?: Parameters<MockHandle["toolCalls"]>[0]): ReturnType<MockHandle["toolCalls"]>;
+  eventually<T>(fn: () => Promise<T> | T, options: EventuallyOptions<T>): Promise<T>;
+  on(surface: Surface): Probe;
+}
+
+export interface StepOptions {
+  /** Save a reopenable checkpoint of the world when this step passes (see `User.checkpoint`). */
+  checkpoint?: boolean;
+}
+
+/** Options come last so every existing `(name, fn)` step implementation still fits. */
+export type Step = <T>(name: string, fn: () => Promise<T> | T, options?: StepOptions) => Promise<T>;
+
+export type WorldFn<W> = (seed: Seed, ctx: { place: Place }) => Promise<W>;
+
+export interface SpecBodyContext<W> {
+  world: W;
+  seed: Seed;
+  user: User;
+  agent: Agent;
+  probe: Probe;
+  step: Step;
+  evidence: TestEvidenceRecorder;
+  place: Place;
+}
+
+export type SpecTestApi<W> = TestAPI<SpecBodyContext<W>>;
+
+export interface SpecAdapters {
+  seed?: {
+    tmpPath?(label: string): string;
+  };
+  user?: {
+    click?(surface: Surface, target: Target, clickCount: number): Promise<void>;
+  };
+  probe?: {
+    text?(surface: Surface): Promise<string>;
+  };
+  observe?: {
+    trace?(entry: TraceEntry): void;
+    step?(step: StepRecord): void;
+    outcome?(outcome: TestOutcome, failure?: string): void;
+  };
+}
+
+export interface SpecWorldOptions {
+  /** Frozen at registration and shared by arrangement/body. Omit only for bounded legacy migration. */
+  readonly resources?: import("@idexal/env").WorldResources;
+  needs?: TestNeeds;
+  timeout?: number;
+  scope?: "test" | "file";
+  /** Deterministic app-less test seam; production specs must not provide adapters. */
+  adapters?: SpecAdapters;
+}
+
+export type { OrgConnectionInput, Seed, SeedAppWebOptions, SeedDesktopOptions, SeedWebOptions } from "@idexal/env";

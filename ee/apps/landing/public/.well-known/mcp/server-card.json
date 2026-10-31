@@ -1,0 +1,35 @@
+{
+  "name": "com.idexal/idexalos",
+  "title": "idexal Os MCP Gateway",
+  "version": "1.0.0",
+  "description": "One MCP URL for your idexal Os organization: org-assigned skills, plugins, workflows, and connections (Google Workspace, Microsoft 365, and MCP servers), exposed through search_capabilities and execute_capability.",
+  "url": "https://api.idexal.com/mcp/agent",
+  "transport": "streamable-http",
+  "authentication": "oauth2",
+  "auth": {
+    "type": "oauth2",
+    "protectedResourceMetadata": "https://api.idexal.com/.well-known/oauth-protected-resource/mcp/agent",
+    "authorizationServer": "https://os.idexal.com/api/auth",
+    "scopes": ["mcp:read", "mcp:write", "offline_access"],
+    "dynamicClientRegistration": true
+  },
+  "capabilities": {
+    "tools": true,
+    "resources": true
+  },
+  "coreTools": ["search_capabilities", "execute_capability"],
+  "websiteUrl": "https://os.idexal.com/connect",
+  "documentationUrl": "https://os.idexal.com/docs/start-here/connect-idexal-os-mcp",
+  "signUpUrl": "https://os.idexal.com?mode=sign-up",
+  "repository": {
+    "url": "https://github.com/idexal/idexalOs",
+    "source": "github",
+    "subfolder": "ee/apps/den-api"
+  },
+  "install": {
+    "claude-code": "claude mcp add --transport http idexalos https://api.idexal.com/mcp/agent",
+    "codex": "codex mcp add idexalos --url https://api.idexal.com/mcp/agent && codex mcp login idexalos",
+    "gemini-cli": "gemini mcp add --transport http idexalos https://api.idexal.com/mcp/agent",
+    "opencode": "opencode mcp add idexalos --url https://api.idexal.com/mcp/agent && opencode mcp auth idexalos"
+  }
+}

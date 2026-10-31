@@ -1,0 +1,681 @@
+/**
+ * Shared contract for the Electron desktop IPC bridge.
+ *
+ * Producer: apps/desktop/electron/main.mjs — `desktopCommandHandlers`, typed
+ * via JSDoc against `DesktopCommandHandlers` so missing/extra/renamed
+ * commands fail `typecheck:electron`.
+ * Consumer: apps/app/src/app/lib/desktop.ts — the `desktopBridge` Proxy and
+ * its named exports derive per-command signatures from `DesktopCommandMap`.
+ *
+ * Every command sent over the `idexalos:desktop` channel has exactly one
+ * entry here: `args` is the tuple the renderer passes, `result` what the
+ * main process resolves. Results marked `unknown` are not yet modeled —
+ * tighten them instead of widening call sites.
+ */
+import type { ConnectLinkVerifyFailure, ConnectLinkVerifyResult } from "./connect-link.js";
+import type { WorkspaceWire } from "./workspace.js";
+
+// ---------------------------------------------------------------------------
+// Payload shapes (moved from apps/app/src/app/lib/desktop-types.ts, which
+// re-exports them — keep that file as the app-side import path).
+// ---------------------------------------------------------------------------
+
+export type OpencodeExecutionEnvEntry = {
+  name: string;
+  value: string;
+  redacted: boolean;
+};
+
+export type OpencodeExecutionSnapshot = {
+  command: string;
+  args: string[];
+  cwd: string;
+  env: OpencodeExecutionEnvEntry[];
+};
+
+export type EngineInfo = {
+  running: boolean;
+  runtime: "direct";
+  managedByServer: boolean;
+  baseUrl: string | null;
+  projectDir: string | null;
+  hostname: string | null;
+  port: number | null;
+  opencodeUsername: string | null;
+  opencodePassword: string | null;
+  opencodeBinPath: string | null;
+  opencodeBinSource: string | null;
+  pid: number | null;
+  lastStdout: string | null;
+  lastStderr: string | null;
+  execution: OpencodeExecutionSnapshot | null;
+};
+
+export type DesktopNotificationInput = {
+  title: string;
+  body?: string;
+  href?: string;
+  silent?: boolean;
+};
+
+export type DesktopNotificationResult =
+  | { ok: true }
+  | { ok: false; reason: string };
+
+export type DesktopIntegrationIssue =
+  | "appimage-path"
+  | "desktop-entry"
+  | "icon"
+  | "protocol-handler"
+  | "version";
+
+export type DesktopIntegrationStatus = {
+  supported: boolean;
+  state: "unsupported" | "not_integrated" | "integrated" | "needs_repair" | "managed_externally";
+  ownership: "none" | "idexalos" | "external";
+  appImagePath: string | null;
+  desktopEntryPath: string | null;
+  handlerDesktopId: string | null;
+  issues: DesktopIntegrationIssue[];
+};
+
+export type DesktopIntegrationResult = {
+  ok: boolean;
+  status: DesktopIntegrationStatus;
+  error?: string;
+};
+
+export type IdexalOsServerInfo = {
+  running: boolean;
+  /**
+   * Monotonic per-start identity of the embedded server within this desktop
+   * process. Sticky ports and persisted tokens keep the connection details
+   * identical across restarts, so clients that must re-deliver state to a new
+   * server lifetime (e.g. the Connect policy) key on this value. Null when
+   * the bridge predates the field or no start completed yet.
+   */
+  generation: number | null;
+  host: string | null;
+  port: number | null;
+  baseUrl: string | null;
+  clientToken: string | null;
+  ownerToken: string | null;
+  hostToken: string | null;
+  managedOpencodeBinPath: string | null;
+  managedOpencodeBinSource: string | null;
+  /** Structured server log on disk, or null when the server runs without a file sink. */
+  logFilePath: string | null;
+  pid: number | null;
+  lastStdout: string | null;
+  lastStderr: string | null;
+  managedOpencodeExecution: OpencodeExecutionSnapshot | null;
+};
+
+export type EngineDoctorResult = {
+  found: boolean;
+  inPath: boolean;
+  resolvedPath: string | null;
+  resolvedSource: string | null;
+  version: string | null;
+  supportsServe: boolean;
+  notes: string[];
+  serveHelpStatus: number | null;
+  serveHelpStdout: string | null;
+  serveHelpStderr: string | null;
+};
+
+export type WorkspaceList = {
+  selectedId?: string;
+  watchedId?: string | null;
+  activeId?: string | null;
+  workspaces: WorkspaceWire[];
+};
+
+export type WorkspaceExportSummary = {
+  outputPath: string;
+  included: number;
+  excluded: string[];
+};
+
+export type BrandIconApplyResult = { ok: boolean; reason?: string };
+export type BrandIconState = { applied: boolean; sourceUrl: string | null; reason: string | null };
+export type EvalRelaunchResult = { ok: true };
+
+export type OpencodeCommandDraft = {
+  name: string;
+  description?: string;
+  template: string;
+  agent?: string;
+  model?: string;
+  subtask?: boolean;
+};
+
+export type WorkspaceIdexalOsConfig = {
+  version: number;
+  workspace?: {
+    name?: string | null;
+    createdAt?: number | null;
+    preset?: string | null;
+  } | null;
+  authorizedRoots: string[];
+  reload?: {
+    auto?: boolean;
+    resume?: boolean;
+  } | null;
+};
+
+export type InstallReceipt = {
+  /** Version written by the platform installer, not the app bundle. */
+  version: string | null;
+  previousVersion: string | null;
+  architecture: string | null;
+  /** "all" for a machine-wide install, "CurrentUser" for a per-user one. */
+  scope: string | null;
+  installDir: string | null;
+  wizard: string | null;
+};
+
+export type AppBuildInfo = {
+  version: string;
+  gitSha?: string | null;
+  buildEpoch?: string | null;
+  idexalOsDevMode?: boolean;
+  os?: string | null;
+  arch?: string | null;
+  /** Present when the app was installed by an idexal Os platform installer. */
+  installReceipt?: InstallReceipt | null;
+};
+
+export type DesktopDistributionInfo = {
+  flavor: "public" | "enterprise";
+  appName: string;
+  appIdentifier: string;
+  protocolScheme: string;
+  requireSignin: boolean;
+  requireActivation: boolean;
+};
+
+/** Org + first-skill identity shared by the handoff and prepared records. */
+export type DesktopBootstrapOrgSkill = {
+  orgId: string;
+  orgName: string;
+  orgSlug: string;
+  skillId: string;
+  skillTitle: string;
+};
+
+export type DesktopBootstrapConfig = {
+  baseUrl: string;
+  apiBaseUrl?: string | null;
+  requireSignin: boolean;
+  requireActivation?: boolean;
+  brandAppName?: string | null;
+  brandLogoUrl?: string | null;
+  brandIconUrl?: string | null;
+  writtenAt?: string | null;
+  fromFile?: boolean;
+  claimLinks?: Array<{
+    id: string;
+    role: string;
+    token?: string;
+    url: string;
+    expiresAt: string;
+  }> | null;
+  handoff?: (DesktopBootstrapOrgSkill & {
+    grant: string;
+    denBaseUrl: string;
+    createdAt: string;
+  }) | null;
+  prepared?: (DesktopBootstrapOrgSkill & {
+    skillsDir: string;
+    skillPath: string;
+    preparedAt: string;
+  }) | null;
+  enterpriseActivation?: {
+    activatedAt: string;
+    denBaseUrl: string;
+  } | null;
+};
+
+export type IdexalOsDockerCleanupResult = {
+  candidates: string[];
+  removed: string[];
+  errors: string[];
+};
+
+export type ExecResult = {
+  ok: boolean;
+  status: number;
+  stdout: string;
+  stderr: string;
+};
+
+export type LocalSkillCard = {
+  name: string;
+  path: string;
+  description?: string;
+  trigger?: string;
+};
+
+export type LocalSkillContent = {
+  path: string;
+  content: string;
+};
+
+export type OpencodeConfigFile = {
+  path: string;
+  exists: boolean;
+  content: string | null;
+};
+
+export type UpdaterEnvironment = {
+  supported: boolean;
+  reason: string | null;
+  executablePath: string | null;
+  appBundlePath: string | null;
+};
+
+export type CacheResetResult = {
+  removed: string[];
+  missing: string[];
+  errors: string[];
+};
+
+export type NukeManifestPreview = {
+  deletePaths: string[];
+  bootstrapPath: string;
+  preserveBootstrapPath: string | null;
+  partitions: string[];
+};
+
+export type NukeOptions = {
+  preserveBootstrap: boolean;
+};
+
+export type NukeReceiptError = {
+  path: string;
+  message: string;
+  code?: string;
+};
+
+export type NukeReceipt = {
+  deleted: string[];
+  pendingRetry: string[];
+  errors: NukeReceiptError[];
+  preservedBootstrap: boolean;
+  relaunchMode: "cleanup_worker" | "direct";
+  workerScheduled: boolean;
+};
+
+export type DesktopFetchInit = {
+  transferId?: string;
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  timeoutMs?: number;
+  agentContextDiagnostics?: {
+    deadlineAtMs: number;
+  };
+};
+
+export type DesktopFetchResult = {
+  status: number;
+  statusText: string;
+  headers: [string, string][];
+  body: string;
+};
+
+/**
+ * Outcome of opening a workspace file from chat. The host resolves the file on disk and
+ * only launches it when it is a real file inside the real workspace root; a file that
+ * resolves elsewhere is shown in its folder instead of being handed to an application.
+ */
+export type DesktopWorkspaceFileOpenResult =
+  | { ok: true; action: "opened" | "revealed" }
+  | { ok: false; error: string };
+
+export type DesktopBinaryDownloadResult = {
+  status: number;
+  statusText: string;
+  headers: [string, string][];
+  path: string | null;
+  bytes: number;
+  body?: string;
+};
+
+export type WorkspaceCreateInput = {
+  folderPath: string;
+  name?: string | null;
+  preset?: string | null;
+};
+
+export type UiControlBridgeInfo = {
+  baseUrl?: string;
+  token?: string;
+};
+
+export type ProxyProfileKind =
+  | "static_residential"
+  | "rotating_residential"
+  | "datacenter"
+  | "mobile"
+  | "custom";
+
+export type ProxyProtocol = "http" | "https" | "socks5";
+
+export type ProxyProfileInput = {
+  id?: string;
+  name: string;
+  kind: ProxyProfileKind;
+  protocol: ProxyProtocol;
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+  country?: string;
+  timezone?: string;
+  locale?: string;
+  latitude?: number | null;
+  longitude?: number | null;
+  userAgent?: string;
+  rotationUrl?: string;
+  providerId?: string;
+  providerSlug?: string;
+  notes?: string;
+  applyToApp?: boolean;
+  alignIdentity?: boolean;
+};
+
+export type ProxyProfile = {
+  id: string;
+  name: string;
+  kind: ProxyProfileKind;
+  protocol: ProxyProtocol;
+  host: string;
+  port: number;
+  username: string;
+  hasPassword: boolean;
+  country: string;
+  timezone: string;
+  locale: string;
+  latitude: number | null;
+  longitude: number | null;
+  userAgent: string;
+  rotationUrl: string;
+  providerId: string;
+  providerSlug: string;
+  notes: string;
+  applyToApp: boolean;
+  alignIdentity: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ProxyGuardState = {
+  running: boolean;
+  host: string;
+  port: number;
+  usedBytes: number;
+  limitBytes: number | null;
+  month: string;
+};
+
+export type ProxyState = {
+  enabled: boolean;
+  activeId: string | null;
+  profiles: ProxyProfile[];
+  guard: ProxyGuardState | null;
+  lastError: string | null;
+  secretsUnavailable: boolean;
+  updatedAt: string;
+};
+
+export type ProxyTestResult = {
+  ok: boolean;
+  status: number | null;
+  latencyMs: number | null;
+  ip: string | null;
+  country: string | null;
+  error: string | null;
+};
+
+export type ProxyRotateResult = {
+  ok: boolean;
+  status: number | null;
+  message: string | null;
+  error: string | null;
+};
+
+export type BrowserPrewarmResult = {
+  ok: boolean;
+  tabId: string | null;
+  code: string | null;
+};
+
+// ---------------------------------------------------------------------------
+// The command map
+// ---------------------------------------------------------------------------
+
+export type DesktopCommandMap = {
+  // Workspace state
+  workspaceBootstrap: { args: []; result: WorkspaceList };
+  workspaceSetSelected: { args: [workspaceId: string]; result: WorkspaceList };
+  workspaceSetRuntimeActive: { args: [workspaceId: string | null]; result: WorkspaceList };
+  workspaceCreate: { args: [input: WorkspaceCreateInput]; result: WorkspaceList };
+  workspaceForget: { args: [workspaceId: string]; result: WorkspaceList };
+  workspaceIdexalOsRead: {
+    args: [input: { workspacePath: string }];
+    result: WorkspaceIdexalOsConfig;
+  };
+  workspaceIdexalOsWrite: {
+    args: [input: { workspacePath: string; config: WorkspaceIdexalOsConfig }];
+    result: unknown;
+  };
+  workspaceIdexalOsReset: {
+    args: [input: { workspacePath: string }];
+    result: WorkspaceIdexalOsConfig;
+  };
+
+  // Engine / runtime lifecycle
+  engineStart: { args: [projectDir: string, options?: Record<string, unknown>]; result: EngineInfo };
+  runtimeBootstrap: { args: []; result: unknown };
+  runtimeStatus: { args: []; result: unknown };
+  engineStop: { args: []; result: EngineInfo };
+  engineRestart: { args: [options?: Record<string, unknown>]; result: EngineInfo };
+  engineInfo: { args: []; result: EngineInfo };
+
+  // App / bridge info
+  appBuildInfo: { args: []; result: AppBuildInfo };
+  desktopNotificationShow: {
+    args: [input: DesktopNotificationInput];
+    result: DesktopNotificationResult;
+  };
+  desktopSentrySetSession: {
+    args: [input: { userId: string; orgId: string }];
+    result: { enabled: boolean };
+  };
+  desktopSentryClearSession: { args: []; result: { enabled: boolean } };
+  desktopIntegrationStatus: { args: []; result: DesktopIntegrationStatus };
+  desktopIntegrationInstall: {
+    args: [options?: { useExternalLauncher?: boolean }];
+    result: DesktopIntegrationResult;
+  };
+  desktopIntegrationRemove: { args: []; result: DesktopIntegrationResult };
+  getUiControlBridgeInfo: { args: []; result: UiControlBridgeInfo | null };
+  getIdexalOsUiMcpCommand: { args: []; result: string[] };
+  getIdexalOsUiMcpEnvironment: { args: []; result: Record<string, string> };
+
+  // Bootstrap config
+  getDesktopBootstrapConfig: { args: []; result: DesktopBootstrapConfig };
+  debugDesktopBootstrapConfig: { args: []; result: unknown };
+  clearDesktopBootstrapConfig: { args: []; result: unknown };
+  setDesktopBootstrapConfig: {
+    args: [config: Partial<DesktopBootstrapConfig>];
+    result: DesktopBootstrapConfig;
+  };
+
+  // Connect links use a short-lived HTTPS exchange by default and can use an
+  // embedded-key signed token when explicitly enabled. The renderer relays
+  // only the raw URL. `connectLinkAccept` resolves it again after confirmation,
+  // enforces one-time use, and persists the target as desktop bootstrap config.
+  connectLinkVerify: { args: [rawUrl: string]; result: ConnectLinkVerifyResult };
+  connectLinkAccept: {
+    args: [rawUrl: string];
+    result: { ok: true; config: DesktopBootstrapConfig } | ConnectLinkVerifyFailure;
+  };
+  // The mandatory first-launch sign-in gate opens the platform's sign-in and
+  // plan pages inside a window of the app's own instead of a browser, so the
+  // user never leaves the app. The Electron side watches for the app's own
+  // scheme and hands the grant back through the existing deep-link channel.
+  openEmbeddedAuth: {
+    args: [url: string];
+    result: { ok: boolean; error?: string; reused?: boolean };
+  };
+  nukeIdexalOsAndOpencodeConfigPreview: { args: [options?: NukeOptions]; result: NukeManifestPreview };
+  nukeIdexalOsAndOpencodeConfigAndExit: { args: [options?: NukeOptions]; result: NukeReceipt };
+
+  // idexal Os server sidecar
+  idexalOsServerInfo: { args: []; result: IdexalOsServerInfo };
+  automationRunnerConfigure: {
+    args: [configuration: { baseUrl: string; token: string; runnerId: string } | null];
+    result: { connected: boolean };
+  };
+  idexalOsServerRestart: {
+    args: [options?: Record<string, unknown>];
+    result: IdexalOsServerInfo;
+  };
+
+  // Dialogs
+  pickDirectory: {
+    args: [options?: { title?: string; defaultPath?: string; multiple?: boolean }];
+    result: string | string[] | null;
+  };
+  pickFile: {
+    args: [
+      options?: {
+        title?: string;
+        defaultPath?: string;
+        multiple?: boolean;
+        filters?: { name: string; extensions: string[] }[];
+      },
+    ];
+    result: string | string[] | null;
+  };
+
+  // Skills
+  importSkill: {
+    args: [projectDir: string, sourceDir: string, options?: { overwrite?: boolean }];
+    result: ExecResult;
+  };
+  installSkillTemplate: {
+    args: [projectDir: string, name: string, content: string, options?: { overwrite?: boolean }];
+    result: ExecResult;
+  };
+  listLocalSkills: { args: [projectDir: string]; result: LocalSkillCard[] };
+  readLocalSkill: { args: [projectDir: string, skillName: string]; result: LocalSkillContent };
+  writeLocalSkill: {
+    args: [projectDir: string, skillName: string, content: string];
+    result: ExecResult;
+  };
+  uninstallSkill: { args: [projectDir: string, skillName: string]; result: ExecResult };
+
+  // Proxy Manager
+  proxyState: { args: []; result: ProxyState };
+  proxySave: { args: [input: ProxyProfileInput]; result: ProxyState };
+  proxyDelete: { args: [id: string]; result: ProxyState };
+  proxyActivate: { args: [id: string]; result: ProxyState };
+  proxyDisable: { args: []; result: ProxyState };
+  proxySetLimit: { args: [gigabytes: number | null]; result: ProxyState };
+  proxyTest: { args: [id: string]; result: ProxyTestResult };
+  proxyRotate: { args: [id: string]; result: ProxyRotateResult };
+  browserPrewarm: { args: [options?: { url?: string; sessionId?: string; ownerSessionId?: string }]; result: BrowserPrewarmResult };
+
+  // Updater / config / resets
+  updaterEnvironment: { args: []; result: UpdaterEnvironment };
+  readOpencodeConfig: { args: [scope: string, projectDir?: string]; result: OpencodeConfigFile };
+  writeOpencodeConfig: {
+    args: [scope: string, projectDir: string, content: string];
+    result: ExecResult;
+  };
+  /**
+   * The renderer passes its reset-modal mode, but the main process currently
+   * IGNORES it and always removes workspace state + bootstrap config; only
+   * the renderer's localStorage cleanup is mode-scoped. Follow-up: decide
+   * whether "onboarding" should preserve desktop workspace state.
+   */
+  resetIdexalOsState: { args: [mode?: "onboarding" | "all"]; result: unknown };
+  repairLocalCache: { args: []; result: { ok: boolean } };
+  idexalOsDockerCleanup: { args: []; result: IdexalOsDockerCleanupResult };
+  opencodeMcpAuth: { args: [action: string, name: string]; result: ExecResult };
+
+  // Window / OS utilities (dunder commands)
+  __showContextMenu: { args: [request: NativeContextMenuRequest]; result: string | null };
+  __cancelContextMenu: { args: [requestId: string]; result: boolean };
+  __openPath: { args: [target: string]; result: unknown };
+  __idexalOsspaceFile: { args: [workspaceRoot: string, target: string]; result: DesktopWorkspaceFileOpenResult };
+  __revealItemInDir: { args: [target: string]; result: unknown };
+  __applyBrandAppName: { args: [appName: string | null]; result: { ok: true; appName: string } };
+  __applyBrandIcon: { args: [url: string | null]; result: BrandIconApplyResult };
+  __getBrandIconState: { args: []; result: BrandIconState };
+  __evalRelaunch: { args: []; result: EvalRelaunchResult };
+  __getApplicationsForFile: { args: [target: string]; result: { name: string; appPath: string; icon: string | null }[] };
+  __openWithApp: { args: [target: string, appPath: string, workspaceRoot: string]; result: unknown };
+  __fetch: { args: [url: string, init?: DesktopFetchInit]; result: DesktopFetchResult };
+  __cancelTransfer: { args: [transferId: string]; result: boolean };
+  __homeDir: { args: []; result: string };
+  __joinPath: { args: [...segments: string[]]; result: string };
+  __setZoomFactor: { args: [factor: number]; result: boolean };
+  __setNativeTheme: { args: [theme: string]; result: unknown };
+  __setApplicationMenuVisible: { args: [visible: boolean]; result: unknown };
+};
+
+/** Data-only context menu contract; callbacks and privileged Electron roles never cross IPC. */
+export type NativeContextMenuItem = { type: "separator" } | {
+  type: "item";
+  id: string;
+  label: string;
+  enabled?: boolean;
+  submenu?: NativeContextMenuItem[];
+};
+
+export type NativeContextMenuRequest = {
+  requestId?: string;
+  items: NativeContextMenuItem[];
+  point: { x: number; y: number };
+  includeEditing?: boolean;
+};
+
+export type DesktopCommandName = keyof DesktopCommandMap;
+
+export type DesktopCommandArgs<C extends DesktopCommandName> = DesktopCommandMap[C]["args"];
+
+export type DesktopCommandResult<C extends DesktopCommandName> = DesktopCommandMap[C]["result"];
+
+/**
+ * Main-process handler registry shape. `Event` is electron's
+ * IpcMainInvokeEvent (kept generic so this package does not depend on
+ * electron types).
+ *
+ * Args are deliberately loose (`any[]`) on this side: IPC input crosses a
+ * trust boundary, so handlers validate/normalize whatever arrives with
+ * defensive dynamic access (`String(args[0] ?? "")`, `input.foo ?? null`)
+ * rather than assuming the renderer's tuple. `unknown[]` would force ~50
+ * narrowing rewrites in the plain-JS main process for no runtime gain.
+ * Key parity and result types are still enforced.
+ */
+type DesktopCommandHandler<Event, C extends DesktopCommandName> = (
+  event: Event,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ...args: any[]
+) => Promise<DesktopCommandResult<C>>;
+
+export type DesktopCommandHandlers<Event = unknown> = {
+  [C in Exclude<DesktopCommandName, "__evalRelaunch">]: DesktopCommandHandler<Event, C>;
+} & {
+  __evalRelaunch?: DesktopCommandHandler<Event, "__evalRelaunch">;
+};
+
+/** Renderer-side bridge: one async function per command. */
+export type DesktopCommandInvokers = {
+  [C in DesktopCommandName]: (...args: DesktopCommandArgs<C>) => Promise<DesktopCommandResult<C>>;
+};
