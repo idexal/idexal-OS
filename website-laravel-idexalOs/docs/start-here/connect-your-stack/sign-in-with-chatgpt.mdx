@@ -1,0 +1,56 @@
+---
+title: "Sign in with ChatGPT"
+description: "Use your ChatGPT Plus or Pro subscription as a model provider in the idexal Os desktop app."
+keywords: ["chatgpt", "openai", "chatgpt plus", "chatgpt pro", "sign in", "connect provider", "gpt", "subscription", "oauth"]
+---
+
+<Note>
+**Local provider setup.** This connects ChatGPT directly to the desktop app. idexal Os remains free, and you do not need to sign in to idexal Os Cloud. For model access managed by your organization, see [Adding a managed LLM provider](/cloud/share-with-your-team/managed-llm-provider).
+</Note>
+
+If you pay for ChatGPT, you can use that subscription to run idexal Os. You sign in to OpenAI once, then pick a ChatGPT model in any chat.
+
+## Before you start
+
+- You need a paid ChatGPT plan, such as Plus or Pro.
+- Use the email address that holds that subscription when you sign in.
+
+## Connect ChatGPT
+
+1. Open **Settings › AI Providers**.
+2. Click **Connect provider**. The **Connect providers** dialog opens.
+
+<Frame>
+  ![The Connect provider button in idexal Os settings](/images/chatgpt-connect-provider-settings.png)
+</Frame>
+
+3. Choose **OpenAI**. You see "Choose how you'd like to connect."
+4. Choose the ChatGPT subscription option. It is named as in the provider list, for example **ChatGPT Pro/Plus**.
+5. A browser tab opens. Sign in to OpenAI with the email for your subscription.
+
+<Frame>
+  ![OpenAI sign-in page in the browser](/images/chatgpt-openai-auth-login.png)
+</Frame>
+
+6. Return to idexal Os. The dialog shows "Waiting for browser confirmation." and closes by itself once OpenAI confirms the sign-in.
+
+If the browser tab didn't open or you closed it, click **Open browser again**.
+
+## Pick a ChatGPT model
+
+1. In a chat, click the model name under the message box.
+
+<Frame>
+  ![Model selector in the chat box](/images/chatgpt-model-selector.png)
+</Frame>
+
+2. Choose a ChatGPT model from the list. The list shows models from every provider you've connected.
+
+<Frame>
+  ![Model list showing models from all connected providers](/images/chatgpt-model-list.png)
+</Frame>
+
+## Common issues
+
+- **No Connect provider button.** Your organization may manage models for you. Ask your admin, or see [Adding a managed LLM provider](/cloud/share-with-your-team/managed-llm-provider).
+- **Sign-in stopped working later.** Reconnect under **Settings › AI Providers › Connect provider › OpenAI**.

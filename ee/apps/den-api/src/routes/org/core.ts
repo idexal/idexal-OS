@@ -1,0 +1,765 @@
+import { createHash } from "node:crypto"
+import { deploymentCapabilitiesSchema } from "@idexal/types/den/deployment-capabilities"
+import { permissionKeySchema } from "@idexal/types/den/permissions"
+import { eq } from "@idexal-ee/den-db/drizzle"
+import { OrganizationTable, ScimProviderTable, SsoConnectionTable } from "@idexal-ee/den-db/schema"
+import { normalizeDenTypeId, type DenTypeId } from "@idexal-ee/utils/typeid"
+import type { Hono } from "hono"
+import { describeRoute } from "hono-openapi"
+import { z } from "zod"
+import { auth } from "../../auth.js"
+import { attributeAuditRequest, auditSessionUserAttribution } from "../../audit/request-capture.js"
+import { verifyBotProtection } from "../../bot-protection.js"
+import { validateBrandIconUrl } from "../../brand-icon-validation.js"
+import { cloudHostingAvailable } from "../../capability-sources/cloud-hosting.js"
+import { db } from "../../db.js"
+import { checkEntitlement, getOrganizationEntitlements, parseOrganizationPlan } from "../../entitlements.js"
+import { env } from "../../env.js"
+import { deploymentCapabilities } from "../../gateway-deployment.js"
+import { findEnterpriseAuthRequirementForEmailDomain, resolveNonSsoSignInMethodForEmail } from "../../enterprise-auth-requirement.js"
+import { jsonValidator, memberPermissionsForOrganizationContext, orgMemberRoute, orgPermissionRoute, publicRoute, queryValidator, resolveMemberPermissionsMiddleware, resolveMemberTeamsMiddleware, userSessionRoute } from "../../middleware/index.js"
+import { sortedPermissionKeys } from "../../permissions/effective.js"
+import { denTypeIdSchema, enterprisePlanRequiredSchema, forbiddenSchema, invalidRequestSchema, jsonResponse, notFoundSchema, unauthorizedSchema } from "../../openapi.js"
+import { validateInvitationAcceptVerification } from "../../organization-join-verification.js"
+import { normalizeOrganizationMetadata } from "../../organization-limits.js"
+import { workbotOrigin } from "../../workbot/config.js"
+import { isIdexalOsWebAvailableForOrganization } from "../../idexal-os-web-availability.js"
+import { getIdexalOsWebAccess } from "../../stripe-billing.js"
+import {
+  acceptInvitationForUser,
+  createOrganizationForUser,
+  getInvitationPreview,
+  getSingletonSsoStatus,
+  loadOrganizationDirectory,
+  normalizeAllowedEmailDomains,
+  OrganizationEmailDomainRestrictionError,
+  serializeMemberFacingOrganizationMetadata,
+  setSessionActiveOrganization,
+  type AcceptInvitationForUserResult,
+  updateOrganizationSettings,
+} from "../../orgs.js"
+import { getRequiredUserEmail } from "../../user.js"
+import { checkRateLimit } from "../../utils/rate-limit.js"
+import type { OrgRouteVariables } from "./shared.js"
+
+const createOrganizationSchema = z.object({
+  name: z.string().trim().min(2).max(120),
+}).strict()
+
+const updateOrganizationSchema = z.object({
+  name: z.string().trim().min(2).max(120).optional(),
+  allowedEmailDomains: z.array(z.string().trim().min(1).max(255)).max(100).nullable().optional(),
+  allowedDesktopVersions: z.array(z.string().trim().min(1).max(32)).max(200).nullable().optional(),
+  requireSso: z.boolean().optional(),
+  brandAppName: z.string().trim().min(1).max(64).nullable().optional(),
+  brandLogoUrl: z.string().url().max(2048).nullable().optional(),
+  brandIconUrl: z.string().url().max(2048).nullable().optional(),
+  brandAccentColor: z.string().trim().min(1).max(32).nullable().optional(),
+}).strict().refine((value) => value.name !== undefined || value.allowedEmailDomains !== undefined || value.allowedDesktopVersions !== undefined || value.requireSso !== undefined || value.brandAppName !== undefined || value.brandLogoUrl !== undefined || value.brandIconUrl !== undefined || value.brandAccentColor !== undefined, {
+  message: "Provide at least one organization field to update.",
+})
+
+const resolveSsoByEmailQuerySchema = z.object({
+  email: z.string().trim().email(),
+})
+
+const resolveSsoByEmailResponseSchema = z.object({
+  requireSso: z.literal(true),
+  method: z.literal("sso"),
+  organizationSlug: z.string(),
+  signInPath: z.string(),
+  signInUrl: z.string().url(),
+}).or(z.object({
+  requireSso: z.literal(false),
+  method: z.union([z.literal("google"), z.literal("password"), z.literal("signup")]),
+})).meta({ ref: "ResolveOrganizationSsoByEmailResponse" })
+
+const botVerificationFailedSchema = z.object({
+  error: z.literal("bot_verification_failed"),
+  message: z.string(),
+}).meta({ ref: "BotVerificationFailedError" })
+
+const rateLimitedSchema = z.object({
+  error: z.literal("rate_limited"),
+  message: z.string(),
+}).meta({ ref: "RateLimitedError" })
+
+const SSO_RESOLVE_IDENTITY_RATE_LIMIT_MAX = 20
+const SSO_RESOLVE_RATE_LIMIT_WINDOW_MS = 60_000
+// See the login-options buckets: a long domain window buys burst tolerance for
+// a coworker sign-in wave while keeping SUSTAINED per-domain throughput below
+// the previous flat 20/min (120 per 10 min = 12/min; 30 misses per 10 min = 3/min).
+const SSO_RESOLVE_DOMAIN_RATE_LIMIT_WINDOW_MS = 600_000
+const SSO_RESOLVE_DOMAIN_RATE_LIMIT_MAX = 120
+const SSO_RESOLVE_DOMAIN_MISS_RATE_LIMIT_MAX = 30
+// A generous domain bucket bounds distributed enumeration without recreating coworker lockouts;
+// only unresolved addresses pay the tighter miss bucket.
+
+const singleOrgSsoStatusResponseSchema = z.object({
+  configured: z.boolean(),
+  organizationSlug: z.string(),
+  signInPath: z.string(),
+  signInUrl: z.string().url(),
+}).meta({ ref: "SingleOrgSsoStatusResponse" })
+
+const invitationPreviewQuerySchema = z.object({
+  id: z.string().trim().min(1).max(255),
+})
+
+const acceptInvitationSchema = z.object({
+  id: z.string().trim().min(1).max(255),
+})
+
+const scimDeprovisionedSchema = z.object({
+  error: z.literal("scim_deprovisioned"),
+  message: z.string(),
+}).meta({ ref: "ScimDeprovisionedError" })
+
+const organizationResponseSchema = z.object({
+  organization: z.object({}).passthrough().nullable(),
+}).meta({ ref: "OrganizationResponse" })
+
+const singleOrgModeSchema = z.object({
+  error: z.literal("single_org_mode"),
+  message: z.string(),
+}).meta({ ref: "SingleOrgModeError" })
+
+const organizationOwnerSchema = z.object({
+  memberId: denTypeIdSchema("member"),
+  userId: denTypeIdSchema("user"),
+  name: z.string().nullable(),
+  email: z.string().email().nullable(),
+  image: z.string().nullable().optional(),
+}).meta({ ref: "OrganizationOwner" })
+
+const invitationPreviewResponseSchema = z.object({
+  invitation: z.object({
+    id: denTypeIdSchema("invitation"),
+    email: z.string().email(),
+    role: z.string(),
+    status: z.enum(["pending", "accepted", "canceled", "expired"]),
+    expiresAt: z.string().datetime(),
+    createdAt: z.string().datetime(),
+  }),
+  organization: z.object({
+    id: denTypeIdSchema("organization"),
+    name: z.string(),
+    slug: z.string(),
+    allowedEmailDomains: z.array(z.string()).nullable(),
+    branding: z.object({
+      appName: z.string(),
+      logoUrl: z.string().url().nullable(),
+      iconUrl: z.string().url().nullable(),
+    }),
+  }),
+}).meta({ ref: "InvitationPreviewResponse" })
+
+const invitationAcceptedResponseSchema = z.object({
+  accepted: z.literal(true),
+  organizationId: denTypeIdSchema("organization"),
+  organizationSlug: z.string().nullable(),
+  invitationId: denTypeIdSchema("invitation"),
+}).meta({ ref: "InvitationAcceptedResponse" })
+
+const organizationContextResponseSchema = z.object({
+  organization: z.object({
+    owner: organizationOwnerSchema.nullable().optional(),
+  }).passthrough(),
+  currentMember: z.object({
+    permissions: z.array(permissionKeySchema).meta({
+      description: "The caller's effective permission keys in this organization, sorted. The owner gets every key; there is no wildcard. Gate UI on these rather than on role names. Older servers omit the field.",
+    }),
+  }).passthrough(),
+  currentMemberTeams: z.array(z.object({}).passthrough()),
+  capabilities: z.object({
+    auditLogs: z.boolean(),
+    gatewayDashboard: z.literal(true).meta({
+      deprecated: true,
+      description: "Compatibility field, always true. AI Gateway is available to every organization; deployment configuration and authorization still apply.",
+    }),
+  }).passthrough(),
+  /**
+   * Effective on/off for every registry feature (packages/features/src/registry.ts).
+   * New clients read this; `capabilities` is frozen for published clients.
+   * A key missing here means an older server: treat it as off.
+   */
+  features: z.record(z.string(), z.boolean()).meta({ description: "Effective on/off for every idexal Os feature in this organization. Treat a missing key as off." }),
+  deploymentCapabilities: deploymentCapabilitiesSchema,
+  entitlements: z.object({ sso: z.boolean(), desktopPolicies: z.boolean(), orgControls: z.boolean(), analytics: z.boolean(), auditLogs: z.boolean() }),
+}).passthrough().meta({ ref: "OrganizationContextResponse" })
+
+const userEmailRequiredSchema = z.object({
+  error: z.literal("user_email_required"),
+}).meta({ ref: "UserEmailRequiredError" })
+
+const invalidEmailDomainSchema = z.object({
+  error: z.literal("invalid_email_domain"),
+  message: z.string(),
+  invalidDomains: z.array(z.string()),
+}).meta({ ref: "InvalidEmailDomainError" })
+
+const invalidBrandIconSchema = z.object({
+  error: z.literal("invalid_brand_icon"),
+  reason: z.string(),
+  message: z.string(),
+}).meta({ ref: "InvalidBrandIconError" })
+
+const updateOrganizationBadRequestSchema = z.union([
+  invalidRequestSchema,
+  invalidEmailDomainSchema,
+  invalidBrandIconSchema,
+]).meta({ ref: "UpdateOrganizationBadRequest" })
+
+const accountEmailDomainNotAllowedSchema = z.object({
+  error: z.literal("account_email_domain_not_allowed"),
+  message: z.string(),
+  emailDomain: z.string().nullable(),
+  allowedEmailDomains: z.array(z.string()),
+}).meta({ ref: "AccountEmailDomainNotAllowedError" })
+
+const membershipRemovedSchema = z.object({
+  error: z.literal("membership_removed"),
+  message: z.string(),
+}).meta({ ref: "MembershipRemovedError" })
+
+function getStoredSessionId(session: { id?: string | null } | null) {
+  if (!session?.id) {
+    return null
+  }
+
+  try {
+    return normalizeDenTypeId("session", session.id)
+  } catch {
+    return null
+  }
+}
+
+function getRequestAddress(headers: Headers) {
+  const forwarded = headers.get("x-forwarded-for")?.split(",")[0]?.trim()
+  return forwarded || headers.get("x-real-ip")?.trim() || "unknown"
+}
+
+function sha256Hex(value: string) {
+  return createHash("sha256").update(value).digest("hex")
+}
+
+function normalizeResolveEmail(email: string) {
+  return email.trim().toLowerCase()
+}
+
+export function ssoResolveRateLimitKeys(headers: Headers, email: string) {
+  const normalizedEmail = normalizeResolveEmail(email)
+  const domainHash = sha256Hex(normalizedEmail.slice(normalizedEmail.lastIndexOf("@") + 1))
+  return {
+    ip: `org-sso-resolve:ip:${sha256Hex(getRequestAddress(headers))}`,
+    email: `org-sso-resolve:email:${sha256Hex(normalizedEmail)}`,
+    domain: `org-sso-resolve:domain:${domainHash}`,
+    domainMiss: `org-sso-resolve:domain-miss:${domainHash}`,
+  }
+}
+
+async function checkSsoResolveRateLimit(keys: ReturnType<typeof ssoResolveRateLimitKeys>) {
+  const now = Date.now()
+
+  for (const key of [keys.ip, keys.email]) {
+    const retryAfter = await checkRateLimit(key, SSO_RESOLVE_IDENTITY_RATE_LIMIT_MAX, SSO_RESOLVE_RATE_LIMIT_WINDOW_MS, now)
+    if (retryAfter !== null) {
+      return retryAfter
+    }
+  }
+
+  return checkRateLimit(keys.domain, SSO_RESOLVE_DOMAIN_RATE_LIMIT_MAX, SSO_RESOLVE_DOMAIN_RATE_LIMIT_WINDOW_MS, now)
+}
+
+function checkSsoResolveMissRateLimit(key: string) {
+  return checkRateLimit(key, SSO_RESOLVE_DOMAIN_MISS_RATE_LIMIT_MAX, SSO_RESOLVE_DOMAIN_RATE_LIMIT_WINDOW_MS, Date.now())
+}
+
+async function setRequestActiveOrganization(
+  c: {
+    get: (key: "session") => { id?: string | null } | null
+    req: { raw: Request }
+  },
+  organizationId: DenTypeId<"organization"> | null,
+) {
+  try {
+    await auth.api.setActiveOrganization({
+      body: { organizationId },
+      headers: c.req.raw.headers,
+    })
+    return
+  } catch {}
+
+  const sessionId = getStoredSessionId(c.get("session"))
+  if (sessionId) {
+    await setSessionActiveOrganization(sessionId, organizationId)
+  }
+}
+
+export function registerOrgCoreRoutes<T extends { Variables: OrgRouteVariables }>(app: Hono<T>) {
+  app.post(
+    "/v1/org",
+    describeRoute({
+      tags: ["Organizations"],
+      security: [{ bearerAuth: [] }],
+      hide: true,
+      summary: "Create organization",
+      description: "Creates a new organization for the signed-in user. Billing is enforced only when launching shared cloud workspaces.",
+      responses: {
+        201: jsonResponse("Organization created successfully.", organizationResponseSchema),
+        400: jsonResponse("The organization creation request body was invalid.", invalidRequestSchema),
+        401: jsonResponse("The caller must be signed in to create an organization.", unauthorizedSchema),
+        403: jsonResponse("API keys cannot create organizations.", forbiddenSchema),
+        409: jsonResponse("Organization creation is disabled in single-org mode.", singleOrgModeSchema),
+      },
+    }),
+    userSessionRoute(),
+    jsonValidator(createOrganizationSchema),
+    async (c) => {
+    if (env.orgMode === "single_org") {
+      return c.json({
+        error: "single_org_mode",
+        message: "This deployment is configured for one organization. New organizations cannot be created.",
+      }, 409)
+    }
+
+    const user = c.get("user")
+    const input = c.req.valid("json")
+
+    const organizationId = await createOrganizationForUser({
+      userId: normalizeDenTypeId("user", user.id),
+      name: input.name,
+    })
+
+    await setRequestActiveOrganization(c, organizationId)
+
+    const organization = await db
+      .select()
+      .from(OrganizationTable)
+      .where(eq(OrganizationTable.id, organizationId))
+      .limit(1)
+
+    return c.json({ organization: organization[0] ?? null }, 201)
+    },
+  )
+
+  app.get(
+    "/v1/orgs/invitations/preview",
+    describeRoute({
+      tags: ["Invitations"],
+      security: [],
+      summary: "Preview organization invitation",
+      description: "Returns invitation preview details so a user can inspect an organization invite before accepting it.",
+      responses: {
+        200: jsonResponse("Invitation preview returned successfully.", invitationPreviewResponseSchema),
+        400: jsonResponse("The invitation preview query parameters were invalid.", invalidRequestSchema),
+        404: jsonResponse("The invitation could not be found.", notFoundSchema),
+      },
+    }),
+    publicRoute,
+    queryValidator(invitationPreviewQuerySchema),
+    async (c) => {
+    const query = c.req.valid("query")
+    const invitation = await getInvitationPreview(query.id)
+
+    if (!invitation) {
+      return c.json({ error: "invitation_not_found" }, 404)
+    }
+
+    // The invitation token proves its organization: served evidence there
+    // (category read), actor unknown; the token itself is never recorded.
+    await attributeAuditRequest(c, { organizationId: invitation.organization.id, actor: { type: "unknown", id: null }, principalKey: "unknown:invitation_token" })
+
+    return c.json(invitation)
+    },
+  )
+
+  app.post(
+    "/v1/orgs/invitations/accept",
+    describeRoute({
+      tags: ["Invitations"],
+      security: [{ bearerAuth: [] }],
+      summary: "Accept organization invitation",
+      description: "Accepts an organization invitation for the current signed-in user and switches their active organization to the accepted workspace.",
+      responses: {
+        200: jsonResponse("Invitation accepted successfully.", invitationAcceptedResponseSchema),
+        400: jsonResponse("The invitation acceptance request body was invalid.", invalidRequestSchema),
+        401: jsonResponse("The caller must be signed in to accept an invitation.", unauthorizedSchema),
+        403: jsonResponse("API keys cannot accept invitations, or the deployment requires a verified account email.", forbiddenSchema),
+        409: jsonResponse("The account cannot join this organization.", z.union([accountEmailDomainNotAllowedSchema, scimDeprovisionedSchema])),
+        410: jsonResponse("The user previously accepted this invitation, but their workspace access was removed.", membershipRemovedSchema),
+        404: jsonResponse("The invitation could not be found.", notFoundSchema),
+      },
+    }),
+    userSessionRoute(),
+    jsonValidator(acceptInvitationSchema),
+    async (c) => {
+    const user = c.get("user")
+    const input = c.req.valid("json")
+    const email = getRequiredUserEmail(user)
+
+    if (!email) {
+      return c.json({ error: "user_email_required" }, 400)
+    }
+
+    const verification = validateInvitationAcceptVerification({
+      emailVerified: user.emailVerified,
+      emailVerificationRequired: env.requireEmailVerification,
+    })
+    if (!verification.ok) {
+      return c.json({ error: verification.error, message: verification.message }, 403)
+    }
+
+    let accepted: AcceptInvitationForUserResult | null = null
+    let auditBlocked: Response | null = null
+    try {
+      accepted = await acceptInvitationForUser({
+        userId: normalizeDenTypeId("user", user.id),
+        email,
+        invitationId: input.id,
+        // The invitation matched the verified session user's email: its
+        // organization is the tenant; the invitee has no member id yet.
+        beforeEffect: async (invitation) => {
+          const attribution = auditSessionUserAttribution(user.id)
+          if (!attribution) return true
+          const audited = await attributeAuditRequest(c, { organizationId: invitation.organizationId, ...attribution })
+          if (audited.ok) return true
+          auditBlocked = audited.response
+          return false
+        },
+      })
+    } catch (error) {
+      if (error instanceof OrganizationEmailDomainRestrictionError) {
+        return c.json({
+          error: "account_email_domain_not_allowed",
+          message: error.message,
+          emailDomain: error.emailDomain,
+          allowedEmailDomains: error.allowedEmailDomains,
+        }, 409)
+      }
+      throw error
+    }
+
+    if (!accepted) {
+      return c.json({ error: "invitation_not_found" }, 404)
+    }
+
+    if (accepted.status === "blocked") {
+      return auditBlocked ?? c.json({ error: "audit_unavailable" }, 503)
+    }
+
+    if (accepted.status === "membership_removed") {
+      return c.json({
+        error: "membership_removed",
+        message: "Your access to this workspace was removed. Ask a workspace admin for a new invite.",
+      }, 410)
+    }
+    if (accepted.status === "scim_deprovisioned") {
+      return c.json({
+        error: "scim_deprovisioned",
+        message: "This member is managed by your identity provider. Restore their access in the IdP.",
+      }, 409)
+    }
+
+    await setRequestActiveOrganization(c, accepted.member.organizationId)
+
+    const orgRows = await db
+      .select({ slug: OrganizationTable.slug })
+      .from(OrganizationTable)
+      .where(eq(OrganizationTable.id, accepted.member.organizationId))
+      .limit(1)
+
+    return c.json({
+      accepted: true,
+      organizationId: accepted.member.organizationId,
+      organizationSlug: orgRows[0]?.slug ?? null,
+      invitationId: accepted.invitation.id,
+    })
+    },
+  )
+
+  app.patch(
+    "/v1/org",
+    describeRoute({
+      tags: ["Organizations"],
+      summary: "Update organization",
+      description: "Updates organization fields. Requires the Edit organization settings permission. The slug is immutable to avoid breaking dashboard URLs.",
+      responses: {
+        200: jsonResponse("Organization updated successfully.", organizationResponseSchema),
+        400: jsonResponse("The organization update request body was invalid, contained malformed email domains, or contained an invalid brand icon URL.", updateOrganizationBadRequestSchema),
+        401: jsonResponse("The caller must be signed in to update an organization.", unauthorizedSchema),
+        402: jsonResponse("Enabling enforced SSO or desktop version controls requires an Enterprise plan.", enterprisePlanRequiredSchema),
+        403: jsonResponse("The caller does not have permission to update the requested organization fields.", forbiddenSchema),
+        404: jsonResponse("The organization could not be found.", notFoundSchema),
+      },
+    }),
+    orgPermissionRoute("organization.update"),
+    jsonValidator(updateOrganizationSchema),
+    async (c) => {
+      const payload = c.get("organizationContext")
+      const input = c.req.valid("json")
+
+      const normalizedDomains: { domains: string[] | null | undefined; invalidDomains: string[] } = input.allowedEmailDomains === undefined
+        ? { domains: undefined, invalidDomains: [] }
+        : normalizeAllowedEmailDomains(input.allowedEmailDomains)
+
+      if (normalizedDomains.invalidDomains.length > 0) {
+        return c.json({
+          error: "invalid_email_domain",
+          message: "Enter valid email domains like company.com.",
+          invalidDomains: normalizedDomains.invalidDomains,
+        }, 400)
+      }
+
+      const currentMetadata = normalizeOrganizationMetadata(payload.organization.metadata).metadata
+      const enablesRequireSso = input.requireSso === true && currentMetadata.requireSso !== true
+      const enablesVersionPinning = Array.isArray(input.allowedDesktopVersions) && input.allowedDesktopVersions.length > 0
+      if (enablesRequireSso || enablesVersionPinning) {
+        const entitlement = checkEntitlement(payload.organization.metadata, "orgControls")
+        if (!entitlement.ok) {
+          return c.json(entitlement.response, entitlement.status)
+        }
+      }
+
+      const enablesBranding = (typeof input.brandAppName === "string") || (typeof input.brandLogoUrl === "string") || (typeof input.brandIconUrl === "string") || (typeof input.brandAccentColor === "string")
+      if (enablesBranding) {
+        const entitlement = checkEntitlement(payload.organization.metadata, "desktopPolicies")
+        if (!entitlement.ok) {
+          return c.json(entitlement.response, entitlement.status)
+        }
+      }
+
+      if (typeof input.brandIconUrl === "string") {
+        const brandIconCheck = await validateBrandIconUrl(input.brandIconUrl)
+        if (!brandIconCheck.ok) {
+          return c.json({
+            error: "invalid_brand_icon",
+            reason: brandIconCheck.reason,
+            message: brandIconCheck.message,
+          }, 400)
+        }
+      }
+
+      const updated = await updateOrganizationSettings({
+        organizationId: payload.organization.id,
+        name: input.name,
+        allowedEmailDomains: normalizedDomains.domains,
+        allowedDesktopVersions: input.allowedDesktopVersions,
+        requireSso: input.requireSso,
+        brandAppName: input.brandAppName,
+        brandLogoUrl: input.brandLogoUrl,
+        brandIconUrl: input.brandIconUrl,
+        brandAccentColor: input.brandAccentColor,
+      })
+
+      if (!updated) {
+        return c.json({ error: "organization_not_found" }, 404)
+      }
+
+      return c.json({ organization: updated })
+    },
+  )
+
+  app.get(
+    "/v1/orgs/sso/singleton",
+    describeRoute({
+      tags: ["Organizations"],
+      security: [],
+      hide: true,
+      summary: "Resolve singleton organization SSO status",
+      description: "Returns whether the singleton organization has SSO configured for single-org deployments.",
+      responses: {
+        200: jsonResponse("Singleton organization SSO status returned successfully.", singleOrgSsoStatusResponseSchema),
+      },
+    }),
+    publicRoute,
+    async (c) => {
+      const status = await getSingletonSsoStatus()
+      return c.json({
+        configured: env.orgMode === "single_org" && status.configured,
+        organizationSlug: status.organizationSlug,
+        signInPath: status.signInPath,
+        signInUrl: new URL(status.signInPath, env.betterAuthTrustedOrigins[0] ?? env.betterAuthUrl).toString(),
+      })
+    },
+  )
+
+  app.get(
+    "/v1/orgs/sso/resolve",
+    describeRoute({
+      tags: ["Organizations"],
+      security: [],
+      hide: true,
+      summary: "Resolve sign-in method by email",
+      description: "Returns a uniform sign-in routing envelope. SSO routing is resolved by verified domain; non-SSO routing is protected by bot verification and rate limiting.",
+      responses: {
+        200: jsonResponse("Sign-in resolution returned successfully.", resolveSsoByEmailResponseSchema),
+        400: jsonResponse("The SSO resolution query parameters were invalid.", invalidRequestSchema),
+        403: jsonResponse("Bot verification failed.", botVerificationFailedSchema),
+        429: jsonResponse("Too many SSO resolution attempts.", rateLimitedSchema),
+      },
+    }),
+    publicRoute,
+    queryValidator(resolveSsoByEmailQuerySchema),
+    async (c) => {
+      const query = c.req.valid("query")
+
+      // Security note:
+      // This endpoint intentionally preserves per-user auth-method routing for non-SSO
+      // accounts as a product UX decision. To reduce enumeration risk it:
+      // 1. resolves SSO by verified domain, not membership,
+      // 2. requires Vercel BotID verification before per-user method resolution,
+      // 3. relies on Better Auth/routing rate limits,
+      // 4. returns a uniform 200 response envelope for successful lookups.
+      const botProtection = await verifyBotProtection()
+      if (!botProtection.ok) {
+        return c.json({
+          error: "bot_verification_failed",
+          message: botProtection.message,
+        }, botProtection.status)
+      }
+
+      const rateLimitKeys = ssoResolveRateLimitKeys(c.req.raw.headers, query.email)
+      const retryAfter = await checkSsoResolveRateLimit(rateLimitKeys)
+      if (retryAfter !== null) {
+        c.header("Retry-After", String(retryAfter))
+        return c.json({
+          error: "rate_limited",
+          message: "Too many sign-in resolution attempts. Try again later.",
+        }, 429)
+      }
+
+      const requirement = await findEnterpriseAuthRequirementForEmailDomain(query.email)
+
+      if (requirement) {
+        return c.json({
+          requireSso: true,
+          method: "sso",
+          organizationSlug: requirement.organizationSlug,
+          signInPath: requirement.signInPath,
+          signInUrl: new URL(requirement.signInPath, env.betterAuthTrustedOrigins[0] ?? env.betterAuthUrl).toString(),
+        })
+      }
+
+      const method = await resolveNonSsoSignInMethodForEmail(query.email)
+      if (method === "signup") {
+        const missRetryAfter = await checkSsoResolveMissRateLimit(rateLimitKeys.domainMiss)
+        if (missRetryAfter !== null) {
+          c.header("Retry-After", String(missRetryAfter))
+          return c.json({
+            error: "rate_limited",
+            message: "Too many sign-in resolution attempts. Try again later.",
+          }, 429)
+        }
+      }
+
+      return c.json({
+        requireSso: false,
+        method,
+      })
+    },
+  )
+
+  app.get(
+    "/v1/org",
+    describeRoute({
+      tags: ["Organizations"],
+      summary: "Get active organization",
+      description: "Returns the active organization from the current session, including its owner, the current member record, and their team memberships.",
+      responses: {
+        200: jsonResponse("Organization context returned successfully.", organizationContextResponseSchema),
+        401: jsonResponse("The caller must be signed in to load organization context.", unauthorizedSchema),
+        404: jsonResponse("The organization could not be found.", notFoundSchema),
+      },
+    }),
+    orgMemberRoute(),
+    resolveMemberTeamsMiddleware,
+    resolveMemberPermissionsMiddleware,
+    async (c) => {
+      const payload = c.get("organizationContext")
+
+      // Same per-request resolution the middleware made.
+      const memberPermissions = await memberPermissionsForOrganizationContext(payload, c.get("memberTeams"))
+      // Reuse the organization row and feature snapshot resolved for this request.
+      const currentOrganization = payload.organization
+      const features = payload.features
+      // Cloud is entitled by idexal Os Web access (paid subscription or the
+      // platform-admin complimentary grant) on hosted deployments; there is no
+      // separate per-organization Cloud rollout flag.
+      const cloudEnabled = cloudHostingAvailable({ orgMode: env.orgMode, idexalOsWebEnabled: env.idexalOsWebEnabled })
+        && (await getIdexalOsWebAccess(payload.organization.id)).hasAccess
+      // The directory is only loaded here, not with every org request's context.
+      const [directory, ssoRows, scimRows] = await Promise.all([
+        loadOrganizationDirectory(payload.organization.id),
+        db
+          .select({ id: SsoConnectionTable.id })
+          .from(SsoConnectionTable)
+          .where(eq(SsoConnectionTable.organizationId, payload.organization.id))
+          .limit(1),
+        db
+          .select({ id: ScimProviderTable.id })
+          .from(ScimProviderTable)
+          .where(eq(ScimProviderTable.organizationId, payload.organization.id))
+          .limit(1),
+      ])
+      const owner = directory.members.find((member) => member.isOwner) ?? null
+
+      return c.json({
+        ...payload,
+        ...directory,
+        currentMember: {
+          ...payload.currentMember,
+          permissions: sortedPermissionKeys(memberPermissions.keys),
+        },
+        organization: {
+          ...payload.organization,
+          metadata: serializeMemberFacingOrganizationMetadata(payload.organization.metadata),
+          owner: owner
+            ? {
+              memberId: owner.id,
+              userId: owner.user.id,
+              name: owner.user.name,
+              email: owner.user.email,
+              image: owner.user.image,
+            }
+            : null,
+        },
+        currentMemberTeams: c.get("memberTeams") ?? [],
+        deploymentCapabilities: deploymentCapabilities(),
+        plan: parseOrganizationPlan(currentOrganization.metadata),
+        entitlements: getOrganizationEntitlements(currentOrganization.metadata),
+        features,
+        // Frozen for published clients; new clients read `features`.
+        capabilities: {
+          auditLogs: env.auditVisibilityEnabled,
+          gatewayDashboard: true,
+          // Organization Dashboards were removed (2026-10). Published desktop
+          // builds call the old dashboard routes only when this is true, so it
+          // stays pinned to false.
+          orgManagedDashboards: false,
+          // Compatibility field for published clients: Connect is always on.
+          mcpConnections: true,
+          // Building your own Apps is on for every organization unless the
+          // deployment turns it off.
+          appMcpServers: env.appMcpServersEnabled,
+          // Workflows/Code Mode are enabled for every organization; the field
+          // remains for published clients that still read it.
+          workflows: true,
+          // Compatibility field for published clients: install links are always on.
+          installLinks: true,
+          // Effective offer: the deployment switch enables Web generally,
+          // while the platform-admin complimentary grant enables only this
+          // organization when the deployment switch is off.
+          idexalOsWeb: isIdexalOsWebAvailableForOrganization(payload.organization.metadata),
+          // Workbot is its own app (DEN_WORKBOT_URL), per-organization and default-off.
+          workbot: features.workbot && workbotOrigin() !== null,
+          ...(cloudEnabled ? { cloud: true } : {}),
+        },
+        authMethods: {
+          sso: Boolean(ssoRows[0]),
+          scim: Boolean(scimRows[0]),
+        },
+      })
+    },
+  )
+}

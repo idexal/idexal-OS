@@ -1,0 +1,6 @@
+# Scratch and generated files from the rebrand workbench. The scripts that
+# produced them are tracked; their outputs are regenerable and stay local.
+__pycache__/
+_tmp_*
+trace-out/
+*.out.txt

@@ -1,0 +1,163 @@
+import { withBedrockMantleProvider } from "@idexal-ee/utils/bedrock-mantle-catalog"
+import { withMicrosoftFoundryProvider } from "@idexal-ee/utils/microsoft-foundry-catalog"
+
+const MODELS_DEV_API_URL = "https://models.idexal.com/api.json"
+const MODELS_DEV_CACHE_TTL_MS = 1000 * 60 * 10
+
+type JsonRecord = Record<string, unknown>
+
+export type ModelsDevProviderSummary = {
+  id: string
+  name: string
+  npm: string | null
+  env: string[]
+  doc: string | null
+  api: string | null
+  modelCount: number
+}
+
+export type ModelsDevModel = {
+  id: string
+  name: string
+  config: JsonRecord
+}
+
+export type ModelsDevProvider = {
+  id: string
+  name: string
+  npm: string | null
+  env: string[]
+  doc: string | null
+  api: string | null
+  config: JsonRecord
+  models: ModelsDevModel[]
+}
+
+type ModelsDevCatalog = {
+  expiresAt: number
+  providers: ModelsDevProvider[]
+  providersById: Map<string, ModelsDevProvider>
+}
+
+let modelsDevCache: ModelsDevCatalog | null = null
+
+function isRecord(value: unknown): value is JsonRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function asString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null
+}
+
+function asStringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+    : []
+}
+
+async function fetchModelsDevCatalog() {
+  const response = await fetch(MODELS_DEV_API_URL, {
+    signal: AbortSignal.timeout(10_000),
+    headers: {
+      Accept: "application/json",
+      "User-Agent": "idexal Os Den API",
+    },
+  })
+
+  if (!response.ok) {
+    throw new Error(`models.dev returned ${response.status}`)
+  }
+
+  const payload = await response.json()
+  if (!isRecord(payload)) {
+    throw new Error("models.dev returned an invalid payload")
+  }
+
+  // Mantle and Foundry Claude models need their own SDK per gateway provider; see
+  // bedrock-mantle-catalog and microsoft-foundry-catalog.
+  const providers = Object.entries(withMicrosoftFoundryProvider(withBedrockMantleProvider(payload)))
+    .map(([providerKey, rawProvider]) => {
+      if (!isRecord(rawProvider)) {
+        throw new Error("models.dev returned an invalid provider")
+      }
+
+      const providerId = asString(rawProvider.id) ?? providerKey
+      const name = asString(rawProvider.name) ?? providerId
+      if (!isRecord(rawProvider.models)) throw new Error("models.dev returned an invalid model catalog")
+      const modelsRecord = rawProvider.models
+      const { models: _models, ...providerConfig } = rawProvider
+      const models = Object.entries(modelsRecord)
+        .map(([modelKey, rawModel]) => {
+          if (!isRecord(rawModel)) {
+            throw new Error("models.dev returned an invalid model")
+          }
+
+          const modelId = asString(rawModel.id) ?? modelKey
+          const modelName = asString(rawModel.name) ?? modelId
+          return {
+            id: modelId,
+            name: modelName,
+            config: rawModel,
+          } satisfies ModelsDevModel
+        })
+        .sort((left, right) => left.name.localeCompare(right.name))
+
+      return {
+        id: providerId,
+        name,
+        npm: asString(rawProvider.npm),
+        env: asStringList(rawProvider.env),
+        doc: asString(rawProvider.doc),
+        api: asString(rawProvider.api),
+        config: providerConfig,
+        models,
+      } satisfies ModelsDevProvider
+    })
+    .sort((left, right) => left.name.localeCompare(right.name))
+
+  const nextCache = {
+    expiresAt: Date.now() + MODELS_DEV_CACHE_TTL_MS,
+    providers,
+    providersById: new Map(providers.map((provider) => [provider.id, provider])),
+  }
+
+  modelsDevCache = nextCache
+  return nextCache
+}
+
+// Only the public catalog is shared. Provider configuration and authorization
+// still run independently for every request. Failed refreshes remain retryable.
+let modelsDevInflight: Promise<ModelsDevCatalog> | null = null
+
+async function loadModelsDevCatalog() {
+  if (modelsDevCache && modelsDevCache.expiresAt > Date.now()) return modelsDevCache
+  modelsDevInflight ??= fetchModelsDevCatalog().finally(() => { modelsDevInflight = null })
+  return modelsDevInflight
+}
+
+export async function listModelsDevProviders(): Promise<ModelsDevProviderSummary[]> {
+  const catalog = await loadModelsDevCatalog()
+  return catalog.providers.map((provider) => ({
+    id: provider.id,
+    name: provider.name,
+    npm: provider.npm,
+    env: provider.env,
+    doc: provider.doc,
+    api: provider.api,
+    modelCount: provider.models.length,
+  }))
+}
+
+export async function getModelsDevProvider(providerId: string): Promise<ModelsDevProvider | null> {
+  const catalog = await loadModelsDevCatalog()
+  return catalog.providersById.get(providerId) ?? null
+}
+
+/** Resolve several providers from a single cached catalog read. */
+export async function getModelsDevProviders(providerIds: readonly string[]): Promise<ModelsDevProvider[]> {
+  const catalog = await loadModelsDevCatalog()
+  return [...new Set(providerIds)].flatMap((id) => {
+    const provider = catalog.providersById.get(id)
+    return provider ? [provider] : []
+  })
+}

@@ -1,0 +1,78 @@
+# syntax=docker/dockerfile:1.7
+FROM node:22-bookworm-slim
+
+RUN corepack enable
+
+WORKDIR /app
+
+ARG DEN_GATEWAY_VERSION=""
+ENV DEN_GATEWAY_VERSION=${DEN_GATEWAY_VERSION}
+ENV PORT=8788
+
+# The gateway serves the idexal Os web build itself, so the app and Den end up on
+# one origin. That is what removes the need for cross-origin patches, and it is
+# why the SPA is baked in here rather than served from a separate CDN origin.
+ENV DEN_GATEWAY_WEB_ROOT=/opt/idexalos/web
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.declarations.json /app/
+COPY patches /app/patches
+COPY scripts/build-workspace-dependencies.mjs /app/scripts/build-workspace-dependencies.mjs
+
+# This image installs only the gateway runtime workspace. Some root patches apply
+# to packages that are intentionally not copied here, and pnpm rejects those as
+# unused unless this pruned install opts out of that check.
+RUN node -e "const fs = require('node:fs'); fs.appendFileSync('/app/pnpm-workspace.yaml', '\nallowUnusedPatches: true\n')"
+
+COPY packages/types/package.json /app/packages/types/package.json
+COPY packages/managed-deployments/package.json /app/packages/managed-deployments/package.json
+COPY packages/free-auto/package.json /app/packages/free-auto/package.json
+COPY packages/ui/package.json /app/packages/ui/package.json
+COPY packages/install-config/package.json /app/packages/install-config/package.json
+COPY packages/workbook/package.json /app/packages/workbook/package.json
+COPY packages/browser-tabs/package.json /app/packages/browser-tabs/package.json
+COPY packages/calendar/package.json /app/packages/calendar/package.json
+COPY ee/packages/utils/package.json /app/ee/packages/utils/package.json
+COPY ee/packages/telemetry-contracts/package.json /app/ee/packages/telemetry-contracts/package.json
+COPY ee/apps/den-gateway/package.json /app/ee/apps/den-gateway/package.json
+COPY apps/app/package.json /app/apps/app/package.json
+
+RUN pnpm install --frozen-lockfile --trust-lockfile
+
+COPY packages/types /app/packages/types
+COPY packages/managed-deployments /app/packages/managed-deployments
+COPY packages/free-auto /app/packages/free-auto
+COPY packages/ui /app/packages/ui
+COPY packages/install-config /app/packages/install-config
+COPY packages/workbook /app/packages/workbook
+COPY packages/browser-tabs /app/packages/browser-tabs
+COPY packages/calendar /app/packages/calendar
+COPY ee/packages/utils /app/ee/packages/utils
+COPY ee/packages/telemetry-contracts /app/ee/packages/telemetry-contracts
+COPY ee/apps/den-gateway /app/ee/apps/den-gateway
+COPY apps/server/src/mcp-app-sandbox.ts /app/apps/server/src/mcp-app-sandbox.ts
+COPY apps/app /app/apps/app
+
+RUN pnpm --dir /app/packages/types run build
+RUN pnpm --dir /app/packages/free-auto run build
+RUN pnpm --dir /app/packages/ui run build
+RUN pnpm --dir /app/packages/install-config run build
+RUN pnpm --dir /app/ee/packages/utils run build
+
+# build:web already sets VITE_IDEXAL_DEPLOYMENT=web and
+# VITE_DEN_REQUIRE_SIGNIN=1. VITE_DEN_BASE_URL is deliberately NOT baked: in
+# gateway mode the app resolves Den from window.location.origin at runtime via
+# the gateway marker, and a baked base URL would silently defeat that.
+RUN pnpm --dir /app/apps/app run build:web
+
+RUN pnpm --dir /app/ee/apps/den-gateway run build
+
+RUN mkdir -p /opt/idexalos \
+  && cp -R /app/apps/app/dist /opt/idexalos/web \
+  && test -f /opt/idexalos/web/index.html \
+  && test -d /opt/idexalos/web/assets
+
+EXPOSE 8788
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || '8788') + '/__gw/health').then((res) => process.exit(res.ok ? 0 : 1)).catch(() => process.exit(1))"
+
+CMD ["node", "/app/ee/apps/den-gateway/dist/server.js"]

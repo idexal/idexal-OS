@@ -1,0 +1,34 @@
+{
+  "name": "@idexal/env",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "development": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./eval-engine": {
+      "types": "./src/eval-engine.ts",
+      "development": "./src/eval-engine.ts",
+      "default": "./src/eval-engine.ts"
+    },
+    "./eval-ref": {
+      "types": "./src/eval-ref.ts",
+      "development": "./src/eval-ref.ts",
+      "default": "./src/eval-ref.ts"
+    }
+  },
+  "dependencies": {
+    "@idexal/behaviors": "workspace:*",
+    "@idexal/cdp": "workspace:*",
+    "@idexal/hosts": "workspace:*",
+    "@idexal/freestyle": "link:../../../packages/freestyle",
+    "@idexal/labs": "workspace:*",
+    "@idexal/world": "link:../../../packages/world",
+    "mysql2": "^3.11.3",
+    "@idexal/evidence-provider": "link:../../../packages/evidence-provider",
+    "@idexal/daytona-evidence": "link:../../../packages/daytona-evidence"
+  }
+}

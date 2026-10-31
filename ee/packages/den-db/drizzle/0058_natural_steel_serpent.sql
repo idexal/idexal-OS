@@ -1,0 +1,1 @@
+CREATE INDEX `connector_sync_event_target_status` ON `connector_sync_event` (`connector_target_id`,`status`);

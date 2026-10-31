@@ -1,0 +1,146 @@
+# Den API
+
+Hono-based Den control plane implementation (`den-api`, formerly `den-controller`).
+
+This package is the active Den control plane implementation.
+
+It carries the full migrated Den API route surface in a foldered Hono structure so agents can navigate one area at a time without scanning the whole service.
+
+## Quick start
+
+```bash
+pnpm --filter @idexal-ee/den-api dev:local
+```
+
+## Local demo org seed
+
+With a local Den MySQL database running, seed a demo organization:
+
+```bash
+pnpm --filter @idexal-ee/den-api seed:demo-org
+```
+
+This creates `Acme Robotics` with demo users, teams, pending invites, and an imported Anthropic Knowledge Work Plugins marketplace. It is guarded by `IDEXAL_DEV_MODE=1`, defaults to the local Den DB URL, and does not create workers or active external integrations.
+
+Default owner login: `alex@acme.test` / `IdexalOsDemo123!`.
+
+## Observability
+
+`DEN_OBSERVABILITY_BACKEND` selects one backend: `none`, `otel`, or `sentry`.
+
+- `none` (default): structured JSON logs are written to stdout.
+- `otel`: initializes the OpenTelemetry Node SDK before Hono/DB imports, exports OTLP HTTP/protobuf traces, metrics, and logs from standard `OTEL_*` variables, and uses `@hono/otel` for normalized request spans/metrics without inbound HTTP auto-instrumentation.
+- `sentry`: initializes `@sentry/hono/node` before app imports and uses the official Hono middleware for errors/tracing/Sentry Logs. Do not combine it with the OTEL backend.
+
+The request access log records request id, method, normalized route, status, duration and the number of database statements the request issued (`db_queries`, a count only), and omits health/readiness noise. Health/readiness requests also skip den-api's Hono observability middleware. Authorization, cookie, body, and query values are redacted from app telemetry. `OTEL_SERVICE_NAME` overrides the default `den-api` service name. Daytona's own OTEL bootstrap remains disabled; do not set Daytona OTEL enable variables from den-api.
+
+Builds generate source maps. Sentry source maps are uploaded only when `DEN_OBSERVABILITY_BACKEND=sentry` and `SENTRY_AUTH_TOKEN`, `SENTRY_ORG`, `SENTRY_PROJECT`, and `SENTRY_RELEASE` are present; `SENTRY_DIST` is passed through when set. The auth token must stay in secret storage and is never written to env examples or logs.
+
+## Approved web origins
+
+Organization owners and admins approve self-hosted idexal Os Web instances in the Den dashboard under **Org settings → Approved web origins** (`/v1/org/web-origins`). Each entry is an **exact HTTPS origin** — scheme, host, and optional port, with no path, query, fragment, credentials, or wildcard — and an organization can approve up to 20. An approved origin can receive web sign-in handoffs back to `/signin` only while that organization is active, and is allowed for credentialed browser requests to Den API. Handoff approval is checked on every request; CORS approval is cached per process and takes effect within about 30 seconds on every Den API replica. If `DEN_CORS_HANDLED_BY_EDGE=true`, the edge must also allow the same exact origin and the `Authorization` preflight.
+
+## Current routes
+
+- `GET /` -> `302 https://os.idexal.com`
+- `GET /health`
+- Better Auth mount at `/api/auth/*`
+- desktop handoff routes under `/v1/auth/*`
+- current user routes under `/v1/me*`
+- organization routes under `/v1/orgs*`
+- active-organization SCIM management routes under `/v1/scim*`
+- admin routes under `/v1/admin*`
+- worker list, delete, and activity heartbeat routes under `/v1/workers*` (idexal Os Web instances are worker rows; their lifecycle lives under `/v1/cloud/*`)
+
+## Folder map
+
+- `src/routes/auth/`: Better Auth mount + desktop handoff endpoints
+- `src/routes/me/`: current user and current user's org resolution routes
+- `src/routes/org/`: organization CRUD-ish surfaces, split by area
+- `src/routes/admin/`: admin-only reporting endpoints
+- `src/routes/workers/`: worker list, delete, and activity heartbeat endpoints
+- `src/middleware/`: reusable Hono middleware for auth context, org context, teams, and validation
+- `src/cache.ts`: shared Redis-backed read-through cache. Add expensive read helpers here, keyed as `cache:${cacheParent}:${cacheChild}:${id}`; for example `cache.auth.session(token)` and `cache.org.members(orgId)`. Redis is optional, so every helper must fall back to the DB loader.
+
+Each major folder also has its own `README.md` so future agents can inspect one area in isolation.
+
+## Shared query cache
+
+Use `src/cache.ts` for Den API read-through Redis caching. Do not create ad-hoc Redis calls in route handlers or domain modules.
+
+Current public helpers:
+
+```ts
+const session = await cache.auth.session(token)
+const members = await cache.org.members(orgId)
+```
+
+Cache key format:
+
+```txt
+cache:${cacheParent}:${cacheChild}:${id}
+```
+
+Example key:
+
+```txt
+cache:auth:session:<token>
+cache:org:members:org_...
+```
+
+Rules for adding cache helpers:
+
+- Add helpers under the exported `cache` namespace in `src/cache.ts`.
+- Keep each helper as a read-through function: check Redis, run the DB loader on miss, write Redis, then return the loaded value.
+- Redis is optional. Helpers must work when `DATABASE_REDIS_URL` is unset.
+- Non-local Redis should use `rediss://`. Set `DATABASE_REDIS_ALLOW_INSECURE_INTERNAL=1` only when the `redis://` endpoint is private, non-public, and restricted to a trusted internal network.
+- Use short TTLs unless invalidation is explicit and tested.
+- Auth sessions are DB-authoritative and cached for at most one hour. Any session delete or identity-changing update must invalidate `cache.auth.deleteSession(token)`.
+- Do not add new security-critical cache helpers without explicit invalidation and tests.
+- Prefer names that read like domain calls, for example `cache.auth.session(token)` or `cache.org.members(orgId)`.
+
+## SCIM existing-user adoption
+
+The SCIM plugin in `src/auth.ts` requires existing membership in the connector's
+organization before adopting an existing account. Its `shouldLinkUser` callback
+also performs an uncached membership read by normalized user and organization
+IDs with `removed_at IS NULL`. Better Auth 1.7.0-beta.10's built-in membership
+lookup does not exclude removed rows, so both checks must remain enabled.
+Invitations without a joined user, removed memberships, outside-org accounts,
+and tokens without an organization cannot authorize adoption. No email-domain
+exception applies. Successful adoption preserves the user ID and membership role;
+the new-user provisioning path is unchanged.
+
+The plugin evaluates this policy **before** its account-creation transaction.
+The fresh read excludes already-removed memberships, but does not serialize a
+concurrent removal with linking. Closing that race requires transactional policy
+support in the plugin; this callback is not an atomic membership lock.
+
+Run the installed-plugin regression suite in its own Node process:
+
+```bash
+pnpm --filter @idexal-ee/den-api test:scim-existing-user-linking
+```
+
+It uses Better Auth's memory adapter and compiles the membership SQL without
+executing it. It does not import Den's full auth graph, start MySQL, configure
+OAuth, or require real credentials.
+
+## TypeID validation
+
+- Shared Den TypeID validation lives in `ee/packages/utils/src/typeid.ts`.
+- Use `typeId.schema("...")` or the compatibility helpers like `normalizeDenTypeId("...", value)` when an endpoint accepts or returns a Den TypeID.
+- `ee/apps/den-api/src/openapi.ts` exposes `denTypeIdSchema(...)` so path params, request bodies, and response fields all share the same validation rules and Swagger examples.
+- Swagger now documents Den IDs with their required prefix and fixed 26-character TypeID suffix, so invalid IDs fail request validation before route logic runs.
+
+## OpenAPI contract
+
+- `packages/docs/openapi.json` is the published contract, regenerated with `pnpm api:snapshot` and linted with `pnpm api:lint` (Spectral, ruleset in `.spectral.yaml`). The API Contract workflow fails on snapshot drift, on any lint error, and when warnings exceed `.spectral-baseline.json`.
+- Every route registration carries a `describeRoute()` with `summary`, `tags`, `security` and `responses`; conventions and documented exceptions are in [`docs/api-style.md`](../../../docs/api-style.md).
+
+## Migration approach
+
+1. Keep `den-api` (formerly `den-controller`) as the source of truth for Den control-plane behavior.
+2. Add endpoints in focused Hono route groups one surface at a time.
+3. Reuse shared middleware and Zod validators instead of duplicating request/session/org plumbing.
+4. Leave a short README in each route area when the structure changes so later agents can recover context fast.

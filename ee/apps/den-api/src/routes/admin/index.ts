@@ -1,0 +1,2342 @@
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, sql } from "@idexal-ee/den-db/drizzle"
+import { expireUsageRequestsForMembers } from "@idexal-ee/den-db/gateway-usage-limits"
+import { revokeUpstreamCredentials, revokeInferenceCredentialsForMembers } from "../../llm/inference-provider-lifecycle.js"
+import type { SQL } from "@idexal-ee/den-db/drizzle"
+import {
+  AuthAccountTable,
+  AuthApiKeyTable,
+  AuthSessionTable,
+  AuthUserTable,
+  FreeAutoLimitEventTable,
+  FreeAutoPurchaseTable,
+  ConnectedAccountTable,
+  DesktopHandoffGrantTable,
+  ExternalIdentityTable,
+  InvitationTable,
+  InferenceOrgLimitPolicyTable,
+  InferenceOrgUsageBucketTable,
+  InferenceUsageLedgerBucketChargeTable,
+  InferenceUsageLedgerEntryTable,
+  LlmProviderMemberCredentialTable,
+  MemberTable,
+  OAuthAccessTokenTable,
+  OAuthClientTable,
+  OAuthConsentTable,
+  OAuthRefreshTokenTable,
+  OrganizationTable,
+  OrgSubscriptionTable,
+  ScimSyncEventTable,
+  TelemetryEventTable,
+  WorkerTable,
+  AdminAllowlistTable,
+} from "@idexal-ee/den-db/schema"
+import { createDenTypeId, isDenTypeId } from "@idexal-ee/utils/typeid"
+import { ManagedModelsPolicyError, readOrganizationMetadata } from "@idexal/types/den/managed-models-policy"
+import type { Hono } from "hono"
+import { describeRoute } from "hono-openapi"
+import { z } from "zod"
+import { cache } from "../../cache.js"
+import { db } from "../../db.js"
+import { parseOrganizationPlan, type PlanTier } from "../../entitlements.js"
+import { adminRoute, jsonValidator, queryValidator } from "../../middleware/index.js"
+import { registerAdminFreeAutoConversionsRoutes } from "./free-auto-conversions.js"
+import { registerAdminFreeAutoUsageRoutes } from "./free-auto-usage.js"
+import { registerAdminDashboardRoute } from "./dashboard.js"
+import { registerAdminOrganizationDetailRoutes } from "./organization-detail.js"
+import { denTypeIdSchema, forbiddenSchema, invalidRequestSchema, jsonResponse, notFoundSchema, unauthorizedSchema } from "../../openapi.js"
+import { appLogger } from "../../observability/logger.js"
+import { seedDefaultPermissionSetsOnEnable } from "../../permissions/default-sets.js"
+import {
+  describeFeatures,
+  readFeatureRollouts,
+  readOrganizationFeatureOverrides,
+  readOrganizationFeatureOverridesForMany,
+  type FeatureOverrideChanges,
+} from "@idexal-ee/den-db/organization-features"
+import { updateFeatureRollout, updateOrganizationFeatureOverrides } from "../../features.js"
+import {
+  FEATURE_KEYS,
+  featureAvailableOn,
+  featureDefinition,
+  featureKeySchema,
+  featureRollout,
+  mapFeatures,
+  type FeatureKey,
+  type FeatureOverrides,
+  type FeatureRollouts,
+  type ResolvedFeature,
+} from "@idexal/features"
+import { DEFAULT_ORGANIZATION_LIMITS, normalizeOrganizationMetadata } from "../../organization-limits.js"
+import { updateOrganizationMetadata } from "../../organization-metadata.js"
+import { env } from "../../env.js"
+import type { AuthContextVariables } from "../../session.js"
+import { ORGANIZATION_AUDIT_ACTIONS } from "../../audit-events.js"
+import { appendDomainChangesAfterCommit, finishLegacyAuditAction, logLegacyOrChanges, writeLegacyOrChangesInTx } from "../../audit/domain/legacy.js"
+import { memberRemovedEvent, type MemberAuditRow } from "../../audit/domain/members.js"
+import { sessionRevokedEvent, type DirectlyDeletedSession } from "../../audit/domain/sessions.js"
+import { complimentaryAccessEvent, dpaSignedUpdatedEvent } from "../../audit/domain/organization-settings.js"
+import { auditChangeCapture, logAuditOutcomeLost } from "../../audit/request-capture.js"
+import { platformAdminChangeCapture } from "../../audit/service-capture.js"
+import { hasIdexalOsWebComplimentaryAccess, resolveIdexalOsWebAccess, setIdexalOsWebComplimentaryAccess } from "../../idexal-os-web-access.js"
+import { isIdexalOsWebAvailable } from "../../idexal-os-web-availability.js"
+import { calculateOrganizationSeatBillingCounts, getOrganizationSeatBillingCounts, isEligibleIdexalOsWebSubscriptionStatus, isOngoingIdexalOsWebSubscriptionStatus, organizationHasOngoingIdexalOsWebSubscription, refreshOrgSubscriptionFromStripe, syncSeatSubscriptionQuantityAfterMemberChange } from "../../stripe-billing.js"
+import { buildAdminPageInfo, normalizeAdminPageRequest, sanitizeAdminSearchForLike, type AdminPageRequest } from "./scale-performance.js"
+
+type UserId = typeof AuthUserTable.$inferSelect.id
+type OrganizationId = typeof OrganizationTable.$inferSelect.id
+
+type AdminBillingStatus = {
+  status: "paid" | "unpaid" | "unavailable"
+  featureGateEnabled: boolean
+  subscriptionId: string | null
+  subscriptionStatus: string | null
+  currentPeriodEnd: Date | string | null
+  source: "benefit" | "subscription" | "unavailable"
+  note: string | null
+}
+
+const DEFAULT_ORGANIZATION_FREE_SEAT_COUNT = calculateOrganizationSeatBillingCounts({ memberCount: 0 }).includedFree
+const logger = appLogger.child({ component: "admin_routes" })
+
+const overviewQuerySchema = z.object({
+  includeBilling: z.string().optional(),
+  limit: z.string().optional(),
+  offset: z.string().optional(),
+  search: z.string().optional(),
+})
+
+const adminPageQuerySchema = z.object({
+  includeBilling: z.string().optional(),
+  limit: z.string().optional(),
+  offset: z.string().optional(),
+  search: z.string().optional(),
+})
+
+const adminOrganizationPageQuerySchema = adminPageQuerySchema.extend({
+  includeFeatures: z.enum(["0", "1"]).optional().meta({
+    description: "Set to 0 to omit capabilities and featureStates. Fetch one organization's features when its editor is opened. Defaults to 1 for existing clients.",
+  }),
+})
+
+const updateOrganizationPlanSchema = z.object({
+  tier: z.enum(["free", "team", "enterprise"]),
+  seatLimit: z.number().int().min(1).max(100000),
+})
+
+const updateOrganizationFreeSeatsSchema = z.object({
+  totalFreeSeats: z.number().int().min(DEFAULT_ORGANIZATION_FREE_SEAT_COUNT).max(100000),
+})
+
+const updateOrganizationIdexalOsWebAccessSchema = z.object({
+  enabled: z.boolean(),
+  reason: z.string().trim().min(3).max(500),
+})
+
+const updateOrganizationDpaSchema = z.object({
+  dpaSigned: z.boolean(),
+  reason: z.string().trim().min(3).max(500),
+}).strict()
+
+// Generated from the feature registry (packages/features/src/registry.ts):
+// every registry key is accepted; unknown and retired keys are ignored.
+const updateOrganizationCapabilitiesSchema = z.object({
+  capabilities: z.object({
+    ...mapFeatures(() => z.boolean().nullable().optional()),
+    gatewayDashboard: z.boolean().nullable().optional().meta({
+      deprecated: true,
+      description: "Accepted for compatibility only and ignored; AI Gateway no longer has an organization rollout override.",
+    }),
+  }),
+})
+
+const adminOrganizationCapabilitiesSchema = z.object({
+  ...mapFeatures(() => z.boolean()),
+  gatewayDashboard: z.literal(true).meta({
+    deprecated: true,
+    description: "Compatibility field, always true. AI Gateway is available to every organization; deployment configuration and authorization still apply.",
+  }),
+})
+
+const adminFeatureStateSchema = z.object({
+  enabled: z.boolean(),
+  source: z.enum(["unavailable", "killed", "lock", "override", "everyone"]),
+  everyone: z.boolean(),
+  killed: z.boolean(),
+  lock: z.boolean().nullable(),
+  override: z.boolean().nullable(),
+  overrideApplies: z.boolean(),
+})
+
+const adminFeatureStatesSchema = z.object(mapFeatures(() => adminFeatureStateSchema)).meta({
+  description: "Per feature for this organization: whether it is on and why (not part of this deployment, kill switch, operator lock, organization override, or the deployment-wide on/off state), and whether an organization override would take effect.",
+})
+
+const adminFeatureSchema = z.object({
+  key: featureKeySchema,
+  label: z.string(),
+  description: z.string(),
+  since: z.string(),
+  deployments: z.array(z.enum(["cloud", "self_hosted"])),
+  default: z.boolean(),
+  available: z.boolean(),
+  enabled: z.boolean(),
+  killed: z.boolean(),
+  lock: z.boolean().nullable(),
+}).meta({ ref: "AdminFeature" })
+
+const updateFeatureRolloutSchema = z.object({
+  enabled: z.boolean().optional(),
+  killed: z.boolean().optional(),
+}).strict().refine((value) => value.enabled !== undefined || value.killed !== undefined, { message: "Set enabled, killed, or both." })
+
+const createAdminSchema = z.object({
+  email: z.string().trim().max(255).email().transform((email) => email.toLowerCase()),
+  note: z.string().max(255).nullable().optional(),
+})
+
+const adminActivityPointSchema = z.object({
+  day: z.string(),
+  activeUsers: z.number(),
+  realActiveUsers: z.number(),
+  signups: z.number(),
+})
+
+const nullableNumberSchema = z.number().nullable()
+
+const adminSummarySchema = z.object({
+  totalUsers: z.number(),
+  totalOrganizations: z.number(),
+  verifiedUsers: nullableNumberSchema,
+  recentUsers7d: nullableNumberSchema,
+  recentUsers30d: nullableNumberSchema,
+  totalWorkers: nullableNumberSchema,
+  cloudWorkers: nullableNumberSchema,
+  localWorkers: nullableNumberSchema,
+  usersWithWorkers: nullableNumberSchema,
+  usersWithoutWorkers: nullableNumberSchema,
+  paidUsers: nullableNumberSchema,
+  unpaidUsers: nullableNumberSchema,
+  billingUnavailableUsers: nullableNumberSchema,
+  adminCount: z.number(),
+  billingLoaded: z.boolean(),
+  activeUsers1d: nullableNumberSchema,
+  activeUsers7d: nullableNumberSchema,
+  activeUsers30d: nullableNumberSchema,
+  realActiveUsers1d: nullableNumberSchema,
+  realActiveUsers7d: nullableNumberSchema,
+  realActiveUsers30d: nullableNumberSchema,
+  recurringUsers: nullableNumberSchema,
+  inviters: nullableNumberSchema,
+  medianHoursToFirstInvite: nullableNumberSchema,
+  activitySeries: z.array(adminActivityPointSchema),
+}).meta({ ref: "AdminSummary" })
+
+const adminPageInfoSchema = z.object({
+  total: z.number(),
+  limit: z.number(),
+  offset: z.number(),
+  returned: z.number(),
+  hasMore: z.boolean(),
+  search: z.string(),
+  durationMs: z.number(),
+}).meta({ ref: "AdminPageInfo" })
+
+const adminBillingPageSchema = z.object({
+  loaded: z.boolean(),
+  paidUsers: nullableNumberSchema,
+  unpaidUsers: nullableNumberSchema,
+  billingUnavailableUsers: nullableNumberSchema,
+})
+
+const adminOverviewResponseSchema = z.object({
+  viewer: z.object({
+    id: denTypeIdSchema("user"),
+    email: z.string(),
+    name: z.string().nullable(),
+  }),
+  admins: z.array(z.object({}).passthrough()),
+  summary: adminSummarySchema,
+  users: z.array(z.object({}).passthrough()),
+  organizations: z.array(z.object({ capabilities: adminOrganizationCapabilitiesSchema, featureStates: adminFeatureStatesSchema }).passthrough()),
+  userPage: adminPageInfoSchema,
+  organizationPage: adminPageInfoSchema,
+  generatedAt: z.string().datetime(),
+}).meta({ ref: "AdminOverviewResponse" })
+
+const adminUsersPageResponseSchema = z.object({
+  users: z.array(z.object({}).passthrough()),
+  page: adminPageInfoSchema,
+  billing: adminBillingPageSchema,
+  generatedAt: z.string().datetime(),
+}).meta({ ref: "AdminUsersPageResponse" })
+
+const adminOrganizationsPageResponseSchema = z.object({
+  organizations: z.array(z.object({ capabilities: adminOrganizationCapabilitiesSchema.optional(), featureStates: adminFeatureStatesSchema.optional() }).passthrough()),
+  page: adminPageInfoSchema,
+  generatedAt: z.string().datetime(),
+}).meta({ ref: "AdminOrganizationsPageResponse" })
+
+const adminMetricsResponseSchema = z.object({
+  summary: adminSummarySchema,
+  generatedAt: z.string().datetime(),
+}).meta({ ref: "AdminMetricsResponse" })
+
+function normalizeEmail(value: string | null | undefined) {
+  return value?.trim().toLowerCase() ?? ""
+}
+
+function toNumber(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value
+  }
+
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function normalizeProvider(providerId: string) {
+  const normalized = providerId.trim().toLowerCase()
+  if (!normalized) {
+    return "unknown"
+  }
+
+  if (normalized === "credential" || normalized === "email-password") {
+    return "email"
+  }
+
+  return normalized
+}
+
+function toDayKey(value: Date | string | null): string | null {
+  if (!value) {
+    return null
+  }
+
+  const date = value instanceof Date ? value : new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return null
+  }
+
+  return date.toISOString().slice(0, 10)
+}
+
+function toTimestamp(value: Date | string | null): number | null {
+  if (!value) {
+    return null
+  }
+
+  const date = value instanceof Date ? value : new Date(value)
+  const time = date.getTime()
+  return Number.isNaN(time) ? null : time
+}
+
+function median(values: number[]): number | null {
+  if (values.length === 0) {
+    return null
+  }
+
+  const sorted = [...values].sort((a, b) => a - b)
+  const mid = Math.floor(sorted.length / 2)
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
+}
+
+function parseBooleanQuery(value: string | undefined): boolean {
+  if (!value) {
+    return false
+  }
+
+  const normalized = value.trim().toLowerCase()
+  return normalized === "1" || normalized === "true" || normalized === "yes"
+}
+
+type DescribedFeatures = Record<FeatureKey, ResolvedFeature>
+
+function describeOrganization(rollouts: FeatureRollouts, overrides: FeatureOverrides): DescribedFeatures {
+  return describeFeatures({ rollouts, overrides, environment: env.features })
+}
+
+function readAdminFeatureStates(described: DescribedFeatures): z.infer<typeof adminFeatureStatesSchema> {
+  return mapFeatures((key) => {
+    const { enabled, source, everyone, killed, lock, override, overrideApplies } = described[key]
+    return { enabled, source, everyone, killed, lock, override, overrideApplies }
+  })
+}
+
+function readAdminVisibleOrganizationCapabilities(described: DescribedFeatures): z.infer<typeof adminOrganizationCapabilitiesSchema> {
+  return { ...mapFeatures((key) => described[key].enabled), gatewayDashboard: true }
+}
+
+function readAdminFeature(key: FeatureKey, rollouts: FeatureRollouts): z.infer<typeof adminFeatureSchema> {
+  const definition = featureDefinition(key)
+  const { enabled, killed } = featureRollout(key, rollouts)
+  return {
+    key,
+    label: definition.label,
+    description: definition.description,
+    since: definition.since,
+    deployments: [...definition.deployments],
+    default: definition.default,
+    available: featureAvailableOn(key, env.features.deployment),
+    enabled,
+    killed,
+    lock: env.features.locks[key] ?? null,
+  }
+}
+
+function readAdminIdexalOsWebAccess(
+  metadata: Record<string, unknown> | string | null | undefined,
+  subscription: AdminIdexalOsWebSubscription | null,
+) {
+  const complimentaryAccess = hasIdexalOsWebComplimentaryAccess(metadata)
+  const hasEligibleSubscription = Boolean(
+    subscription
+    && isEligibleIdexalOsWebSubscriptionStatus(subscription.status)
+    && env.stripe.idexalOsWebPriceId
+    && subscription.stripe_price_id === env.stripe.idexalOsWebPriceId
+    && subscription.payment_failed !== true,
+  )
+  const access = resolveIdexalOsWebAccess({
+    deploymentAvailable: isIdexalOsWebAvailable(),
+    hasEligibleSubscription,
+    complimentaryAccess,
+  })
+  return {
+    ...access,
+    hasEligibleSubscription,
+    hasOngoingSubscription: Boolean(subscription && isOngoingIdexalOsWebSubscriptionStatus(subscription.status)),
+    subscriptionStatus: subscription?.status ?? null,
+  }
+}
+
+function getManualPlanMetadata(tier: PlanTier): { tier: PlanTier; source: "manual"; grantedAt?: string } {
+  return {
+    tier,
+    source: "manual",
+    ...(tier === "enterprise" ? { grantedAt: new Date().toISOString() } : {}),
+  }
+}
+
+async function recordAdminMemberRemoval(member: MemberAuditRow & { organizationId: OrganizationId }, adminUserId: UserId) {
+  let capture: Awaited<ReturnType<typeof platformAdminChangeCapture>>
+  try {
+    capture = await platformAdminChangeCapture({ organizationId: member.organizationId, adminUserId, kind: "member.management", scope: member.id })
+  } catch (error) {
+    logAuditOutcomeLost({ requestId: null, organizationId: member.organizationId, action: "member.removed", error })
+    return
+  }
+  const ids = await appendDomainChangesAfterCommit(capture, "member.removed", async () => [memberRemovedEvent({ organizationId: member.organizationId, member, reasonCode: "user_deleted" })])
+  try {
+    await finishLegacyAuditAction(capture, {
+      organizationId: member.organizationId,
+      actorUserId: adminUserId,
+      action: ORGANIZATION_AUDIT_ACTIONS.memberRemoved,
+      payload: { targetOrgMembershipId: member.id, targetUserId: member.userId, previousRole: member.role },
+    }, ids)
+  } catch (error) {
+    logAuditOutcomeLost({ requestId: capture?.context.requestId ?? null, organizationId: member.organizationId, action: ORGANIZATION_AUDIT_ACTIONS.memberRemoved, error })
+  }
+}
+
+/**
+ * Admin user deletion deletes every session row directly (no better-auth hook):
+ * session.revoked (reasonCode admin_user_deleted) per live session in each
+ * organization the user was an active member of, actor = this admin, origin
+ * platform_admin. Appended after the commit; a failed append logs [audit-outcome-lost].
+ */
+async function recordAdminSessionsRevoked(member: { id: string; organizationId: OrganizationId }, sessions: readonly DirectlyDeletedSession[], adminUserId: UserId) {
+  const live = sessions.filter((session) => session.expiresAt.getTime() > Date.now())
+  if (live.length === 0) return
+  let capture: Awaited<ReturnType<typeof platformAdminChangeCapture>>
+  try {
+    capture = await platformAdminChangeCapture({ organizationId: member.organizationId, adminUserId, kind: "session.lifecycle", scope: member.id })
+  } catch (error) {
+    logAuditOutcomeLost({ requestId: null, organizationId: member.organizationId, action: "session.revoked", error })
+    return
+  }
+  const requestId = capture?.context.requestId ?? null
+  await appendDomainChangesAfterCommit(capture, "session.revoked", async () => live.map((session) => sessionRevokedEvent({ organizationId: member.organizationId, memberId: member.id, session, reasonCode: "admin_user_deleted", requestId })))
+}
+
+function isOrganizationId(value: string): value is OrganizationId {
+  return value.startsWith("org_")
+}
+
+function isUserId(value: string): value is UserId {
+  return isDenTypeId("user", value)
+}
+
+function isDuplicateDatabaseEntry(error: unknown): boolean {
+  let current = error
+  const visited = new Set<object>()
+  while (typeof current === "object" && current !== null && !visited.has(current)) {
+    visited.add(current)
+    if ("code" in current && current.code === "ER_DUP_ENTRY") {
+      return true
+    }
+    if ("errno" in current && current.errno === 1062) {
+      return true
+    }
+    current = "cause" in current ? current.cause : null
+  }
+  return false
+}
+
+async function mapWithConcurrency<T, R>(items: T[], limit: number, mapper: (item: T) => Promise<R>): Promise<R[]> {
+  if (items.length === 0) {
+    return []
+  }
+
+  const results = new Array<R>(items.length)
+  let nextIndex = 0
+
+  async function runWorker() {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex
+      nextIndex += 1
+      results[currentIndex] = await mapper(items[currentIndex])
+    }
+  }
+
+  const workerCount = Math.max(1, Math.min(limit, items.length))
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()))
+  return results
+}
+
+function isPaidSubscriptionStatus(value: string | null) {
+  return value === "active" || value === "trialing"
+}
+
+function billingTime(value: Date | string | null) {
+  if (!value) {
+    return 0
+  }
+
+  return value instanceof Date ? value.getTime() : new Date(value).getTime()
+}
+
+function shouldReplaceBillingStatus(current: AdminBillingStatus, candidate: AdminBillingStatus) {
+  if (candidate.status === "paid" && current.status !== "paid") {
+    return true
+  }
+
+  if (candidate.status !== current.status) {
+    return false
+  }
+
+  return billingTime(candidate.currentPeriodEnd) > billingTime(current.currentPeriodEnd)
+}
+
+type AdminUserBaseRow = Pick<typeof AuthUserTable.$inferSelect, "id" | "name" | "email" | "emailVerified" | "createdAt" | "updatedAt">
+
+type AdminUserRow = AdminUserBaseRow & {
+  lastSeenAt: Date | string | null
+  sessionCount: number
+  activeDayCount: number
+  isRecurring: boolean
+  lastActiveAt: Date | string | null
+  invitesSent: number
+  firstInviteAt: Date | string | null
+  hoursToFirstInvite: number | null
+  authProviders: string[]
+  workerCount: number
+  cloudWorkerCount: number
+  localWorkerCount: number
+  latestWorkerCreatedAt: Date | string | null
+  billing: AdminBillingStatus | null
+  organizations: Array<{
+    id: OrganizationId
+    name: string
+    role: string
+    memberCount: number
+    joinedAt: Date | string | null
+  }>
+}
+
+type AdminOrganizationRow = {
+  id: OrganizationId
+  name: string
+  slug: string
+  createdAt: Date | string | null
+  updatedAt: Date | string | null
+  memberCount: number
+  plan: ReturnType<typeof parseOrganizationPlan>
+  seatLimit: number
+  freeSeatCount: number
+  seatsFreeAdditional: number
+  billableSeatCount: number
+  capabilities?: ReturnType<typeof readAdminVisibleOrganizationCapabilities>
+  featureStates?: ReturnType<typeof readAdminFeatureStates>
+  idexalOsWebAccess: AdminIdexalOsWebAccess
+}
+
+type AdminIdexalOsWebSubscription = Pick<
+  typeof OrgSubscriptionTable.$inferSelect,
+  "status" | "stripe_price_id" | "payment_failed"
+>
+
+type AdminIdexalOsWebAccess = ReturnType<typeof readAdminIdexalOsWebAccess>
+
+type AdminSummary = {
+  totalUsers: number
+  totalOrganizations: number
+  verifiedUsers: number | null
+  recentUsers7d: number | null
+  recentUsers30d: number | null
+  totalWorkers: number | null
+  cloudWorkers: number | null
+  localWorkers: number | null
+  usersWithWorkers: number | null
+  usersWithoutWorkers: number | null
+  paidUsers: number | null
+  unpaidUsers: number | null
+  billingUnavailableUsers: number | null
+  adminCount: number
+  billingLoaded: boolean
+  activeUsers1d: number | null
+  activeUsers7d: number | null
+  activeUsers30d: number | null
+  realActiveUsers1d: number | null
+  realActiveUsers7d: number | null
+  realActiveUsers30d: number | null
+  recurringUsers: number | null
+  inviters: number | null
+  medianHoursToFirstInvite: number | null
+  activitySeries: Array<{ day: string; activeUsers: number; realActiveUsers: number; signups: number }>
+}
+
+function elapsedMs(startedAt: number) {
+  return Math.max(0, Math.round(Date.now() - startedAt))
+}
+
+function userSearchCondition(search: string): SQL | undefined {
+  if (!search) {
+    return undefined
+  }
+
+  const normalized = search.toLowerCase()
+  if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(normalized)) {
+    return eq(AuthUserTable.email, normalized)
+  }
+
+  const pattern = `%${sanitizeAdminSearchForLike(search)}%`
+  return sql`(
+    lower(${AuthUserTable.name}) like ${pattern} escape '|'
+    or lower(${AuthUserTable.email}) like ${pattern} escape '|'
+    or lower(${AuthUserTable.id}) like ${pattern} escape '|'
+    or exists (
+      select 1 from ${AuthAccountTable}
+      where ${AuthAccountTable.userId} = ${AuthUserTable.id}
+        and lower(${AuthAccountTable.providerId}) like ${pattern} escape '|'
+    )
+    or exists (
+      select 1 from ${MemberTable}
+      inner join ${OrganizationTable} on ${MemberTable.organizationId} = ${OrganizationTable.id}
+      where ${MemberTable.userId} = ${AuthUserTable.id}
+        and ${MemberTable.removedAt} is null
+        and (
+          lower(${OrganizationTable.name}) like ${pattern} escape '|'
+          or lower(${OrganizationTable.id}) like ${pattern} escape '|'
+          or lower(${MemberTable.role}) like ${pattern} escape '|'
+        )
+    )
+  )`
+}
+
+function organizationSearchCondition(search: string): SQL | undefined {
+  if (!search) {
+    return undefined
+  }
+
+  const pattern = `%${sanitizeAdminSearchForLike(search)}%`
+  return sql`(
+    lower(${OrganizationTable.name}) like ${pattern} escape '|'
+    or lower(${OrganizationTable.slug}) like ${pattern} escape '|'
+    or lower(${OrganizationTable.id}) like ${pattern} escape '|'
+  )`
+}
+
+async function selectUserCount(condition: SQL | undefined) {
+  const query = db.select({ total: sql<number>`count(*)` }).from(AuthUserTable)
+  const rows = condition ? await query.where(condition) : await query
+  return toNumber(rows[0]?.total)
+}
+
+async function selectUserPage(request: AdminPageRequest) {
+  const condition = userSearchCondition(request.search)
+  const query = db
+    .select({
+      id: AuthUserTable.id,
+      name: AuthUserTable.name,
+      email: AuthUserTable.email,
+      emailVerified: AuthUserTable.emailVerified,
+      createdAt: AuthUserTable.createdAt,
+      updatedAt: AuthUserTable.updatedAt,
+    })
+    .from(AuthUserTable)
+  const pageQuery = condition ? query.where(condition) : query
+  const [total, rows] = await Promise.all([
+    selectUserCount(condition),
+    pageQuery.orderBy(desc(AuthUserTable.createdAt), desc(AuthUserTable.id)).limit(request.limit).offset(request.offset),
+  ])
+
+  return { total, rows }
+}
+
+async function selectOrganizationCount(condition: SQL | undefined) {
+  const query = db.select({ total: sql<number>`count(*)` }).from(OrganizationTable)
+  const rows = condition ? await query.where(condition) : await query
+  return toNumber(rows[0]?.total)
+}
+
+async function selectOrganizationPage(request: AdminPageRequest) {
+  const condition = organizationSearchCondition(request.search)
+  const query = db
+    .select({
+      id: OrganizationTable.id,
+      name: OrganizationTable.name,
+      slug: OrganizationTable.slug,
+      metadata: OrganizationTable.metadata,
+      createdAt: OrganizationTable.createdAt,
+      updatedAt: OrganizationTable.updatedAt,
+    })
+    .from(OrganizationTable)
+  const pageQuery = condition ? query.where(condition) : query
+  const [total, rows] = await Promise.all([
+    selectOrganizationCount(condition),
+    pageQuery.orderBy(desc(OrganizationTable.createdAt), desc(OrganizationTable.id)).limit(request.limit).offset(request.offset),
+  ])
+
+  return { total, rows }
+}
+
+export async function loadAdminUsersPage(request: AdminPageRequest, includeBilling: boolean) {
+  const startedAt = Date.now()
+  const { total, rows } = await selectUserPage(request)
+  const users = await shapeAdminUserRows(rows, includeBilling)
+  const billingCounts = users.reduce(
+    (accumulator, user) => {
+      if (!user.billing) {
+        return accumulator
+      }
+      if (user.billing.status === "paid") {
+        accumulator.paidUsers += 1
+      } else if (user.billing.status === "unpaid") {
+        accumulator.unpaidUsers += 1
+      } else {
+        accumulator.billingUnavailableUsers += 1
+      }
+      return accumulator
+    },
+    { paidUsers: 0, unpaidUsers: 0, billingUnavailableUsers: 0 },
+  )
+
+  return {
+    users,
+    page: buildAdminPageInfo(request, total, users.length, elapsedMs(startedAt)),
+    billing: includeBilling
+      ? { loaded: true, ...billingCounts }
+      : { loaded: false, paidUsers: null, unpaidUsers: null, billingUnavailableUsers: null },
+  }
+}
+
+async function shapeAdminUserRows(users: AdminUserBaseRow[], includeBilling: boolean): Promise<AdminUserRow[]> {
+  if (users.length === 0) {
+    return []
+  }
+
+  const userIds = users.map((user) => user.id)
+  const activityWindowStart = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000)
+  const sessionDayExpr = sql<string>`date_format(${AuthSessionTable.createdAt}, '%Y-%m-%d')`
+  const telemetryDayExpr = sql<string>`date_format(${TelemetryEventTable.event_timestamp}, '%Y-%m-%d')`
+
+  const [workerStatsRows, sessionStatsRows, accountRows, orgMembershipRows, sessionDayRows, telemetryDayRows, taskDayRows, inviteStatsRows] = await Promise.all([
+    db
+      .select({
+        userId: WorkerTable.created_by_user_id,
+        workerCount: sql<number>`count(*)`,
+        cloudWorkerCount: sql<number>`sum(case when ${WorkerTable.destination} = 'cloud' then 1 else 0 end)`,
+        localWorkerCount: sql<number>`sum(case when ${WorkerTable.destination} = 'local' then 1 else 0 end)`,
+        latestWorkerCreatedAt: sql<Date | null>`max(${WorkerTable.created_at})`,
+      })
+      .from(WorkerTable)
+      .where(inArray(WorkerTable.created_by_user_id, userIds))
+      .groupBy(WorkerTable.created_by_user_id),
+    db
+      .select({
+        userId: AuthSessionTable.userId,
+        sessionCount: sql<number>`count(*)`,
+        lastSeenAt: sql<Date | null>`max(${AuthSessionTable.updatedAt})`,
+      })
+      .from(AuthSessionTable)
+      .where(inArray(AuthSessionTable.userId, userIds))
+      .groupBy(AuthSessionTable.userId),
+    db
+      .select({
+        userId: AuthAccountTable.userId,
+        providerId: AuthAccountTable.providerId,
+      })
+      .from(AuthAccountTable)
+      .where(inArray(AuthAccountTable.userId, userIds))
+      .groupBy(AuthAccountTable.userId, AuthAccountTable.providerId),
+    db
+      .select({
+        userId: MemberTable.userId,
+        organizationId: MemberTable.organizationId,
+        organizationName: OrganizationTable.name,
+        role: MemberTable.role,
+        joinedAt: MemberTable.joinedAt,
+      })
+      .from(MemberTable)
+      .innerJoin(OrganizationTable, eq(MemberTable.organizationId, OrganizationTable.id))
+      .where(and(inArray(MemberTable.userId, userIds), isNull(MemberTable.removedAt))),
+    db
+      .select({ userId: AuthSessionTable.userId, day: sessionDayExpr })
+      .from(AuthSessionTable)
+      .where(and(inArray(AuthSessionTable.userId, userIds), gte(AuthSessionTable.createdAt, activityWindowStart)))
+      .groupBy(AuthSessionTable.userId, sessionDayExpr),
+    db
+      .select({
+        userId: MemberTable.userId,
+        day: telemetryDayExpr,
+        lastEventAt: sql<Date | null>`max(${TelemetryEventTable.event_timestamp})`,
+      })
+      .from(TelemetryEventTable)
+      .innerJoin(MemberTable, eq(TelemetryEventTable.member_id, MemberTable.id))
+      .where(and(inArray(MemberTable.userId, userIds), gte(TelemetryEventTable.event_timestamp, activityWindowStart)))
+      .groupBy(MemberTable.userId, telemetryDayExpr)
+      .catch(() => []),
+    db
+      .select({ userId: MemberTable.userId, day: telemetryDayExpr })
+      .from(TelemetryEventTable)
+      .innerJoin(MemberTable, eq(TelemetryEventTable.member_id, MemberTable.id))
+      .where(and(
+        inArray(MemberTable.userId, userIds),
+        gte(TelemetryEventTable.event_timestamp, activityWindowStart),
+        inArray(TelemetryEventTable.event_type, ["task.started", "task.completed", "task.failed"]),
+        isNotNull(TelemetryEventTable.session_id),
+      ))
+      .groupBy(MemberTable.userId, telemetryDayExpr)
+      .catch(() => []),
+    db
+      .select({
+        inviterId: InvitationTable.inviterId,
+        invitesSent: sql<number>`count(*)`,
+        firstInviteAt: sql<Date | null>`min(${InvitationTable.createdAt})`,
+      })
+      .from(InvitationTable)
+      .where(inArray(InvitationTable.inviterId, userIds))
+      .groupBy(InvitationTable.inviterId),
+  ])
+
+  const organizationIds = Array.from(new Set(orgMembershipRows.map((row) => row.organizationId).filter(isOrganizationId)))
+  const orgMemberStatsRows = organizationIds.length > 0
+    ? await db
+      .select({ organizationId: MemberTable.organizationId, memberCount: sql<number>`count(*)` })
+      .from(MemberTable)
+      .where(and(inArray(MemberTable.organizationId, organizationIds), isNull(MemberTable.removedAt)))
+      .groupBy(MemberTable.organizationId)
+    : []
+  const memberCountByOrg = new Map<string, number>()
+  for (const row of orgMemberStatsRows) {
+    memberCountByOrg.set(row.organizationId, toNumber(row.memberCount))
+  }
+
+  const workerStatsByUser = new Map<UserId, { workerCount: number; cloudWorkerCount: number; localWorkerCount: number; latestWorkerCreatedAt: Date | string | null }>()
+  for (const row of workerStatsRows) {
+    if (!row.userId) {
+      continue
+    }
+    workerStatsByUser.set(row.userId, {
+      workerCount: toNumber(row.workerCount),
+      cloudWorkerCount: toNumber(row.cloudWorkerCount),
+      localWorkerCount: toNumber(row.localWorkerCount),
+      latestWorkerCreatedAt: row.latestWorkerCreatedAt,
+    })
+  }
+
+  const sessionStatsByUser = new Map<UserId, { sessionCount: number; lastSeenAt: Date | string | null }>()
+  for (const row of sessionStatsRows) {
+    sessionStatsByUser.set(row.userId, { sessionCount: toNumber(row.sessionCount), lastSeenAt: row.lastSeenAt })
+  }
+
+  const providersByUser = new Map<UserId, Set<string>>()
+  for (const row of accountRows) {
+    const existing = providersByUser.get(row.userId) ?? new Set<string>()
+    existing.add(normalizeProvider(row.providerId))
+    providersByUser.set(row.userId, existing)
+  }
+
+  const membershipsByUser = new Map<UserId, AdminUserRow["organizations"]>()
+  for (const row of orgMembershipRows) {
+    if (!row.userId || !isOrganizationId(row.organizationId)) {
+      continue
+    }
+    const memberships = membershipsByUser.get(row.userId) ?? []
+    memberships.push({
+      id: row.organizationId,
+      name: row.organizationName,
+      role: row.role,
+      memberCount: memberCountByOrg.get(row.organizationId) ?? 0,
+      joinedAt: row.joinedAt,
+    })
+    membershipsByUser.set(row.userId, memberships)
+  }
+  for (const memberships of membershipsByUser.values()) {
+    memberships.sort((a, b) => a.name.localeCompare(b.name))
+  }
+
+  type ActivityStats = { days: Set<string>; lastTelemetryAt: number | null }
+  const activityByUser = new Map<UserId, ActivityStats>()
+  const getActivity = (userId: UserId): ActivityStats => {
+    let stats = activityByUser.get(userId)
+    if (!stats) {
+      stats = { days: new Set(), lastTelemetryAt: null }
+      activityByUser.set(userId, stats)
+    }
+    return stats
+  }
+  for (const row of sessionDayRows) {
+    if (row.day) {
+      getActivity(row.userId).days.add(row.day)
+    }
+  }
+  for (const row of telemetryDayRows) {
+    if (!row.userId) {
+      continue
+    }
+    const stats = getActivity(row.userId)
+    if (row.day) {
+      stats.days.add(row.day)
+    }
+    const eventTime = toTimestamp(row.lastEventAt)
+    if (eventTime !== null && (stats.lastTelemetryAt === null || eventTime > stats.lastTelemetryAt)) {
+      stats.lastTelemetryAt = eventTime
+    }
+  }
+  for (const row of taskDayRows) {
+    if (row.userId && row.day) {
+      getActivity(row.userId).days.add(row.day)
+    }
+  }
+
+  const inviteStatsByUser = new Map<UserId, { invitesSent: number; firstInviteAt: Date | string | null }>()
+  for (const row of inviteStatsRows) {
+    inviteStatsByUser.set(row.inviterId, { invitesSent: toNumber(row.invitesSent), firstInviteAt: row.firstInviteAt })
+  }
+
+  const billingByUser = includeBilling ? await loadBillingForUsers(userIds) : new Map<UserId, AdminBillingStatus>()
+
+  return users.map((entry) => {
+    const workerStats = workerStatsByUser.get(entry.id) ?? { workerCount: 0, cloudWorkerCount: 0, localWorkerCount: 0, latestWorkerCreatedAt: null }
+    const sessionStats = sessionStatsByUser.get(entry.id) ?? { sessionCount: 0, lastSeenAt: null }
+    const activity = activityByUser.get(entry.id)
+    const activeDayCount = activity ? activity.days.size : 0
+    const lastSeenTime = toTimestamp(sessionStats.lastSeenAt)
+    const lastTelemetryAt = activity ? activity.lastTelemetryAt : null
+    const lastActiveTime = lastTelemetryAt === null ? lastSeenTime : lastSeenTime === null ? lastTelemetryAt : Math.max(lastSeenTime, lastTelemetryAt)
+    const inviteStats = inviteStatsByUser.get(entry.id)
+    const signupTime = toTimestamp(entry.createdAt)
+    const firstInviteTime = toTimestamp(inviteStats ? inviteStats.firstInviteAt : null)
+    const hoursToFirstInvite = signupTime !== null && firstInviteTime !== null
+      ? Math.max(0, Math.round(((firstInviteTime - signupTime) / (60 * 60 * 1000)) * 10) / 10)
+      : null
+
+    return {
+      ...entry,
+      lastSeenAt: sessionStats.lastSeenAt,
+      sessionCount: sessionStats.sessionCount,
+      activeDayCount,
+      isRecurring: activeDayCount >= 2,
+      lastActiveAt: lastActiveTime === null ? null : new Date(lastActiveTime),
+      invitesSent: inviteStats ? inviteStats.invitesSent : 0,
+      firstInviteAt: inviteStats ? inviteStats.firstInviteAt : null,
+      hoursToFirstInvite,
+      authProviders: Array.from(providersByUser.get(entry.id) ?? []).sort(),
+      workerCount: workerStats.workerCount,
+      cloudWorkerCount: workerStats.cloudWorkerCount,
+      localWorkerCount: workerStats.localWorkerCount,
+      latestWorkerCreatedAt: workerStats.latestWorkerCreatedAt,
+      billing: includeBilling ? billingByUser.get(entry.id) ?? {
+        status: "unpaid",
+        featureGateEnabled: false,
+        subscriptionId: null,
+        subscriptionStatus: null,
+        currentPeriodEnd: null,
+        source: "subscription",
+        note: "No cached organization subscription covers this user.",
+      } : null,
+      organizations: membershipsByUser.get(entry.id) ?? [],
+    }
+  })
+}
+
+async function loadBillingForUsers(userIds: UserId[]) {
+  const subscriptionRows = await db
+    .select({
+      userId: MemberTable.userId,
+      subscriptionId: OrgSubscriptionTable.stripe_subscription_id,
+      subscriptionStatus: OrgSubscriptionTable.status,
+      currentPeriodEnd: OrgSubscriptionTable.current_period_end,
+    })
+    .from(OrgSubscriptionTable)
+    .innerJoin(MemberTable, eq(OrgSubscriptionTable.organization_id, MemberTable.organizationId))
+    .where(and(inArray(MemberTable.userId, userIds), isNull(MemberTable.removedAt), eq(OrgSubscriptionTable.type, "inference")))
+
+  const subscriptionIds = Array.from(new Set(subscriptionRows.map((row) => row.subscriptionId)))
+  const refreshedRows = await mapWithConcurrency(subscriptionIds, 4, async (subscriptionId) => {
+    try {
+      return await refreshOrgSubscriptionFromStripe(subscriptionId)
+    } catch (error) {
+      logger.warn("failed to refresh Stripe subscription", { stripe_subscription_id: subscriptionId, error })
+      return null
+    }
+  })
+  const refreshedBySubscriptionId = new Map<string, NonNullable<(typeof refreshedRows)[number]>>()
+  for (const row of refreshedRows) {
+    if (row) {
+      refreshedBySubscriptionId.set(row.stripe_subscription_id, row)
+    }
+  }
+
+  const billingByUser = new Map<UserId, AdminBillingStatus>()
+  for (const row of subscriptionRows) {
+    if (!row.userId) {
+      continue
+    }
+    const refreshed = refreshedBySubscriptionId.get(row.subscriptionId)
+    const subscriptionStatus = refreshed?.status ?? row.subscriptionStatus
+    const subscriptionId = refreshed?.stripe_subscription_id ?? row.subscriptionId
+    const currentPeriodEnd = refreshed?.current_period_end ?? row.currentPeriodEnd
+    const paid = isPaidSubscriptionStatus(subscriptionStatus)
+    const billing: AdminBillingStatus = {
+      status: paid ? "paid" : "unpaid",
+      featureGateEnabled: false,
+      subscriptionId,
+      subscriptionStatus,
+      currentPeriodEnd,
+      source: "subscription",
+      note: paid ? "Covered by an active organization subscription." : "Organization subscription is not active.",
+    }
+    const current = billingByUser.get(row.userId)
+    if (!current || shouldReplaceBillingStatus(current, billing)) {
+      billingByUser.set(row.userId, billing)
+    }
+  }
+
+  return billingByUser
+}
+
+export async function loadAdminOrganizationsPage(request: AdminPageRequest, includeFeatures = true) {
+  const startedAt = Date.now()
+  const { total, rows } = await selectOrganizationPage(request)
+  const organizations = await shapeAdminOrganizationRows(rows, includeFeatures)
+  return {
+    organizations,
+    page: buildAdminPageInfo(request, total, organizations.length, elapsedMs(startedAt)),
+    generatedAt: new Date().toISOString(),
+  }
+}
+
+async function shapeAdminOrganizationRows(rows: Array<Pick<typeof OrganizationTable.$inferSelect, "id" | "name" | "slug" | "metadata" | "createdAt" | "updatedAt">>, includeFeatures: boolean): Promise<AdminOrganizationRow[]> {
+  if (rows.length === 0) {
+    return []
+  }
+
+  const organizationIds = rows.map((row) => row.id)
+  const [memberRows, webSubscriptionRows, featureOverridesByOrg, featureRollouts] = await Promise.all([
+    db
+      .select({ organizationId: MemberTable.organizationId, memberCount: sql<number>`count(*)` })
+      .from(MemberTable)
+      .where(and(inArray(MemberTable.organizationId, organizationIds), isNull(MemberTable.removedAt)))
+      .groupBy(MemberTable.organizationId),
+    db
+      .select({
+        organizationId: OrgSubscriptionTable.organization_id,
+        status: OrgSubscriptionTable.status,
+        stripe_price_id: OrgSubscriptionTable.stripe_price_id,
+        payment_failed: OrgSubscriptionTable.payment_failed,
+      })
+      .from(OrgSubscriptionTable)
+      .where(and(
+        inArray(OrgSubscriptionTable.organization_id, organizationIds),
+        eq(OrgSubscriptionTable.type, "web"),
+      )),
+    includeFeatures ? readOrganizationFeatureOverridesForMany(db, organizationIds) : null,
+    includeFeatures ? readFeatureRollouts(db) : null,
+  ])
+  const memberCountByOrg = new Map<string, number>()
+  for (const row of memberRows) {
+    memberCountByOrg.set(row.organizationId, toNumber(row.memberCount))
+  }
+  const webSubscriptionByOrg = new Map(webSubscriptionRows.map((row) => [row.organizationId, row]))
+
+  return rows.map((entry) => {
+    const described = featureRollouts && featureOverridesByOrg
+      ? describeOrganization(featureRollouts, featureOverridesByOrg.get(entry.id) ?? {})
+      : null
+    const metadata = normalizeOrganizationMetadata(entry.metadata).metadata
+    const seatLimit = metadata.limits.members ?? DEFAULT_ORGANIZATION_LIMITS.members
+    const seatCounts = calculateOrganizationSeatBillingCounts({ memberCount: memberCountByOrg.get(entry.id) ?? 0, metadata })
+    return {
+      id: entry.id,
+      name: entry.name,
+      slug: entry.slug,
+      createdAt: entry.createdAt,
+      updatedAt: entry.updatedAt,
+      memberCount: seatCounts.total,
+      plan: parseOrganizationPlan(metadata),
+      seatLimit,
+      freeSeatCount: seatCounts.free,
+      seatsFreeAdditional: seatCounts.additionalFree,
+      billableSeatCount: seatCounts.chargeable,
+      ...(described ? {
+        capabilities: readAdminVisibleOrganizationCapabilities(described),
+        featureStates: readAdminFeatureStates(described),
+      } : {}),
+      idexalOsWebAccess: readAdminIdexalOsWebAccess(metadata, webSubscriptionByOrg.get(entry.id) ?? null),
+    }
+  })
+}
+
+function buildDeferredOverviewSummary(adminCount: number, totalUsers: number, totalOrganizations: number): AdminSummary {
+  return {
+    totalUsers,
+    totalOrganizations,
+    verifiedUsers: null,
+    recentUsers7d: null,
+    recentUsers30d: null,
+    totalWorkers: null,
+    cloudWorkers: null,
+    localWorkers: null,
+    usersWithWorkers: null,
+    usersWithoutWorkers: null,
+    paidUsers: null,
+    unpaidUsers: null,
+    billingUnavailableUsers: null,
+    adminCount,
+    billingLoaded: false,
+    activeUsers1d: null,
+    activeUsers7d: null,
+    activeUsers30d: null,
+    realActiveUsers1d: null,
+    realActiveUsers7d: null,
+    realActiveUsers30d: null,
+    recurringUsers: null,
+    inviters: null,
+    medianHoursToFirstInvite: null,
+    activitySeries: [],
+  }
+}
+
+export async function loadAdminMetricsSummary(): Promise<AdminSummary> {
+  const activityWindowDays = 90
+  const seriesWindowDays = 30
+  const now = Date.now()
+  const activityWindowStart = new Date(now - activityWindowDays * 24 * 60 * 60 * 1000)
+  const seriesWindowStart = new Date(now - (seriesWindowDays - 1) * 24 * 60 * 60 * 1000)
+  const recent7dStart = new Date(now - 7 * 24 * 60 * 60 * 1000)
+  const recent30dStart = new Date(now - 30 * 24 * 60 * 60 * 1000)
+  const sessionDayExpr = sql<string>`date_format(${AuthSessionTable.createdAt}, '%Y-%m-%d')`
+  const telemetryDayExpr = sql<string>`date_format(${TelemetryEventTable.event_timestamp}, '%Y-%m-%d')`
+  const signupDayExpr = sql<string>`date_format(${AuthUserTable.createdAt}, '%Y-%m-%d')`
+
+  const [userSummaryRows, organizationTotal, adminRows, workerRows, sessionDayRows, telemetryDayRows, taskDayRows, signupRows, inviteRows] = await Promise.all([
+    db
+      .select({
+        totalUsers: sql<number>`count(*)`,
+        verifiedUsers: sql<number>`sum(case when ${AuthUserTable.emailVerified} then 1 else 0 end)`,
+        recentUsers7d: sql<number>`sum(case when ${AuthUserTable.createdAt} >= ${recent7dStart} then 1 else 0 end)`,
+        recentUsers30d: sql<number>`sum(case when ${AuthUserTable.createdAt} >= ${recent30dStart} then 1 else 0 end)`,
+      })
+      .from(AuthUserTable),
+    selectOrganizationCount(undefined),
+    db.select({ adminCount: sql<number>`count(*)` }).from(AdminAllowlistTable),
+    db
+      .select({
+        totalWorkers: sql<number>`count(*)`,
+        cloudWorkers: sql<number>`sum(case when ${WorkerTable.destination} = 'cloud' then 1 else 0 end)`,
+        localWorkers: sql<number>`sum(case when ${WorkerTable.destination} = 'local' then 1 else 0 end)`,
+        usersWithWorkers: sql<number>`count(distinct ${WorkerTable.created_by_user_id})`,
+      })
+      .from(WorkerTable),
+    db
+      .select({ userId: AuthSessionTable.userId, day: sessionDayExpr })
+      .from(AuthSessionTable)
+      .where(gte(AuthSessionTable.createdAt, activityWindowStart))
+      .groupBy(AuthSessionTable.userId, sessionDayExpr),
+    db
+      .select({ userId: MemberTable.userId, day: telemetryDayExpr })
+      .from(TelemetryEventTable)
+      .innerJoin(MemberTable, eq(TelemetryEventTable.member_id, MemberTable.id))
+      .where(and(isNotNull(MemberTable.userId), gte(TelemetryEventTable.event_timestamp, activityWindowStart)))
+      .groupBy(MemberTable.userId, telemetryDayExpr)
+      .catch(() => []),
+    db
+      .select({ userId: MemberTable.userId, day: telemetryDayExpr })
+      .from(TelemetryEventTable)
+      .innerJoin(MemberTable, eq(TelemetryEventTable.member_id, MemberTable.id))
+      .where(and(
+        isNotNull(MemberTable.userId),
+        gte(TelemetryEventTable.event_timestamp, activityWindowStart),
+        inArray(TelemetryEventTable.event_type, ["task.started", "task.completed", "task.failed"]),
+        isNotNull(TelemetryEventTable.session_id),
+      ))
+      .groupBy(MemberTable.userId, telemetryDayExpr)
+      .catch(() => []),
+    db
+      .select({ day: signupDayExpr, signups: sql<number>`count(*)` })
+      .from(AuthUserTable)
+      .where(gte(AuthUserTable.createdAt, seriesWindowStart))
+      .groupBy(signupDayExpr),
+    db
+      .select({
+        inviterId: InvitationTable.inviterId,
+        signupAt: AuthUserTable.createdAt,
+        firstInviteAt: sql<Date | null>`min(${InvitationTable.createdAt})`,
+      })
+      .from(InvitationTable)
+      .innerJoin(AuthUserTable, eq(InvitationTable.inviterId, AuthUserTable.id))
+      .groupBy(InvitationTable.inviterId, AuthUserTable.createdAt),
+  ])
+
+  const userSummary = userSummaryRows[0]
+  const totalUsers = toNumber(userSummary?.totalUsers)
+  const workerSummary = workerRows[0]
+  const totalWorkers = toNumber(workerSummary?.totalWorkers)
+  const cloudWorkers = toNumber(workerSummary?.cloudWorkers)
+  const localWorkers = toNumber(workerSummary?.localWorkers)
+  const usersWithWorkers = toNumber(workerSummary?.usersWithWorkers)
+  const seriesStartKey = toDayKey(seriesWindowStart) ?? ""
+  const activeUsersByDay = new Map<string, Set<UserId>>()
+  const realActiveUsersByDay = new Map<string, Set<UserId>>()
+  const activityDaysByUser = new Map<UserId, Set<string>>()
+
+  const rememberActivityDay = (userId: UserId, day: string) => {
+    const days = activityDaysByUser.get(userId) ?? new Set<string>()
+    days.add(day)
+    activityDaysByUser.set(userId, days)
+  }
+  const markDay = (target: Map<string, Set<UserId>>, day: string, userId: UserId) => {
+    if (day < seriesStartKey) {
+      return
+    }
+
+    const users = target.get(day) ?? new Set<UserId>()
+    users.add(userId)
+    target.set(day, users)
+  }
+
+  for (const row of sessionDayRows) {
+    if (!row.day) {
+      continue
+    }
+    rememberActivityDay(row.userId, row.day)
+    markDay(activeUsersByDay, row.day, row.userId)
+  }
+  for (const row of telemetryDayRows) {
+    if (!row.userId || !row.day) {
+      continue
+    }
+    rememberActivityDay(row.userId, row.day)
+    markDay(activeUsersByDay, row.day, row.userId)
+  }
+  for (const row of taskDayRows) {
+    if (!row.userId || !row.day) {
+      continue
+    }
+    rememberActivityDay(row.userId, row.day)
+    markDay(realActiveUsersByDay, row.day, row.userId)
+  }
+
+  const signupsByDay = new Map<string, number>()
+  for (const row of signupRows) {
+    if (row.day) {
+      signupsByDay.set(row.day, toNumber(row.signups))
+    }
+  }
+
+  const todayKey = toDayKey(new Date(now))
+  const active7d = new Set<UserId>()
+  const active30d = new Set<UserId>()
+  const realActive7d = new Set<UserId>()
+  const realActive30d = new Set<UserId>()
+  const activitySeries: AdminSummary["activitySeries"] = []
+  for (let offset = seriesWindowDays - 1; offset >= 0; offset -= 1) {
+    const day = toDayKey(new Date(now - offset * 24 * 60 * 60 * 1000))
+    if (!day) {
+      continue
+    }
+
+    const activeSet = activeUsersByDay.get(day)
+    const realActiveSet = realActiveUsersByDay.get(day)
+    activitySeries.push({
+      day,
+      activeUsers: activeSet?.size ?? 0,
+      realActiveUsers: realActiveSet?.size ?? 0,
+      signups: signupsByDay.get(day) ?? 0,
+    })
+
+    if (activeSet) {
+      for (const id of activeSet) {
+        active30d.add(id)
+        if (offset <= 6) {
+          active7d.add(id)
+        }
+      }
+    }
+    if (realActiveSet) {
+      for (const id of realActiveSet) {
+        realActive30d.add(id)
+        if (offset <= 6) {
+          realActive7d.add(id)
+        }
+      }
+    }
+  }
+
+  const inviteHours: number[] = []
+  for (const row of inviteRows) {
+    const signupTime = toTimestamp(row.signupAt)
+    const firstInviteTime = toTimestamp(row.firstInviteAt)
+    if (signupTime !== null && firstInviteTime !== null) {
+      inviteHours.push(Math.max(0, Math.round(((firstInviteTime - signupTime) / (60 * 60 * 1000)) * 10) / 10))
+    }
+  }
+
+  let recurringUsers = 0
+  for (const days of activityDaysByUser.values()) {
+    if (days.size >= 2) {
+      recurringUsers += 1
+    }
+  }
+
+  return {
+    totalUsers,
+    totalOrganizations: organizationTotal,
+    verifiedUsers: toNumber(userSummary?.verifiedUsers),
+    recentUsers7d: toNumber(userSummary?.recentUsers7d),
+    recentUsers30d: toNumber(userSummary?.recentUsers30d),
+    totalWorkers,
+    cloudWorkers,
+    localWorkers,
+    usersWithWorkers,
+    usersWithoutWorkers: Math.max(0, totalUsers - usersWithWorkers),
+    paidUsers: null,
+    unpaidUsers: null,
+    billingUnavailableUsers: null,
+    adminCount: toNumber(adminRows[0]?.adminCount),
+    billingLoaded: false,
+    activeUsers1d: todayKey ? activeUsersByDay.get(todayKey)?.size ?? 0 : 0,
+    activeUsers7d: active7d.size,
+    activeUsers30d: active30d.size,
+    realActiveUsers1d: todayKey ? realActiveUsersByDay.get(todayKey)?.size ?? 0 : 0,
+    realActiveUsers7d: realActive7d.size,
+    realActiveUsers30d: realActive30d.size,
+    recurringUsers,
+    inviters: inviteRows.length,
+    medianHoursToFirstInvite: median(inviteHours),
+    activitySeries,
+  }
+}
+
+type AdminOverviewViewer = {
+  id: UserId
+  email: string | null
+  name: string | null
+}
+
+export async function loadAdminInitialOverviewPayload(user: AdminOverviewViewer, pageRequest: AdminPageRequest) {
+  const [admins, userPage, organizationTotal] = await Promise.all([
+    db
+      .select({
+        id: AdminAllowlistTable.id,
+        email: AdminAllowlistTable.email,
+        note: AdminAllowlistTable.note,
+        createdAt: AdminAllowlistTable.created_at,
+      })
+      .from(AdminAllowlistTable)
+      .orderBy(asc(AdminAllowlistTable.email)),
+    loadAdminUsersPage(pageRequest, false),
+    selectOrganizationCount(undefined),
+  ])
+  const summary = buildDeferredOverviewSummary(admins.length, userPage.page.total, organizationTotal)
+
+  return {
+    viewer: {
+      id: user.id,
+      email: normalizeEmail(user.email),
+      name: user.name,
+    },
+    admins,
+    organizations: [],
+    organizationPage: buildAdminPageInfo({ limit: pageRequest.limit, offset: 0, search: "" }, organizationTotal, 0, 0),
+    summary,
+    users: userPage.users,
+    userPage: userPage.page,
+    generatedAt: new Date().toISOString(),
+  }
+}
+
+
+// Admin mutation routes parse their JSON bodies in the handler with the schemas
+// above, so their descriptions spell out the accepted fields.
+const adminRequestErrorSchema = z.object({
+  error: z.literal("invalid_request"),
+  message: z.string(),
+})
+const adminConflictErrorSchema = z.object({
+  error: z.string(),
+  message: z.string(),
+})
+const adminOkSchema = z.object({ ok: z.literal(true) })
+const adminRouteErrors = {
+  401: jsonResponse("The caller must be authenticated.", unauthorizedSchema),
+  403: jsonResponse("The authenticated user is not an admin.", forbiddenSchema),
+}
+
+export function registerAdminRoutes<T extends { Variables: AuthContextVariables }>(app: Hono<T>) {
+  registerAdminFreeAutoUsageRoutes(app)
+  registerAdminFreeAutoConversionsRoutes(app)
+  registerAdminOrganizationDetailRoutes(app)
+  registerAdminDashboardRoute(app)
+  app.post(
+    "/v1/admin/admins",
+    describeRoute({
+      tags: ["Admin"],
+      summary: "Add a platform admin",
+      description: "Adds an email address to the platform admin allowlist. Body: { email: string, note?: string | null }.",
+      responses: {
+        200: jsonResponse("The admin was added.", z.object({
+          ok: z.literal(true),
+          admin: z.object({ id: z.string(), email: z.string(), note: z.string().nullable(), createdAt: z.string().datetime() }),
+        })),
+        400: jsonResponse("The request body was invalid.", adminRequestErrorSchema),
+        ...adminRouteErrors,
+        409: jsonResponse("An admin with that email already exists.", adminConflictErrorSchema),
+      },
+    }),
+    adminRoute(),
+    async (c) => {
+      const body = createAdminSchema.safeParse(await c.req.json().catch(() => null))
+      if (!body.success) {
+        return c.json({ error: "invalid_request", message: body.error.issues[0]?.message ?? "Invalid admin request." }, 400)
+      }
+
+      const id = createDenTypeId("adminAllowlist")
+      const createdAt = new Date()
+      try {
+        await db.insert(AdminAllowlistTable).values({
+          id,
+          email: body.data.email,
+          note: body.data.note ?? null,
+          created_at: createdAt,
+        })
+      } catch (error) {
+        if (isDuplicateDatabaseEntry(error)) {
+          return c.json({ error: "conflict", message: `An admin with email ${body.data.email} already exists.` }, 409)
+        }
+        throw error
+      }
+
+      return c.json({
+        ok: true,
+        admin: { id, email: body.data.email, note: body.data.note ?? null, createdAt },
+      })
+    },
+  )
+
+  app.delete(
+    "/v1/admin/admins/:adminId",
+    describeRoute({
+      tags: ["Admin"],
+      summary: "Remove a platform admin",
+      description: "Removes an email address from the platform admin allowlist. Admins cannot remove themselves or the final remaining admin.",
+      responses: {
+        200: jsonResponse("The admin was removed.", adminOkSchema),
+        400: jsonResponse("The admin id was invalid, or the removal would delete the caller or the final admin.", adminRequestErrorSchema),
+        ...adminRouteErrors,
+        404: jsonResponse("The admin does not exist.", notFoundSchema),
+      },
+    }),
+    adminRoute(),
+    async (c) => {
+      const adminId = c.req.param("adminId")
+      if (!isDenTypeId("adminAllowlist", adminId)) {
+        return c.json({ error: "invalid_request", message: "Invalid admin id." }, 400)
+      }
+
+      const viewerEmail = normalizeEmail(c.get("user").email)
+      const result = await db.transaction(async (tx) => {
+        const admins = await tx
+          .select({ id: AdminAllowlistTable.id, email: AdminAllowlistTable.email })
+          .from(AdminAllowlistTable)
+          .for("update")
+        const target = admins.find((admin) => admin.id === adminId)
+        if (!target) {
+          return "not_found"
+        }
+        if (normalizeEmail(target.email) === viewerEmail) {
+          return "current_viewer"
+        }
+        if (admins.length === 1) {
+          return "final_admin"
+        }
+        await tx.delete(AdminAllowlistTable).where(eq(AdminAllowlistTable.id, adminId))
+        return "deleted"
+      })
+
+      if (result === "not_found") {
+        return c.json({ error: "not_found", message: "Admin not found." }, 404)
+      }
+      if (result === "current_viewer") {
+        return c.json({ error: "invalid_request", message: "You cannot delete your own admin access." }, 400)
+      }
+      if (result === "final_admin") {
+        return c.json({ error: "invalid_request", message: "You cannot delete the final admin." }, 400)
+      }
+      return c.json({ ok: true })
+    },
+  )
+
+  app.get(
+    "/v1/admin/users/:userId/inference-usage",
+    describeRoute({
+      tags: ["Admin"],
+      summary: "Get a user's inference usage",
+      description: "Returns the user's inference usage per organization and limit window, alongside the organization-wide usage of the same windows.",
+      responses: {
+        200: jsonResponse("Inference usage returned.", z.object({
+          user: z.object({ id: z.string(), email: z.string() }),
+          organizations: z.array(z.object({}).passthrough()),
+        })),
+        400: jsonResponse("The user id was invalid.", adminRequestErrorSchema),
+        ...adminRouteErrors,
+        404: jsonResponse("The user does not exist.", notFoundSchema),
+      },
+    }),
+    adminRoute(),
+    async (c) => {
+      const userId = c.req.param("userId")
+      if (!isUserId(userId)) {
+        return c.json({ error: "invalid_request", message: "Invalid user id." }, 400)
+      }
+
+      const users = await db
+        .select({ id: AuthUserTable.id, email: AuthUserTable.email })
+        .from(AuthUserTable)
+        .where(eq(AuthUserTable.id, userId))
+        .limit(1)
+      const user = users[0]
+      if (!user) {
+        return c.json({ error: "not_found", message: "User not found." }, 404)
+      }
+
+      const rows = await db
+        .select({
+          organizationId: OrganizationTable.id,
+          organizationName: OrganizationTable.name,
+          membershipId: MemberTable.id,
+          bucketId: InferenceOrgUsageBucketTable.id,
+          windowType: InferenceOrgLimitPolicyTable.window_type,
+          windowStartAt: InferenceOrgUsageBucketTable.window_start_at,
+          windowEndAt: InferenceOrgUsageBucketTable.window_end_at,
+          limitAmount: InferenceOrgUsageBucketTable.limit_amount,
+          organizationUsedAmount: InferenceOrgUsageBucketTable.used_amount,
+          userUsedAmount: sql<number>`coalesce(sum(${InferenceUsageLedgerBucketChargeTable.amount}), 0)`,
+        })
+        .from(MemberTable)
+        .innerJoin(OrganizationTable, eq(MemberTable.organizationId, OrganizationTable.id))
+        .innerJoin(InferenceOrgLimitPolicyTable, eq(MemberTable.organizationId, InferenceOrgLimitPolicyTable.organization_id))
+        .innerJoin(InferenceOrgUsageBucketTable, eq(InferenceOrgLimitPolicyTable.current_bucket_id, InferenceOrgUsageBucketTable.id))
+        .leftJoin(InferenceUsageLedgerEntryTable, and(
+          eq(InferenceUsageLedgerEntryTable.org_membership_id, MemberTable.id),
+          eq(InferenceUsageLedgerEntryTable.organization_id, MemberTable.organizationId),
+        ))
+        .leftJoin(InferenceUsageLedgerBucketChargeTable, and(
+          eq(InferenceUsageLedgerBucketChargeTable.ledger_entry_id, InferenceUsageLedgerEntryTable.id),
+          eq(InferenceUsageLedgerBucketChargeTable.bucket_id, InferenceOrgUsageBucketTable.id),
+        ))
+        .where(and(eq(MemberTable.userId, userId), isNull(MemberTable.removedAt)))
+        .groupBy(
+          OrganizationTable.id,
+          OrganizationTable.name,
+          MemberTable.id,
+          InferenceOrgUsageBucketTable.id,
+          InferenceOrgLimitPolicyTable.window_type,
+          InferenceOrgUsageBucketTable.window_start_at,
+          InferenceOrgUsageBucketTable.window_end_at,
+          InferenceOrgUsageBucketTable.limit_amount,
+          InferenceOrgUsageBucketTable.used_amount,
+        )
+        .orderBy(asc(OrganizationTable.name), asc(InferenceOrgLimitPolicyTable.window_type))
+
+      const organizations = new Map<typeof MemberTable.$inferSelect.id, {
+        id: OrganizationId
+        name: string
+        membershipId: typeof MemberTable.$inferSelect.id
+        windows: Array<{
+          bucketId: typeof InferenceOrgUsageBucketTable.$inferSelect.id
+          windowType: typeof InferenceOrgLimitPolicyTable.$inferSelect.window_type
+          windowStartAt: Date
+          windowEndAt: Date
+          limitAmount: number
+          organizationUsedAmount: number
+          userUsedAmount: number
+        }>
+      }>()
+      for (const row of rows) {
+        const organization = organizations.get(row.membershipId) ?? {
+          id: row.organizationId,
+          name: row.organizationName,
+          membershipId: row.membershipId,
+          windows: [],
+        }
+        organization.windows.push({
+          bucketId: row.bucketId,
+          windowType: row.windowType,
+          windowStartAt: row.windowStartAt,
+          windowEndAt: row.windowEndAt,
+          limitAmount: toNumber(row.limitAmount),
+          organizationUsedAmount: toNumber(row.organizationUsedAmount),
+          userUsedAmount: toNumber(row.userUsedAmount),
+        })
+        organizations.set(row.membershipId, organization)
+      }
+
+      return c.json({ user, organizations: Array.from(organizations.values()) })
+    },
+  )
+
+  app.post(
+    "/v1/admin/users/:userId/inference-usage/reset",
+    describeRoute({
+      tags: ["Admin"],
+      summary: "Reset a user's inference usage",
+      description: "Removes the user's charges from the current inference limit windows of every organization they belong to and returns the total amount released.",
+      responses: {
+        200: jsonResponse("Inference usage was reset.", z.object({ ok: z.literal(true), resetAmount: z.number() })),
+        400: jsonResponse("The user id was invalid.", adminRequestErrorSchema),
+        ...adminRouteErrors,
+        404: jsonResponse("The user does not exist.", notFoundSchema),
+      },
+    }),
+    adminRoute(),
+    async (c) => {
+      const userId = c.req.param("userId")
+      if (!isUserId(userId)) {
+        return c.json({ error: "invalid_request", message: "Invalid user id." }, 400)
+      }
+
+      const users = await db.select({ id: AuthUserTable.id }).from(AuthUserTable).where(eq(AuthUserTable.id, userId)).limit(1)
+      if (!users[0]) {
+        return c.json({ error: "not_found", message: "User not found." }, 404)
+      }
+
+      const resetAmount = await db.transaction(async (tx) => {
+        const memberships = await tx.select({ organizationId: MemberTable.organizationId }).from(MemberTable)
+          .where(and(eq(MemberTable.userId, userId), isNull(MemberTable.removedAt)))
+        if (memberships.length === 0) return 0
+        // Same order as admission/settlement: policies before ledger, buckets and charges.
+        await tx.select({ id: InferenceOrgLimitPolicyTable.id }).from(InferenceOrgLimitPolicyTable)
+          .where(inArray(InferenceOrgLimitPolicyTable.organization_id, memberships.map((member) => member.organizationId)))
+          .orderBy(asc(InferenceOrgLimitPolicyTable.organization_id), asc(InferenceOrgLimitPolicyTable.window_type)).for("update")
+        const charges = await tx
+          .select({
+            id: InferenceUsageLedgerBucketChargeTable.id,
+            bucketId: InferenceUsageLedgerBucketChargeTable.bucket_id,
+            amount: InferenceUsageLedgerBucketChargeTable.amount,
+          })
+          .from(InferenceUsageLedgerBucketChargeTable)
+          .innerJoin(InferenceUsageLedgerEntryTable, eq(InferenceUsageLedgerBucketChargeTable.ledger_entry_id, InferenceUsageLedgerEntryTable.id))
+          .innerJoin(MemberTable, and(
+            eq(InferenceUsageLedgerEntryTable.org_membership_id, MemberTable.id),
+            eq(InferenceUsageLedgerEntryTable.organization_id, MemberTable.organizationId),
+          ))
+          .innerJoin(InferenceOrgLimitPolicyTable, and(
+            eq(InferenceUsageLedgerEntryTable.organization_id, InferenceOrgLimitPolicyTable.organization_id),
+            eq(InferenceUsageLedgerBucketChargeTable.bucket_id, InferenceOrgLimitPolicyTable.current_bucket_id),
+          ))
+          .where(and(eq(MemberTable.userId, userId), isNull(MemberTable.removedAt)))
+          .for("update")
+
+        const amountByBucket = new Map<typeof InferenceOrgUsageBucketTable.$inferSelect.id, number>()
+        let total = 0
+        for (const charge of charges) {
+          const amount = toNumber(charge.amount)
+          amountByBucket.set(charge.bucketId, (amountByBucket.get(charge.bucketId) ?? 0) + amount)
+          total += amount
+        }
+        for (const [bucketId, amount] of amountByBucket) {
+          await tx
+            .update(InferenceOrgUsageBucketTable)
+            .set({ used_amount: sql`greatest(${InferenceOrgUsageBucketTable.used_amount} - ${amount}, 0)` })
+            .where(eq(InferenceOrgUsageBucketTable.id, bucketId))
+        }
+        if (charges.length > 0) {
+          // Keep the identity so retries cannot resurrect intentionally forgiven usage.
+          await tx.update(InferenceUsageLedgerBucketChargeTable).set({ amount: 0 }).where(inArray(
+            InferenceUsageLedgerBucketChargeTable.id,
+            charges.map((charge) => charge.id),
+          ))
+        }
+        return total
+      })
+
+      return c.json({ ok: true, resetAmount })
+    },
+  )
+
+  app.delete(
+    "/v1/admin/users/:userId",
+    describeRoute({
+      tags: ["Admin"],
+      summary: "Delete a user",
+      description: "Deletes the user account, revokes its sessions, API keys, OAuth grants and connected accounts, and soft-removes its organization memberships. Admins cannot delete their own user.",
+      responses: {
+        200: jsonResponse("The user was deleted.", z.object({ ok: z.literal(true), user: z.object({ id: z.string(), email: z.string() }) })),
+        400: jsonResponse("The user id was invalid or refers to the caller.", adminRequestErrorSchema),
+        ...adminRouteErrors,
+        404: jsonResponse("The user does not exist.", notFoundSchema),
+      },
+    }),
+    adminRoute(),
+    async (c) => {
+      const currentUser = c.get("user")
+      const userId = c.req.param("userId")
+      if (!isUserId(userId)) {
+        return c.json({ error: "invalid_request", message: "Invalid user id." }, 400)
+      }
+
+      if (userId === currentUser.id) {
+        return c.json({ error: "invalid_request", message: "You cannot delete your own admin user." }, 400)
+      }
+
+      const rows = await db
+        .select({ id: AuthUserTable.id, email: AuthUserTable.email })
+        .from(AuthUserTable)
+        .where(eq(AuthUserTable.id, userId))
+        .limit(1)
+
+      const targetUser = rows[0]
+      if (!targetUser) {
+        return c.json({ error: "not_found", message: "User not found." }, 404)
+      }
+
+      const membershipRows = await db
+        .select({ id: MemberTable.id, organizationId: MemberTable.organizationId, removedAt: MemberTable.removedAt, userId: MemberTable.userId, role: MemberTable.role, joinedAt: MemberTable.joinedAt, inviteId: MemberTable.inviteId })
+        .from(MemberTable)
+        .where(eq(MemberTable.userId, userId))
+      const activeMembershipRows = membershipRows.filter((member) => !member.removedAt)
+      const sessionRows = await db
+        .select({ id: AuthSessionTable.id, token: AuthSessionTable.token, userId: AuthSessionTable.userId, expiresAt: AuthSessionTable.expiresAt, activeOrganizationId: AuthSessionTable.activeOrganizationId })
+        .from(AuthSessionTable)
+        .where(eq(AuthSessionTable.userId, userId))
+      // Grant tombstones must cover exactly the deleted consent set. Snapshot
+      // the ids inside the transaction with a locking read so a concurrently
+      // authorized consent cannot slip between the snapshot and the delete
+      // (Warden RUD-WDK).
+      const { oauthConsentRows, gatewayCredentials } = await db.transaction(async (tx) => {
+        const members = await tx.select({ id: MemberTable.id }).from(MemberTable)
+          .where(eq(MemberTable.userId, userId)).orderBy(MemberTable.id).for("update")
+        await expireUsageRequestsForMembers(tx, members.map((member) => member.id))
+        const credentials = await revokeInferenceCredentialsForMembers(tx, members.map((member) => member.id))
+        const removedAt = new Date()
+        const consentRows = await tx
+          .select({ id: OAuthConsentTable.id })
+          .from(OAuthConsentTable)
+          .where(eq(OAuthConsentTable.userId, userId))
+          .for("update")
+
+        await tx.delete(OAuthAccessTokenTable).where(eq(OAuthAccessTokenTable.userId, userId))
+        await tx.delete(OAuthRefreshTokenTable).where(eq(OAuthRefreshTokenTable.userId, userId))
+        await tx.delete(OAuthConsentTable).where(eq(OAuthConsentTable.userId, userId))
+        await tx.update(OAuthClientTable).set({ userId: null }).where(eq(OAuthClientTable.userId, userId))
+        await tx.delete(AuthApiKeyTable).where(eq(AuthApiKeyTable.referenceId, userId))
+        await tx.delete(AuthSessionTable).where(eq(AuthSessionTable.userId, userId))
+        await tx.delete(AuthAccountTable).where(eq(AuthAccountTable.userId, userId))
+        await tx.delete(DesktopHandoffGrantTable).where(eq(DesktopHandoffGrantTable.user_id, userId))
+        await tx.delete(ExternalIdentityTable).where(eq(ExternalIdentityTable.userId, userId))
+        await tx.delete(ScimSyncEventTable).where(eq(ScimSyncEventTable.userId, userId))
+        if (membershipRows.length > 0) {
+          await tx.delete(ConnectedAccountTable).where(inArray(
+            ConnectedAccountTable.orgMembershipId,
+            membershipRows.map((member) => member.id),
+          ))
+          await tx.delete(LlmProviderMemberCredentialTable).where(inArray(
+            LlmProviderMemberCredentialTable.orgMembershipId,
+            membershipRows.map((member) => member.id),
+          ))
+        }
+        await tx.update(MemberTable).set({ removedAt }).where(eq(MemberTable.userId, userId))
+        await tx.update(WorkerTable).set({ created_by_user_id: null }).where(eq(WorkerTable.created_by_user_id, userId))
+        await tx.delete(FreeAutoLimitEventTable).where(eq(FreeAutoLimitEventTable.user_id, userId))
+        await tx.delete(FreeAutoPurchaseTable).where(eq(FreeAutoPurchaseTable.user_id, userId))
+        await tx.delete(AuthUserTable).where(eq(AuthUserTable.id, userId))
+        return { oauthConsentRows: consentRows, gatewayCredentials: credentials }
+      })
+      // Alternate member-removal path: each affected organization gets the same
+      // member.removed evidence as DELETE /v1/members/:memberId (members emitter,
+      // single writer), actor = this admin, origin platform_admin. Appended after
+      // the commit: one transaction cannot take several organizations' audit
+      // locks in order after the member row locks; a failed append logs
+      // [audit-outcome-lost].
+      for (const membership of activeMembershipRows) {
+        await recordAdminMemberRemoval(membership, currentUser.id)
+        await recordAdminSessionsRevoked(membership, sessionRows, currentUser.id)
+      }
+      await revokeUpstreamCredentials(gatewayCredentials)
+      // Auth session cache hits intentionally avoid a DB liveness check; user deletion must clear
+      // both token and session-id cache entries for every deleted session instead.
+      await Promise.all(sessionRows.flatMap((session) => [
+        cache.auth.revokeSession(session.token),
+        cache.auth.revokeSessionId(session.id),
+      ]))
+      await Promise.all(oauthConsentRows.map((consent) => cache.auth.revokeGrant(consent.id)))
+
+      const organizationIds = Array.from(new Set(activeMembershipRows.map((row) => row.organizationId).filter(isOrganizationId)))
+      // Admin user deletion soft-removes memberships; clear affected org membership caches.
+      await Promise.all(organizationIds.map((organizationId) => cache.org.deleteMembers(organizationId)))
+      for (const organizationId of organizationIds) {
+        const seatCounts = await getOrganizationSeatBillingCounts({ organizationId })
+        await syncSeatSubscriptionQuantityAfterMemberChange({ organizationId, memberCount: seatCounts.total })
+      }
+
+      return c.json({ ok: true, user: { id: targetUser.id, email: targetUser.email } })
+    },
+  )
+
+  app.patch(
+    "/v1/admin/organizations/:organizationId/plan",
+    describeRoute({
+      tags: ["Admin"],
+      summary: "Set an organization's plan",
+      description: "Assigns a manual plan tier and seat limit to the organization. Body: { tier: \"free\" | \"team\" | \"enterprise\", seatLimit: integer }.",
+      responses: {
+        200: jsonResponse("The plan was updated.", z.object({ ok: z.literal(true), organization: z.object({}).passthrough() })),
+        400: jsonResponse("The request body or organization id was invalid.", adminRequestErrorSchema),
+        ...adminRouteErrors,
+        404: jsonResponse("The organization does not exist.", notFoundSchema),
+      },
+    }),
+    adminRoute(),
+    async (c) => {
+      const body = updateOrganizationPlanSchema.safeParse(await c.req.json().catch(() => null))
+      if (!body.success) {
+        return c.json({ error: "invalid_request", message: body.error.issues[0]?.message ?? "Invalid organization plan request." }, 400)
+      }
+
+      const organizationId = c.req.param("organizationId")
+      if (!isOrganizationId(organizationId)) {
+        return c.json({ error: "invalid_request", message: "Invalid organization id." }, 400)
+      }
+      const rows = await db
+        .select({ id: OrganizationTable.id, metadata: OrganizationTable.metadata })
+        .from(OrganizationTable)
+        .where(eq(OrganizationTable.id, organizationId))
+        .limit(1)
+
+      const organization = rows[0]
+      if (!organization) {
+        return c.json({ error: "not_found", message: "Organization not found." }, 404)
+      }
+
+      const metadata = await updateOrganizationMetadata(organizationId, (current) => {
+        const normalized = normalizeOrganizationMetadata(current).metadata
+        const plan = { ...readOrganizationMetadata(current.plan), ...getManualPlanMetadata(body.data.tier) }
+        if (body.data.tier !== "enterprise") delete plan.grantedAt
+        return {
+          ...normalized,
+          plan,
+          limits: {
+            ...normalized.limits,
+            members: body.data.seatLimit,
+          },
+        }
+      })
+
+      return c.json({ ok: true, organization: { id: organizationId, plan: parseOrganizationPlan(metadata), seatLimit: body.data.seatLimit } })
+    },
+  )
+
+  app.patch(
+    "/v1/admin/organizations/:organizationId/free-seats",
+    describeRoute({
+      tags: ["Admin"],
+      summary: "Set an organization's free seats",
+      description: "Sets the total number of free seats for the organization and resynchronizes its seat subscription quantity. Body: { totalFreeSeats: integer }.",
+      responses: {
+        200: jsonResponse("Free seats were updated.", z.object({ ok: z.literal(true), organization: z.object({}).passthrough() })),
+        400: jsonResponse("The request body or organization id was invalid.", adminRequestErrorSchema),
+        ...adminRouteErrors,
+        404: jsonResponse("The organization does not exist.", notFoundSchema),
+      },
+    }),
+    adminRoute(),
+    async (c) => {
+      const body = updateOrganizationFreeSeatsSchema.safeParse(await c.req.json().catch(() => null))
+      if (!body.success) {
+        return c.json({ error: "invalid_request", message: body.error.issues[0]?.message ?? "Invalid organization free seats request." }, 400)
+      }
+
+      const organizationId = c.req.param("organizationId")
+      if (!isOrganizationId(organizationId)) {
+        return c.json({ error: "invalid_request", message: "Invalid organization id." }, 400)
+      }
+
+      const rows = await db
+        .select({ id: OrganizationTable.id, metadata: OrganizationTable.metadata })
+        .from(OrganizationTable)
+        .where(eq(OrganizationTable.id, organizationId))
+        .limit(1)
+
+      const organization = rows[0]
+      if (!organization) {
+        return c.json({ error: "not_found", message: "Organization not found." }, 404)
+      }
+
+      const seatsFreeAdditional = body.data.totalFreeSeats - DEFAULT_ORGANIZATION_FREE_SEAT_COUNT
+      await updateOrganizationMetadata(organizationId, (current) => ({
+        ...current,
+        seatsFreeAdditional,
+      }))
+
+      const seatCounts = await getOrganizationSeatBillingCounts({ organizationId })
+      await syncSeatSubscriptionQuantityAfterMemberChange({ organizationId, memberCount: seatCounts.total })
+
+      return c.json({
+        ok: true,
+        organization: {
+          id: organizationId,
+          memberCount: seatCounts.total,
+          freeSeatCount: seatCounts.free,
+          seatsFreeAdditional: seatCounts.additionalFree,
+          billableSeatCount: seatCounts.chargeable,
+        },
+      })
+    },
+  )
+
+  app.patch(
+    "/v1/admin/organizations/:organizationId/dpa",
+    describeRoute({
+      tags: ["Admin"],
+      summary: "Record an organization DPA decision",
+      description: "Allowlisted platform administrators only. Atomically updates the reserved metadata flag and records the authenticated actor and reason in the audit trail.",
+      responses: {
+        200: jsonResponse("DPA decision recorded.", z.object({
+          ok: z.literal(true),
+          organization: z.object({ id: denTypeIdSchema("organization"), dpaSigned: z.boolean() }),
+        })),
+        400: jsonResponse("Invalid DPA decision or organization identifier.", z.union([
+          invalidRequestSchema, z.object({ error: z.literal("invalid_request"), message: z.string() }),
+        ])),
+        401: jsonResponse("Authentication is required.", unauthorizedSchema),
+        403: jsonResponse("Platform administrator access is required.", forbiddenSchema),
+        404: jsonResponse("Organization not found.", z.object({ error: z.literal("not_found"), message: z.string() })),
+        503: jsonResponse("Organization metadata could not be read.", z.object({
+          error: z.literal("managed_models_policy_unavailable"), message: z.string(),
+        })),
+      },
+    }),
+    adminRoute(),
+    jsonValidator(updateOrganizationDpaSchema),
+    async (c) => {
+      const body = c.req.valid("json")
+      const organizationId = c.req.param("organizationId")
+      if (!isOrganizationId(organizationId)) {
+        return c.json({ error: "invalid_request", message: "Invalid organization id." }, 400)
+      }
+      const actorUserId = c.get("user")?.id
+      if (!actorUserId) return c.json({ error: "unauthorized" }, 401)
+
+      const capture = auditChangeCapture(c)
+      const result = await db.transaction(async (tx) => {
+        const [organization] = await tx
+          .select({ metadata: OrganizationTable.metadata })
+          .from(OrganizationTable)
+          .where(eq(OrganizationTable.id, organizationId))
+          .limit(1)
+          .for("update")
+        if (!organization) return "not_found"
+
+        let metadata: Record<string, unknown>
+        try {
+          metadata = readOrganizationMetadata(organization.metadata)
+        } catch {
+          return "policy_unavailable"
+        }
+        const previousDpaSigned = typeof metadata.dpaSigned === "boolean" ? metadata.dpaSigned : null
+        await tx.update(OrganizationTable)
+          .set({ metadata: { ...metadata, dpaSigned: body.dpaSigned } })
+          .where(eq(OrganizationTable.id, organizationId))
+        // Legacy row keeps its reason; the change event records only reasonProvided.
+        const audit = await writeLegacyOrChangesInTx(tx, capture, {
+          organizationId,
+          actorUserId,
+          action: ORGANIZATION_AUDIT_ACTIONS.dpaSignedUpdated,
+          payload: {
+            previousDpaSigned,
+            dpaSigned: body.dpaSigned,
+            reason: body.reason,
+          },
+        }, [dpaSignedUpdatedEvent(organizationId, previousDpaSigned, body.dpaSigned, body.reason.trim().length > 0)])
+        return { audit }
+      })
+      if (result === "not_found") {
+        return c.json({ error: "not_found", message: "Organization not found." }, 404)
+      }
+      if (result === "policy_unavailable") {
+        const error = new ManagedModelsPolicyError("managed_models_policy_unavailable")
+        return c.json({ error: error.code, message: error.message }, error.status)
+      }
+      logLegacyOrChanges(capture, result.audit)
+      return c.json({ ok: true, organization: { id: organizationId, dpaSigned: body.dpaSigned } })
+    },
+  )
+
+  app.put(
+    "/v1/admin/organizations/:organizationId/idexal-os-web-access",
+    describeRoute({
+      tags: ["Admin"],
+      summary: "Grant or revoke complimentary idexal Os Web access",
+      description: "Toggles complimentary idexal Os Web access for the organization and records an audit event. Access cannot be granted while a paid idexal Os Web subscription is ongoing. Body: { enabled: boolean, reason: string }.",
+      responses: {
+        200: jsonResponse("idexal Os Web access was updated.", z.object({ ok: z.literal(true), organization: z.object({}).passthrough() })),
+        400: jsonResponse("The request body or organization id was invalid.", adminRequestErrorSchema),
+        ...adminRouteErrors,
+        404: jsonResponse("The organization does not exist.", notFoundSchema),
+        409: jsonResponse("The organization has an ongoing paid idexal Os Web subscription.", adminConflictErrorSchema),
+      },
+    }),
+    adminRoute(),
+    async (c) => {
+      const body = updateOrganizationIdexalOsWebAccessSchema.safeParse(await c.req.json().catch(() => null))
+      if (!body.success) {
+        return c.json({ error: "invalid_request", message: body.error.issues[0]?.message ?? "Invalid idexal Os Web access request." }, 400)
+      }
+
+      const organizationId = c.req.param("organizationId")
+      if (!isOrganizationId(organizationId)) {
+        return c.json({ error: "invalid_request", message: "Invalid organization id." }, 400)
+      }
+
+      if (body.data.enabled && await organizationHasOngoingIdexalOsWebSubscription(organizationId)) {
+        return c.json({
+          error: "idexal_os_web_subscription_exists",
+          message: "Cancel or finish the existing paid idexal Os Web subscription before granting complimentary access.",
+        }, 409)
+      }
+
+      const actorUserId = c.get("user").id
+      const capture = auditChangeCapture(c)
+      const result = await db.transaction(async (tx) => {
+        const organizations = await tx
+          .select({ id: OrganizationTable.id, metadata: OrganizationTable.metadata })
+          .from(OrganizationTable)
+          .where(eq(OrganizationTable.id, organizationId))
+          .limit(1)
+          .for("update")
+        const organization = organizations[0]
+        if (!organization) {
+          return "not_found"
+        }
+
+        const webSubscriptions = await tx
+          .select({
+            status: OrgSubscriptionTable.status,
+            stripe_price_id: OrgSubscriptionTable.stripe_price_id,
+            payment_failed: OrgSubscriptionTable.payment_failed,
+          })
+          .from(OrgSubscriptionTable)
+          .where(and(
+            eq(OrgSubscriptionTable.organization_id, organizationId),
+            eq(OrgSubscriptionTable.type, "web"),
+          ))
+          .limit(1)
+          .for("update")
+        const webSubscription = webSubscriptions[0] ?? null
+        if (body.data.enabled && webSubscription && isOngoingIdexalOsWebSubscriptionStatus(webSubscription.status)) {
+          return "subscription_exists"
+        }
+
+        const metadata = setIdexalOsWebComplimentaryAccess(organization.metadata, body.data.enabled)
+        const previousAccess = hasIdexalOsWebComplimentaryAccess(readOrganizationMetadata(organization.metadata))
+
+        await tx
+          .update(OrganizationTable)
+          .set({ metadata })
+          .where(eq(OrganizationTable.id, organizationId))
+        const audit = await writeLegacyOrChangesInTx(tx, capture, {
+          organizationId,
+          actorUserId,
+          action: body.data.enabled
+            ? ORGANIZATION_AUDIT_ACTIONS.idexalOsWebComplimentaryAccessGranted
+            : ORGANIZATION_AUDIT_ACTIONS.idexalOsWebComplimentaryAccessRevoked,
+          payload: {
+            reason: body.data.reason,
+            complimentaryAccess: body.data.enabled,
+          },
+        }, [complimentaryAccessEvent(organizationId, previousAccess, body.data.enabled, body.data.reason.trim().length > 0)])
+
+        return { metadata, webSubscription, audit }
+      })
+
+      if (result === "not_found") {
+        return c.json({ error: "not_found", message: "Organization not found." }, 404)
+      }
+      if (result === "subscription_exists") {
+        return c.json({
+          error: "idexal_os_web_subscription_exists",
+          message: "Cancel or finish the existing paid idexal Os Web subscription before granting complimentary access.",
+        }, 409)
+      }
+
+      logLegacyOrChanges(capture, result.audit)
+      return c.json({
+        ok: true,
+        organization: {
+          id: organizationId,
+          idexalOsWebAccess: readAdminIdexalOsWebAccess(result.metadata, result.webSubscription),
+        },
+      })
+    },
+  )
+
+  app.get(
+    "/v1/admin/organizations/:organizationId/capabilities",
+    describeRoute({
+      tags: ["Admin"],
+      summary: "Get an organization's capability overrides",
+      description: "Returns the effective value of every registry feature (capabilities) and, per feature, its source and whether /admin can change it (featureStates). The deprecated gatewayDashboard compatibility field is always true, not a mutable organization flag; deployment configuration and authorization still apply.",
+      responses: {
+        200: jsonResponse("Capability overrides returned.", z.object({ capabilities: adminOrganizationCapabilitiesSchema, featureStates: adminFeatureStatesSchema })),
+        400: jsonResponse("The organization id was invalid.", adminRequestErrorSchema),
+        ...adminRouteErrors,
+        404: jsonResponse("The organization does not exist.", notFoundSchema),
+      },
+    }),
+    adminRoute(),
+    async (c) => {
+      const organizationId = c.req.param("organizationId")
+      if (!isOrganizationId(organizationId)) {
+        return c.json({ error: "invalid_request", message: "Invalid organization id." }, 400)
+      }
+
+      const rows = await db
+        .select({ id: OrganizationTable.id, metadata: OrganizationTable.metadata })
+        .from(OrganizationTable)
+        .where(eq(OrganizationTable.id, organizationId))
+        .limit(1)
+
+      const organization = rows[0]
+      if (!organization) {
+        return c.json({ error: "not_found", message: "Organization not found." }, 404)
+      }
+
+      const [overrides, rollouts] = await Promise.all([readOrganizationFeatureOverrides(db, organization.id), readFeatureRollouts(db)])
+      const described = describeOrganization(rollouts, overrides)
+      return c.json({ capabilities: readAdminVisibleOrganizationCapabilities(described), featureStates: readAdminFeatureStates(described) })
+    },
+  )
+
+  app.put(
+    "/v1/admin/organizations/:organizationId/capabilities",
+    describeRoute({
+      tags: ["Admin"],
+      summary: "Set an organization's capability overrides",
+      description: "Enables, disables or clears (null) per-organization feature overrides. Every key in the feature registry (packages/features/src/registry.ts) is accepted; a feature that is fixed on this deployment (unavailable, off or on for everyone) returns 400, and unknown or retired keys are ignored. A deployment lock (DEN_FEATURE_*) outranks a stored override; featureStates shows the effective value and its source. The deprecated gatewayDashboard boolean or null input is validated but ignored and never persisted; its response field is always true.",
+      responses: {
+        200: jsonResponse("Capability overrides were updated.", z.object({ ok: z.literal(true), organization: z.object({ id: z.string() }), capabilities: adminOrganizationCapabilitiesSchema, featureStates: adminFeatureStatesSchema })),
+        400: jsonResponse("The request body or organization id was invalid.", adminRequestErrorSchema),
+        ...adminRouteErrors,
+        404: jsonResponse("The organization does not exist.", notFoundSchema),
+      },
+    }),
+    adminRoute(),
+    async (c) => {
+      const body = updateOrganizationCapabilitiesSchema.safeParse(await c.req.json().catch(() => null))
+      if (!body.success) {
+        return c.json({ error: "invalid_request", message: body.error.issues[0]?.message ?? "Invalid organization capabilities request." }, 400)
+      }
+
+      const organizationId = c.req.param("organizationId")
+      if (!isOrganizationId(organizationId)) {
+        return c.json({ error: "invalid_request", message: "Invalid organization id." }, 400)
+      }
+
+      const rows = await db
+        .select({ id: OrganizationTable.id, metadata: OrganizationTable.metadata })
+        .from(OrganizationTable)
+        .where(eq(OrganizationTable.id, organizationId))
+        .limit(1)
+
+      const organization = rows[0]
+      if (!organization) {
+        return c.json({ error: "not_found", message: "Organization not found." }, 404)
+      }
+
+      const changes: FeatureOverrideChanges = {}
+      for (const key of FEATURE_KEYS) {
+        const value = body.data.capabilities[key]
+        if (value === undefined) continue
+        if (!featureAvailableOn(key, env.features.deployment)) {
+          return c.json({ error: "invalid_request", message: `${key} is not part of this deployment.` }, 400)
+        }
+        changes[key] = value
+      }
+      const overrides = await updateOrganizationFeatureOverrides({
+        organizationId,
+        changes,
+        source: "platform",
+        setByUserId: c.get("user")?.id ?? null,
+      })
+
+      const described = describeOrganization(await readFeatureRollouts(db), overrides)
+      // Turning Permissions on copies the default sets in now (docs/permissions/overview.md,
+      // section 8). Never fails the toggle: resolution seeds lazily if this does.
+      if (changes.permissions === true && described.permissions.enabled) {
+        await seedDefaultPermissionSetsOnEnable(organizationId)
+      }
+      return c.json({ ok: true, organization: { id: organizationId }, capabilities: readAdminVisibleOrganizationCapabilities(described), featureStates: readAdminFeatureStates(described) })
+    },
+  )
+
+  app.get(
+    "/v1/admin/features",
+    describeRoute({
+      tags: ["Admin"],
+      summary: "List features and their state",
+      description: "Every feature in the registry (packages/features/src/registry.ts) with what is fixed in code (deployments, default) and this deployment's state: on or off for everyone, kill switch, and any operator lock.",
+      responses: {
+        200: jsonResponse("Features returned.", z.object({ deployment: z.enum(["cloud", "self_hosted"]), features: z.array(adminFeatureSchema) })),
+        ...adminRouteErrors,
+      },
+    }),
+    adminRoute(),
+    async (c) => {
+      const rollouts = await readFeatureRollouts(db)
+      return c.json({ deployment: env.features.deployment, features: FEATURE_KEYS.map((key) => readAdminFeature(key, rollouts)) })
+    },
+  )
+
+  app.put(
+    "/v1/admin/features/:key",
+    describeRoute({
+      tags: ["Admin"],
+      summary: "Change a feature's state",
+      description: "Turns the feature on or off for everyone on this deployment (organization overrides still apply), and/or sets the kill switch. The kill switch turns the feature off everywhere, outranking operator locks and organization overrides; it is the way to revert.",
+      responses: {
+        200: jsonResponse("Feature updated.", z.object({ ok: z.literal(true), feature: adminFeatureSchema })),
+        400: jsonResponse("The feature or body was invalid.", adminRequestErrorSchema),
+        ...adminRouteErrors,
+      },
+    }),
+    adminRoute(),
+    async (c) => {
+      const key = featureKeySchema.safeParse(c.req.param("key"))
+      if (!key.success) return c.json({ error: "invalid_request", message: "Unknown feature." }, 400)
+      const body = updateFeatureRolloutSchema.safeParse(await c.req.json().catch(() => null))
+      if (!body.success) {
+        return c.json({ error: "invalid_request", message: body.error.issues[0]?.message ?? "Invalid feature request." }, 400)
+      }
+      if (!featureAvailableOn(key.data, env.features.deployment)) {
+        return c.json({ error: "invalid_request", message: `${key.data} is not part of this deployment.` }, 400)
+      }
+      // Turning Permissions on for everyone does not seed here: that could be
+      // every organization. Each organization's default sets are created on
+      // first use by permission resolution (ensureDefaultPermissionSets), and
+      // deploy-time reconciliation keeps existing sets current.
+      const rollouts = await updateFeatureRollout({
+        key: key.data,
+        enabled: body.data.enabled,
+        killed: body.data.killed,
+        defaultEnabled: featureDefinition(key.data).default,
+        updatedByUserId: c.get("user")?.id ?? null,
+      })
+      return c.json({ ok: true, feature: readAdminFeature(key.data, rollouts) })
+    },
+  )
+
+  app.get(
+    "/v1/admin/users",
+    describeRoute({
+      tags: ["Admin"],
+      summary: "Get a bounded admin user page",
+      description: "Returns one bounded page of users plus required pagination metadata. Search runs across the global user set and optional billing enrichment stays page-scoped.",
+      responses: {
+        200: jsonResponse("Admin user page returned successfully.", adminUsersPageResponseSchema),
+        400: jsonResponse("The admin user page query parameters were invalid.", invalidRequestSchema),
+        401: jsonResponse("The caller must be authenticated.", unauthorizedSchema),
+        403: jsonResponse("The authenticated user is not an admin.", forbiddenSchema),
+      },
+    }),
+    adminRoute(),
+    queryValidator(adminPageQuerySchema),
+    async (c) => {
+      const query = c.req.valid("query")
+      const pageRequest = normalizeAdminPageRequest(query)
+      const result = await loadAdminUsersPage(pageRequest, parseBooleanQuery(query.includeBilling))
+      return c.json({ ...result, generatedAt: new Date().toISOString() })
+    },
+  )
+
+  app.get(
+    "/v1/admin/organizations",
+    describeRoute({
+      tags: ["Admin"],
+      summary: "Get a bounded admin organization page",
+      description: "Returns one bounded page of organizations plus required pagination metadata. Set includeFeatures=0 to skip feature resolution and omit capabilities and featureStates; read them per organization when needed. Search runs across the global organization set without changing the global overview totals.",
+      responses: {
+        200: jsonResponse("Admin organization page returned successfully.", adminOrganizationsPageResponseSchema),
+        400: jsonResponse("The admin organization page query parameters were invalid.", invalidRequestSchema),
+        401: jsonResponse("The caller must be authenticated.", unauthorizedSchema),
+        403: jsonResponse("The authenticated user is not an admin.", forbiddenSchema),
+      },
+    }),
+    adminRoute(),
+    queryValidator(adminOrganizationPageQuerySchema),
+    async (c) => {
+      const query = c.req.valid("query")
+      const pageRequest = normalizeAdminPageRequest(query)
+      return c.json(await loadAdminOrganizationsPage(pageRequest, query.includeFeatures !== "0"))
+    },
+  )
+
+  app.get(
+    "/v1/admin/metrics",
+    describeRoute({
+      tags: ["Admin"],
+      summary: "Load deferred admin analytics",
+      description: "Calculates analytics that are intentionally deferred from the initial admin page: verified users, worker totals, activity, recurrence, invites, and chart series.",
+      responses: {
+        200: jsonResponse("Deferred admin analytics returned successfully.", adminMetricsResponseSchema),
+        401: jsonResponse("The caller must be authenticated.", unauthorizedSchema),
+        403: jsonResponse("The authenticated user is not an admin.", forbiddenSchema),
+      },
+    }),
+    adminRoute(),
+    async (c) => c.json({ summary: await loadAdminMetricsSummary(), generatedAt: new Date().toISOString() }),
+  )
+
+  app.get(
+    "/v1/admin/overview",
+    describeRoute({
+      tags: ["Admin"],
+      summary: "Get admin overview",
+      description: "Returns the initial admin overview with bounded user data, global totals, and required pagination metadata. Expensive analytics are loaded separately from /v1/admin/metrics.",
+      responses: {
+        200: jsonResponse("Administrative overview returned successfully.", adminOverviewResponseSchema),
+        400: jsonResponse("The admin overview query parameters were invalid.", invalidRequestSchema),
+        401: jsonResponse("The caller must be an authenticated admin.", unauthorizedSchema),
+        403: jsonResponse("The authenticated user is not an admin.", forbiddenSchema),
+      },
+    }),
+    adminRoute(),
+    queryValidator(overviewQuerySchema),
+    async (c) => {
+      const user = c.get("user")
+      const query = c.req.valid("query")
+      return c.json(await loadAdminInitialOverviewPayload(user, normalizeAdminPageRequest(query)))
+    },
+  )
+}
