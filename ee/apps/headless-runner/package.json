@@ -1,0 +1,42 @@
+{
+  "name": "@idexal-ee/headless-runner",
+  "private": true,
+  "type": "module",
+  "description": "Cheap headless agent sessions: idexal Os AI Gateway for the model, idexal Os MCP for tools, a small scratch filesystem, and optional kept files and a computer per conversation.",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "dev": "NODE_OPTIONS=\"${NODE_OPTIONS:-} --conditions=development\" tsx watch src/server.ts",
+    "build": "pnpm --filter \"@idexal-ee/headless-runner^...\" --if-present run build && tsc -p tsconfig.json --noEmit && esbuild src/server.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/server.js --external:@hono/node-server --external:@modelcontextprotocol/client --external:hono --external:zod --external:@idexal-ee/headless-computer",
+    "start": "node dist/server.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "smoke": "tsx scripts/smoke.ts",
+    "test:computer-config": "tsx --test scripts/computer-config.test.ts",
+    "test:sql-store": "tsx --test scripts/sql-store.test.ts",
+    "test:error-reporting": "tsx --test scripts/error-reporting.test.ts",
+    "worker:types": "wrangler types",
+    "worker:typecheck": "wrangler types && tsc -p tsconfig.worker.json --noEmit",
+    "worker:compat": "tsx scripts/compat-check.ts",
+    "worker:e2e": "pnpm --filter @idexal-ee/headless-protocol build && tsx scripts/owner-cells-e2e.ts",
+    "worker:e2e:celld": "pnpm --filter @idexal-ee/headless-protocol build && tsx scripts/owner-cells-e2e.ts --celld",
+    "test:conversation": "tsx --test scripts/conversation.test.ts",
+    "test:transfer": "tsx --test scripts/transfer.test.ts"
+  },
+  "dependencies": {
+    "@hono/node-server": "2.0.12",
+    "@modelcontextprotocol/client": "^2.2.0",
+    "@idexal-ee/headless-computer": "workspace:*",
+    "@idexal/workbook": "workspace:*",
+    "aws4fetch": "1.0.20",
+    "hono": "4.13.9",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "0.25.12",
+    "tsx": "^4.23.1",
+    "typescript": "^5.5.4",
+    "wrangler": "4.142.0"
+  }
+}

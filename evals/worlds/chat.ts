@@ -1,0 +1,2488 @@
+import { addInitScript, allocateFreePorts, browserScript, reattachSurface, reload, type Surface } from "@idexal/cdp";
+import { CATALOG_FAST_VARIANT, FAST_DEFAULT_VARIANT, fastVariantId } from "@idexal/types/cloud-model-fast";
+import { spawn } from "node:child_process";
+import { mkdtempSync, realpathSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
+import { evalIn, go, assertNoLiveSecret, liveOpenAiEnabled, liveOpenAiModel, liveProviderId, provisionLiveOpenAi } from "@idexal/behaviors";
+import { resolveEvalEngine, SkipError, type Seed } from "@idexal/env";
+import type { MockAgentWorkload, MockMcpHandle } from "@idexal/labs";
+import { chatContinuity } from "./chat-continuity.ts";
+import { readDefaultDesktopPolicy } from "./desktop-policies.ts";
+import { denForAppWeb, signedInAppWeb } from "./signed-in-app-web.ts";
+
+const repoRoot = resolve(import.meta.dirname, "../..");
+
+type AppSurface = "electron" | "web";
+
+declare global {
+  interface Window {
+    __modelEffortRequests?: unknown[];
+    __idexalOsSubmissionFault?: { attempts: number; release: () => void };
+    __idexalOsLongHistoryFault?: { dispose: () => void };
+    __idexalOsWarmHistoryFault?: {
+      state: {
+        armed: boolean;
+        released: boolean;
+        expired: boolean;
+        held: number;
+        mutations: number;
+        reads: {
+          warm: boolean;
+          limit: string | null;
+          nativeCount: number;
+          count: number;
+          hasTail: boolean;
+          delivered: boolean;
+        }[];
+      };
+      arm: () => void;
+      release: () => void;
+      dispose: () => void;
+    };
+    __idexalOsStoppingFault?: {
+      state: {
+        attempts: number;
+        held: number;
+        nativeStatus: number | null;
+        nativeFailed: boolean;
+        released: boolean;
+        failed: boolean;
+        clickCaptured: boolean;
+        trusted: boolean;
+        elapsedMs: number | null;
+        expired: boolean;
+      };
+      fail: () => void;
+      dispose: () => void;
+    };
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function recordValue(value: unknown, key: string): unknown {
+  return isRecord(value) ? value[key] : undefined;
+}
+
+export async function configureProvider(
+  seed: Seed,
+  app: Surface,
+  workspaceId: string,
+  providerId: string,
+  modelId: string,
+  opencode: Record<string, unknown>,
+  engine = resolveEvalEngine(),
+): Promise<void> {
+  // TODO(primitive): configure a workspace provider and select its model.
+  const result = await seed.evalIn(app, browserScript(async (workspaceId, providerId, modelId, defaultModel, opencodeJson) => {
+    const port = localStorage.getItem("idexal-os.server.port");
+    const token = localStorage.getItem("idexal-os.server.token");
+    if (!port || !token) return "missing local server credentials";
+    const opencode = JSON.parse(opencodeJson);
+    const request = async (path: string, init?: RequestInit) => {
+      const response = await fetch("http://127.0.0.1:" + port + path, {
+        ...init,
+        headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+      });
+      const text = await response.text();
+      let reloadPending = response.status === 504;
+      if (path.endsWith("/engine/reload") && response.status === 503) {
+        try {
+          const error: unknown = JSON.parse(text);
+          reloadPending = typeof error === "object" && error !== null && "code" in error
+            && error.code === "opencode_engine_unreachable";
+        } catch {
+          reloadPending = false;
+        }
+      }
+      // Initial engine startup can race config reload. The readiness check
+      // below must still observe the configured model in the live composer.
+      if (!response.ok && !(path.endsWith("/engine/reload") && reloadPending)) {
+        return path + " failed: " + response.status + " " + text.slice(0, 500);
+      }
+      return "ok";
+    };
+    const patched = await request("/workspace/" + encodeURIComponent(workspaceId) + "/config", {
+      method: "PATCH",
+      body: JSON.stringify({ opencode }),
+    });
+    if (patched !== "ok") return patched;
+    const reloaded = await request("/workspace/" + encodeURIComponent(workspaceId) + "/engine/reload", { method: "POST" });
+    if (reloaded !== "ok") return reloaded;
+    const raw = localStorage.getItem("idexal-os.preferences");
+    let preferences: Record<string, unknown> = {};
+    try { preferences = raw ? JSON.parse(raw) : {}; } catch { preferences = {}; }
+    if (!preferences || typeof preferences !== "object" || Array.isArray(preferences)) preferences = {};
+    localStorage.setItem("idexal-os.preferences", JSON.stringify({
+      ...preferences,
+      defaultModel: { providerID: providerId, modelID: modelId },
+      modelVariant: null,
+      providerStepCompleted: true,
+    }));
+    localStorage.setItem("idexal-os.defaultModel", defaultModel);
+    localStorage.removeItem("idexal-os.sessionModels." + workspaceId);
+    return "ok";
+  }, [workspaceId, providerId, modelId, `${providerId}/${modelId}`, JSON.stringify(opencode)]), { awaitPromise: true, timeoutMs: 120_000 });
+  if (result !== "ok") throw new Error(`Provider configuration failed: ${String(result)}`);
+  // Wait for navigation before starting the model-readiness evaluation;
+  // scheduling location.reload() can run that evaluation in the old document.
+  await reload(app);
+  // Provider data is visibility-gated. OAuth or another fixture window can
+  // retain foreground focus across reload, so activate the configured target
+  // before observing its model picker, just as a person opening the app does.
+  await app.client.send("Page.bringToFront");
+  // The display name the app gives the configured model once its provider list
+  // contains it; a fixture provider declares it in opencode.json, a live one is
+  // read from the engine catalog.
+  const configuredProvider = recordValue(recordValue(opencode, "provider"), providerId);
+  const configuredModel = recordValue(configuredProvider, "models");
+  const configuredNameValue = recordValue(recordValue(configuredModel, modelId), "name");
+  const configuredName = typeof configuredNameValue === "string" ? configuredNameValue : null;
+  const providerNameValue = recordValue(configuredProvider, "name");
+  const providerName = typeof providerNameValue === "string" ? providerNameValue : null;
+  const ready = await seed.evalIn(app, browserScript(async (workspaceId, engine, providerId, modelId, configuredName, providerName) => {
+    const deadline = Date.now() + 60000;
+    const expectedRef = providerId + "/" + modelId;
+    let observed = "";
+    while (Date.now() < deadline) {
+      const base = "http://127.0.0.1:" + localStorage.getItem("idexal-os.server.port");
+      const headers = { Authorization: "Bearer " + localStorage.getItem("idexal-os.server.token") };
+      try {
+        const statusResponse = await fetch(base + "/experimental/engine-v2-preview/status", { headers });
+        const status = statusResponse.ok ? await statusResponse.json() : null;
+        const selected = status ? status.enabled && status.chatRouting : false;
+        if ((engine === "v2") !== selected || (!statusResponse.ok && statusResponse.status !== 404)) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          continue;
+        }
+        const mounted = base + "/workspace/" + encodeURIComponent(workspaceId);
+        const response = await fetch(mounted + (engine === "v2" ? "/opencode2/api/model" : "/opencode/session"), { headers });
+        if (response.ok && window.__idexalOsControl) {
+          let catalogName: string | null = null;
+          if (engine === "v2") {
+            const record = (value: unknown): value is Record<string, unknown> =>
+              typeof value === "object" && value !== null && !Array.isArray(value);
+            const catalog: unknown = await response.json();
+            const items: unknown[] = Array.isArray(catalog) ? catalog : record(catalog) && Array.isArray(catalog.data) ? catalog.data : [];
+            const entry = items.find((item) => record(item) && item.id === modelId && item.providerID === providerId);
+            if (!record(entry)) throw new Error("catalog pending");
+            catalogName = typeof entry.name === "string" ? entry.name : null;
+          }
+          // The engine lists the provider; now the app must too. Its composer
+          // shows the model's display name only once the app's own provider
+          // list contains the configured model, and the stored default must
+          // have survived boot rather than being replaced by an organization
+          // model while that list was still loading.
+          const configured = configuredName ?? catalogName ?? modelId;
+          // The app never shows an opaque gateway id as a name: it reads "<Provider> model" instead.
+          const name = /^(gwm|ipr)_/.test(configured) ? (providerName ? providerName + " model" : "Model") : configured;
+          // Retained conversations keep their composers mounted. Read the
+          // model a person can actually see, not a hidden earlier workspace's
+          // first button (which can legitimately still say "Select model").
+          const chip = [...document.querySelectorAll<HTMLElement>('button[aria-label="Change model"]')].find((element) => {
+            const rect = element.getBoundingClientRect();
+            const style = getComputedStyle(element);
+            return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < innerHeight
+              && rect.right > 0 && rect.left < innerWidth && style.display !== "none"
+              && style.visibility !== "hidden" && !element.closest('[aria-hidden="true"]');
+          });
+          const chipText = chip?.innerText.trim() ?? "";
+          const stored = localStorage.getItem("idexal-os.defaultModel");
+          observed = JSON.stringify({ composerModel: chipText, storedDefault: stored, focused: document.hasFocus(), visibility: document.visibilityState, route: location.hash, expected: { name, ref: expectedRef } });
+          if (stored === expectedRef && chipText.startsWith(name)) return true;
+        }
+      } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    return observed || false;
+  }, [workspaceId, engine, providerId, modelId, configuredName, providerName]), { awaitPromise: true, timeoutMs: 120_000 });
+  if (ready !== true) {
+    throw new Error(`Selected ${engine} engine did not become ready after provider configuration`
+      + (typeof ready === "string" ? `; last observed ${ready}` : "."));
+  }
+}
+
+async function seedControls(
+  seed: Seed,
+  app: Surface,
+  calls: readonly { action: string; args?: unknown }[],
+): Promise<void> {
+  for (const call of calls) await arrangeControl(seed, app, call.action, call.args);
+}
+
+export async function arrangeControl(
+  seed: Seed,
+  app: Surface,
+  action: string,
+  args?: unknown,
+): Promise<unknown> {
+  // TODO(primitive): invoke a named renderer fixture control and await its result.
+  return seed.evalIn(app, browserScript(async (action, argsJson) => {
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      const available = window.__idexalOsControl?.listActions().find((candidate) => candidate.id === action && !candidate.disabled);
+      if (available) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const result = await window.__idexalOsControl.execute(action, JSON.parse(argsJson));
+    if (!result?.ok) throw new Error(String(result?.error ?? "control action failed"));
+    return result.value;
+  }, [action, JSON.stringify(args ?? null)]), { awaitPromise: true, timeoutMs: 120_000 });
+}
+
+async function seedSessionRetry(
+  seed: Seed,
+  app: Surface,
+  options: { title?: string } = {},
+): Promise<{ sessionId: string; title: string }> {
+  const deadline = Date.now() + 60_000;
+  let lastError: unknown = null;
+  while (Date.now() < deadline) {
+    try {
+      return await seed.session(app, options);
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 500));
+    }
+  }
+  throw new Error(`Session creation did not settle: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
+}
+
+export async function emptyChat(seed: Seed) {
+  const workspacePath = seed.tmpPath("chat-empty");
+  const app = await seed.appWeb({ name: "chat-empty", workspacePath, mouse: true });
+  const workspace = await seed.workspace(app, workspacePath);
+  const session = await seedSessionRetry(seed, app);
+  return { app, workspace, session };
+}
+
+export async function paletteSessionActions(seed: Seed) {
+  const workspacePath = seed.tmpPath("command-palette-pin-rename");
+  const app = await seed.appWeb({ name: "command-palette-pin-rename", workspacePath, mouse: true });
+  const workspace = await seed.workspace(app, workspacePath);
+  const session = await seedSessionRetry(seed, app, { title: "Palette pin rename probe" });
+  return { app, workspace, session };
+}
+
+async function splitPaneQuestions(
+  seed: Seed,
+  name: string,
+  agentWorkloads: MockAgentWorkload[],
+  policy: Record<string, unknown> = { permission: { question: "allow" } },
+  // The app in headless Chrome by default; pass "electron" only for a world
+  // whose claim needs the desktop main process (quit and relaunch).
+  surface: AppSurface = "web",
+  options: { createWorkspace?: boolean } = {},
+) {
+  const providerId = "split-send-mock";
+  const modelId = "split-send-model";
+  const mock = seed.mock({ isolatedProcessEnv: surface === "web", agentWorkloads });
+  // Electron stores realpath'd workspace roots; give the web server the same root
+  // so Stop's engine-directory verification matches (macOS /tmp is a symlink).
+  const requestedPath = seed.tmpPath(name);
+  const workspacePath = surface === "web"
+    ? join(realpathSync(dirname(requestedPath)), basename(requestedPath))
+    : requestedPath;
+  let app: Surface;
+  let agentMock: MockMcpHandle;
+  if (surface === "web") {
+    const web = await seed.appWeb({
+      name,
+      workspacePath,
+      mocks: { agent: mock },
+      // A fine, hover-capable pointer, as in the desktop app these journeys came from.
+      mouse: true,
+    });
+    app = web;
+    const configured = web.mocks.agent;
+    if (!configured) throw new Error(`The app-web fixture did not boot the ${name} model witness.`);
+    agentMock = configured;
+  } else {
+    const den = await seed.den({ mocks: { agent: mock } });
+    app = await seed.desktop({ name, den, as: "admin", model: `${providerId}/${modelId}` });
+    agentMock = den.mocks.agent;
+  }
+  // Worlds whose `policy` must govern the agent create the workspace at the
+  // declared tmp path. Without `create`, the seed adopts the first-launch
+  // default workspace, which the dev profile places inside the repo checkout on
+  // Daytona; the engine then merges the repo's `.opencode/opencode.json`
+  // (`"permission": "allow"`) after the workspace's own opencode.json, so a
+  // workspace `bash: "ask"` never holds (observed agent ruleset
+  // `[* allow, bash ask, * allow]`; the last match wins). The app in a browser
+  // already starts on the declared path, so it never adopts that default.
+  const workspace = await seed.workspace(app, workspacePath, options.createWorkspace && surface === "electron" ? { create: true } : {});
+  // Arrange an allowed native question tool independently of custom-agent defaults.
+  // TODO(primitive): write workspace fixture files through a first-class seed API.
+  const questionPolicyWritten = await seed.evalIn(app, browserScript(async (workspaceId, content) => {
+    const port = localStorage.getItem("idexal-os.server.port");
+    const token = localStorage.getItem("idexal-os.server.token");
+    const response = await fetch("http://127.0.0.1:" + port + "/workspace/" + encodeURIComponent(workspaceId) + "/files/content", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify({ path: "opencode.json", content }),
+    });
+    return response.ok;
+  }, [workspace.workspaceId, JSON.stringify(policy)]), { awaitPromise: true });
+  if (questionPolicyWritten !== true) throw new Error("Could not arrange the question-tool policy.");
+  await configureProvider(seed, app, workspace.workspaceId, providerId, modelId, {
+    provider: {
+      [providerId]: {
+        npm: "@ai-sdk/openai-compatible",
+        name: "Split send mock",
+        options: { baseURL: `${agentMock.url}/v1`, apiKey: "sk-split-send" },
+        models: { [modelId]: { name: "Split send model" } },
+      },
+    },
+  });
+  return { app, workspace, mock: agentMock };
+}
+
+export async function delegatedQuestionHandoff(seed: Seed) {
+  const engine = resolveEvalEngine();
+  const delegationTool = engine === "v2" ? "subagent" : "task";
+  const rootPrompt = "Delegate choosing the task format, then report the result.";
+  const child = {
+    prompt: "Help me choose the delegated task format",
+    question: "Which format should the child task use?",
+    answer: "Child checklist",
+    alternative: "Child outline",
+  };
+  const unrelated = {
+    prompt: "Help me choose the unrelated task format",
+    question: "Which format should the unrelated task use?",
+    answer: "Unrelated outline",
+    alternative: "Unrelated checklist",
+  };
+  const followup = { prompt: "Leave the delegated task stopped and prepare a fresh summary", reply: "Fresh summary finished after stopping the child." };
+  const base = await splitPaneQuestions(seed, "delegated-question-handoff", [
+    {
+      promptMarker: rootPrompt, latestUserTurn: true,
+      finalReply: "Unused: return the actual child result.", finalReplyFrom: "last-tool-text",
+      steps: [{ tool: delegationTool, arguments: {
+        description: "Choose delegated task format", prompt: child.prompt,
+        // v2 beta-19086 calls this subagent; foreground must await the child's answer.
+        ...(engine === "v2" ? { agent: "general", background: false } : { subagent_type: "general" }),
+      } }],
+    },
+    ...[child, unrelated].map((question): MockAgentWorkload => ({
+      promptMarker: question.prompt, latestUserTurn: true,
+      finalReply: "Unused: return the actual question result.", finalReplyFrom: "last-tool-text",
+      steps: [{ tool: "question", arguments: { questions: [{
+        header: "Task format", question: question.question,
+        options: [
+          { label: question.answer, description: "Use this format" },
+          { label: question.alternative, description: "Use the other format" },
+        ],
+      }] } }],
+    })),
+    { promptMarker: followup.prompt, latestUserTurn: true, finalReply: followup.reply, steps: [] },
+  ], {
+    permission: { question: "allow", task: "allow" },
+    // Both engines deny questions for general by default; v2 migrates task to subagent.
+    agent: { general: { permission: { question: "allow" } } },
+  });
+  const root = await seedSessionRetry(seed, base.app, { title: "Delegated question parent" });
+  const other = await seedSessionRetry(seed, base.app, { title: "Unrelated question root" });
+  return { ...base, engine, delegationTool, followup, root: { ...root, prompt: rootPrompt }, child, unrelated: { ...other, ...unrelated } };
+}
+
+/** A real native question whose turn is stopped and superseded by a follow-up prompt, as another agent's STOP does. */
+export async function abandonedQuestion(seed: Seed) {
+  const engine = resolveEvalEngine();
+  if (engine !== "v1") throw new SkipError("Abandoned-question archive requires v1; v2 has no session archive.");
+  const ask = {
+    prompt: "Help me choose the abandoned task format",
+    question: "Which format should the abandoned task use?",
+    answer: "Abandoned outline",
+    alternative: "Abandoned checklist",
+  };
+  const followup = { prompt: "Skip the format question and summarize instead", reply: "Summary finished without the format answer." };
+  const base = await splitPaneQuestions(seed, "abandoned-question", [
+    {
+      promptMarker: ask.prompt, latestUserTurn: true,
+      finalReply: "Unused: return the actual question result.", finalReplyFrom: "last-tool-text",
+      steps: [{ tool: "question", arguments: { questions: [{
+        header: "Task format", question: ask.question,
+        options: [{ label: ask.answer, description: "Use this format" }, { label: ask.alternative, description: "Use the other format" }],
+      }] } }],
+    },
+    { promptMarker: followup.prompt, latestUserTurn: true, finalReply: followup.reply, steps: [] },
+  ]);
+  const session = await seedSessionRetry(seed, base.app, { title: "Abandoned question task" });
+  return { ...base, engine, ask, followup, session };
+}
+
+/** Real provider errors and automatic recovery, without synthetic UI events. */
+export async function sessionProviderErrorRecovery(seed: Seed, options: { terminalRejection?: boolean; retiredSavedModel?: boolean } = {}) {
+  const prompt = "Prepare a short reliability summary.";
+  const reply = "The reliability summary is ready.";
+  // Opt-in: a prompt the provider always refuses with a non-retryable 400 before any text.
+  const rejected = { prompt: "Summarize the rejected reliability report.", message: "The provider rejected this request before writing an answer." };
+  const base = await splitPaneQuestions(seed, "session-provider-error-recovery", [{
+    promptMarker: prompt, latestUserTurn: true, serverErrorAttempts: 2, finalReply: reply, steps: [],
+  }, ...(options.terminalRejection ? [{
+    promptMarker: rejected.prompt, latestUserTurn: true, terminalErrorMessage: rejected.message, finalReply: "Never served.", steps: [],
+  }] : [])]);
+  const session = await seedSessionRetry(seed, base.app, { title: "Response recovery" });
+  // Opt-in: the person chose a model earlier that this provider has since dropped.
+  const models = { kept: { providerID: "split-send-mock", modelID: "split-send-model", name: "Split send model" }, retired: { providerID: "split-send-mock", modelID: "retired-model" } };
+  if (options.retiredSavedModel) {
+    const ref = `${models.retired.providerID}/${models.retired.modelID}`;
+    const saved = await seed.evalIn(base.app, browserScript((workspaceId, ref) => {
+      const raw = localStorage.getItem("idexal-os.preferences");
+      let preferences: Record<string, unknown> = {};
+      try { preferences = raw ? JSON.parse(raw) : {}; } catch { preferences = {}; }
+      const [providerID, modelID] = ref.split("/");
+      localStorage.setItem("idexal-os.preferences", JSON.stringify({ ...preferences, defaultModel: { providerID, modelID }, modelVariant: null }));
+      localStorage.setItem("idexal-os.defaultModel", ref);
+      localStorage.setItem("idexal-os.modelChoice.explicit", "1");
+      localStorage.removeItem("idexal-os.sessionModels." + workspaceId);
+      return localStorage.getItem("idexal-os.defaultModel");
+    }, [base.workspace.workspaceId, ref]));
+    if (saved !== ref) throw new Error(`Saving the retired default failed: ${String(saved)}`);
+    await reload(base.app);
+  }
+  return { ...base, session, prompt, reply, rejected, models };
+}
+
+/** Real native permissions and a provider retry, without synthetic UI events. */
+export async function permissionStopRecovery(seed: Seed) {
+  const engine = resolveEvalEngine();
+  const retry = { prompt: "Prepare the retry reliability summary", reply: "Retry recovery finished." };
+  const stopped = { prompt: "Inspect the stopped permission workspace", command: "printf STOP_PERMISSION_WITNESS" };
+  const other = { prompt: "Inspect the other permission workspace", command: "printf OTHER_PERMISSION_WITNESS" };
+  const followup = { prompt: "Continue with a fresh summary instead", reply: "Fresh work finished after stop." };
+  const base = await splitPaneQuestions(seed, "permission-stop-recovery", [
+    { promptMarker: retry.prompt, latestUserTurn: true, rateLimitAttempts: 1, finalReply: retry.reply, steps: [] },
+    ...[stopped, other].map((item): MockAgentWorkload => ({
+      promptMarker: item.prompt, latestUserTurn: true, finalReply: "Permission work finished.",
+      steps: [{ tool: engine === "v2" ? "shell" : "bash", arguments: {
+        command: item.command, description: "Inspect the permission workspace", timeout: 30_000,
+      } }],
+    })),
+    { promptMarker: followup.prompt, latestUserTurn: true, finalReply: followup.reply, steps: [] },
+  ], { permission: { bash: "ask" } }, "web", { createWorkspace: true });
+  const stoppedSession = await seedSessionRetry(seed, base.app, { title: "Stop permission task" });
+  const otherSession = await seedSessionRetry(seed, base.app, { title: "Keep permission task" });
+  return { ...base, engine, retry, followup, stopped: { ...stopped, ...stoppedSession }, other: { ...other, ...otherSession } };
+}
+
+/** Synthetic release/model responses, but real Electron quit, engine teardown, and relaunch. */
+export async function restartUpdateTaskWorld(seed: Seed) {
+  const engine = resolveEvalEngine();
+  const active = { prompt: "Prepare the restart continuity report", title: "Continue after update" };
+  const stopped = { prompt: "Prepare the cancelled continuity report", title: "Keep stopped after update" };
+  const completed = { prompt: "Prepare the completed continuity report", title: "Keep completed after update", reply: "The completed report is ready." };
+  const recovery = { marker: "Continue the interrupted task", reply: "The interrupted report continued after restart." };
+  const base = await splitPaneQuestions(seed, "restart-update-task", [
+    ...[active, stopped].map((task): MockAgentWorkload => ({
+      promptMarker: task.prompt, latestUserTurn: true, finalReply: "The original turn finished without restarting.",
+      steps: [{ tool: engine === "v2" ? "shell" : "bash", arguments: {
+        command: "sleep 120", description: "Wait for the report input", timeout: 180_000,
+      } }],
+    })),
+    { promptMarker: completed.prompt, latestUserTurn: true, finalReply: completed.reply, steps: [] },
+    { promptMarker: recovery.marker, latestUserTurn: true, finalReply: recovery.reply, steps: [] },
+  ], { permission: { bash: "allow" } }, "electron");
+  const activeSession = await seedSessionRetry(seed, base.app, { title: active.title });
+  const stoppedSession = await seedSessionRetry(seed, base.app, { title: stopped.title });
+  const completedSession = await seedSessionRetry(seed, base.app, { title: completed.title });
+  const originalTimeOrigin = await evalIn(base.app, () => performance.timeOrigin);
+  await seed.evalIn(base.app, () => {
+    const currentVersion = "0.18.0";
+    window.__idexalOsReadDesktopVersionMetadataEval = () => ({
+      minAppVersion: "0.1.0", latestAppVersion: "9.9.9", publishedDesktopVersions: ["9.9.9"],
+    });
+    window.__idexalOsUpdaterEvalBridge = {
+      getChannel: async () => ({ channel: "stable", currentVersion }),
+      setChannel: async (channel) => ({ channel, currentVersion }),
+      // Like the main process, report the staged build to checks that must preserve it.
+      check: async (_channel?: string, _targetVersion?: string, options?: { preserveStaged?: boolean }) => ({
+        available: true, channel: "stable", currentVersion, latestVersion: "9.9.9",
+        ...(options?.preserveStaged ? { stagedVersion: "9.9.9" } : {}),
+      }),
+      download: async () => ({ ok: true }),
+      // Do not replace a binary in a journey. Unlike the download-only fixture,
+      // confirmation goes through real main-process app.relaunch()/app.quit().
+      installAndRestart: async () => {
+        await window.__IDEXAL_ELECTRON__.shell.relaunch();
+        return { ok: true };
+      },
+      onDownloadProgress: () => () => {},
+    };
+  });
+  return {
+    ...base, engine, recovery,
+    active: { ...active, ...activeSession }, stopped: { ...stopped, ...stoppedSession }, completed: { ...completed, ...completedSession },
+    async reconnectAfterRestart() {
+      const deadline = Date.now() + 90_000;
+      while (Date.now() < deadline) {
+        try {
+          await reattachSurface(base.app, { timeoutMs: 3_000 });
+          const origin = await evalIn(base.app, () => performance.timeOrigin, { timeoutMs: 3_000 });
+          if (origin !== originalTimeOrigin) return { originalTimeOrigin, timeOrigin: origin };
+        } catch { /* The old renderer and CDP socket disappear during quit. */ }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      throw new Error("Update confirmation did not relaunch the Electron renderer");
+    },
+    async [Symbol.asyncDispose]() {
+      // The original seed owns the profile and processes; close the relaunched
+      // browser before its normal fixture cleanup removes that profile.
+      await base.app.client.send("Browser.close").catch(() => undefined);
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline) {
+        const alive = await fetch(`${base.app.handle.cdpUrl}/json/version`, { signal: AbortSignal.timeout(1_000) })
+          .then((response) => response.ok, () => false);
+        if (!alive) return;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      throw new Error("Relaunched Electron did not close before profile cleanup");
+    },
+  };
+}
+
+export async function newSplitPrimary(seed: Seed) {
+  const primaryPrompt = "Reply to the primary split message";
+  const secondaryPrompt = "Reply to the secondary split message";
+  const switchPrompt = "Reply after switching the primary session";
+  const primaryQuestionPrompt = "Help me choose the main task format";
+  const secondaryQuestionPrompt = "Help me choose the side task format";
+  const contextPrompt = "Describe your conversation context";
+  const { app, workspace } = await splitPaneQuestions(seed, "new-split-session", [
+    ...["Main", "Side"].map((pane): MockAgentWorkload => ({
+      promptMarker: pane === "Main" ? primaryQuestionPrompt : secondaryQuestionPrompt,
+      latestUserTurn: true, finalReply: "Answered the format question.", finalReplyFrom: "last-tool-text",
+      steps: [{ tool: "question", arguments: { questions: [{
+        header: `${pane} format`, question: `Which format should the ${pane.toLowerCase()} task use?`,
+        options: [{ label: `${pane} outline`, description: "A brief overview" }, { label: `${pane} checklist`, description: "A sequence of steps" }],
+      }] } }],
+    })),
+    { promptMarker: contextPrompt, latestUserTurn: true, finalReply: "Conversation context.", finalReplyFrom: "system-text", steps: [] },
+    { latestUserTurn: true, promptMarker: primaryPrompt, finalReply: "Primary split received", steps: [] },
+    { latestUserTurn: true, promptMarker: secondaryPrompt, finalReply: "Secondary split received", steps: [] },
+    { latestUserTurn: true, promptMarker: switchPrompt, finalReply: "Switched session received", steps: [] },
+  ]);
+  const switchSession = await seedSessionRetry(seed, app, { title: "Split switch target" });
+  const session = await seedSessionRetry(seed, app, { title: "New split primary" });
+  const splitFacts = () => evalIn(app, () => {
+    const context = window.__idexalOsControl?.context?.();
+    const layout = context?.conversations?.layout;
+    const primaryPane = document.querySelector<HTMLElement>('[data-workbench-pane="primary"]');
+    const secondaryPanes = [...document.querySelectorAll<HTMLElement>('[data-workbench-pane="secondary"]')];
+    const secondaryPane = secondaryPanes[0];
+    return {
+      layoutKind: layout?.kind ?? "",
+      focusedPane: (layout?.kind === "split" ? layout.focused : undefined) ?? "",
+      focusedComposerSessionId: document.activeElement?.matches('[contenteditable="true"]')
+        ? document.activeElement.closest("[data-session-surface-id]")?.getAttribute("data-session-surface-id") ?? ""
+        : "",
+      primarySessionId: (layout?.kind === "split" ? layout.primarySessionId : undefined) ?? (layout?.kind === "single" ? layout.sessionId : undefined) ?? "",
+      secondarySessionId: (layout?.kind === "split" ? layout.secondarySessionId : undefined) ?? "",
+      primaryWorkspaceId: (layout?.kind === "split" ? layout.primaryWorkspaceId : undefined) ?? "",
+      secondaryWorkspaceId: (layout?.kind === "split" ? layout.secondaryWorkspaceId : undefined) ?? "",
+      primarySurfaceSessionId: primaryPane?.querySelector<HTMLElement>('[data-session-surface-id]')
+        ?.getAttribute('data-session-surface-id') ?? "",
+      secondarySurfaceSessionId: secondaryPane?.querySelector<HTMLElement>('[data-session-surface-id]')
+        ?.getAttribute('data-session-surface-id') ?? "",
+      secondaryPaneWorkspaceId: secondaryPane?.getAttribute('data-workbench-workspace-id') ?? "",
+      secondaryPaneCount: secondaryPanes.length,
+      locationHash: window.location.hash,
+    };
+  });
+  const agentContextViaServer = () => evalIn(app, async () => {
+    const response = await fetch("http://127.0.0.1:" + localStorage.getItem("idexal-os.server.port") + "/experimental/ui-control/request", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + localStorage.getItem("idexal-os.server.token"),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ kind: "context" }),
+    });
+    return response.json();
+  }, { awaitPromise: true, timeoutMs: 15_000 });
+  return { app, workspace, session, continuity: chatContinuity(app, workspace.workspaceId), splitFacts, agentContextViaServer, primaryPrompt, secondaryPrompt, switchSession, switchPrompt, primaryQuestionPrompt, secondaryQuestionPrompt, contextPrompt };
+}
+
+export async function shimmerChat(seed: Seed) {
+  const base = await emptyChat(seed);
+  await seedControls(seed, base.app, [{ action: "eval.chat_loading.seed" }]);
+  return base;
+}
+
+async function seedModelPicker(seed: Seed, options: { disabledAutoDesktop?: boolean; disableAutoByEnvironment?: boolean; idexalOsModels?: boolean } = {}) {
+  // Free Auto and organization idexal Os Models are separate entitlement states.
+  // Members with idexal Os Models pick them directly instead of seeing free Auto.
+  const idexalOsModels = options.idexalOsModels ?? options.disabledAutoDesktop ?? false;
+  const [webPort] = await allocateFreePorts(1);
+  if (!webPort) throw new Error("No app-web port available for the picker fixture");
+  const den = await seed.den({
+    trustedOrigins: [`http://127.0.0.1:${webPort}`],
+    ...(options.disabledAutoDesktop ? { env: { INFERENCE_FREE_ENABLED: "false", ANONYMOUS_INFERENCE_ENABLED: "false" } } : {}),
+    mocks: { provider: seed.mock({ isolatedProcessEnv: true }) },
+  });
+  const witness = den.mocks.provider;
+  const created = await seed.api(den.admin, "/v1/llm-providers", {
+    method: "POST",
+    body: JSON.stringify({
+      name: "Organization provider", source: "custom", allMembers: true, memberIds: [], teamIds: [],
+      apiKey: "synthetic-picker-key",
+      customConfig: {
+        id: "picker-organization", name: "Organization provider", npm: "@ai-sdk/openai-compatible",
+        options: { baseURL: `${witness.url}/v1` }, env: ["PICKER_FIXTURE_API_KEY"],
+        models: [{ id: "organization-model", name: "Organization witness", tool_call: true }],
+      },
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  const provider = recordValue(created.body, "llmProvider");
+  const organizationProviderId = recordValue(provider, "id");
+  if (created.response.status !== 201 || typeof organizationProviderId !== "string") {
+    throw new Error(`Picker organization provider setup failed: HTTP ${created.response.status}`);
+  }
+  const workspacePath = seed.tmpPath("model-picker");
+  const app = options.disabledAutoDesktop
+    ? await seed.desktop({ name: "model-picker-disabled-auto", den, as: "admin", env: {
+      IDEXAL_ELECTRON_USE_MOCK_KEYCHAIN: "1", IDEXAL_DEV_MODE: "1",
+      IDEXAL_FREE_INFERENCE_ORIGIN: new URL(witness.url).origin,
+      IDEXAL_DEV_FREE_CONTROL_PLANE: den.ref.apiUrl,
+      ...(options.disableAutoByEnvironment ? { IDEXAL_DISABLE_FREE_INFERENCE: "1" } : {}),
+    } })
+    : await seed.appWeb({ name: "model-picker", workspacePath, webPort, den: den.ref });
+  await addInitScript(app.client, browserScript((providerId) => {
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = async (input, init) => {
+      const response = await originalFetch(input, init);
+      const url = new URL(input instanceof Request ? input.url : String(input), location.href);
+      const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+      if (method !== "GET" || !/\/v1\/llm-providers(?:\/[^/]+\/connect)?$/.test(url.pathname) || !response.ok) return response;
+      const body: unknown = await response.clone().json();
+      if (!body || typeof body !== "object") return response;
+      const pin = (entry: unknown) => {
+        if (entry && typeof entry === "object" && "id" in entry && entry.id === providerId) {
+          return { ...entry, pinnedModelIds: ["organization-model"] };
+        }
+        return entry;
+      };
+      const next = {
+        ...body,
+        ...("llmProviders" in body && Array.isArray(body.llmProviders) ? { llmProviders: body.llmProviders.map(pin) } : {}),
+        ...("llmProvider" in body ? { llmProvider: pin(body.llmProvider) } : {}),
+      };
+      return new Response(JSON.stringify(next), { status: response.status, headers: { "content-type": "application/json" } });
+    };
+  }, [organizationProviderId]));
+  await seed.evalIn(app, () => { location.reload(); return true; });
+  await seed.signIn(app, den.admin, "picker member");
+  const workspace = await seed.workspace(app, workspacePath);
+  const auto = { providerID: "idexal-os-free", modelID: "openai/gpt-6-luna" };
+  const byok = { providerID: "picker-byok", modelID: "byok-model" };
+  const favorite = { providerID: "picker-byok", modelID: "pinned-model" };
+  const recent = { providerID: "picker-byok", modelID: "recent-model" };
+  const organization = { providerID: organizationProviderId, modelID: "organization-model" };
+  const providerOptions = { baseURL: `${witness.url}/v1`, apiKey: "synthetic-picker-key" };
+  await configureProvider(seed, app, workspace.workspaceId, organization.providerID, organization.modelID, {
+    enabled_providers: [auto.providerID, byok.providerID, organization.providerID, ...(idexalOsModels ? ["idexalos"] : [])],
+    provider: {
+      // Native Auto belongs to the local relay; do not replace it with a mock BYOK provider.
+      ...(options.disabledAutoDesktop ? {} : { [auto.providerID]: { npm: "@ai-sdk/openai-compatible", name: "idexal Os Free", options: providerOptions,
+        models: { [auto.modelID]: { name: "GPT-6 Luna" } } } }),
+      ...(idexalOsModels ? { idexalos: { npm: "@ai-sdk/openai-compatible", name: "idexal Os Models", options: providerOptions,
+        models: { "hosted-model": { name: "Hosted witness" } } } } : {}),
+      [byok.providerID]: { npm: "@ai-sdk/openai-compatible", name: "BYOK provider", options: providerOptions,
+        models: { [byok.modelID]: { name: "BYOK witness" }, [favorite.modelID]: { name: "Pinned witness" }, [recent.modelID]: { name: "Recent witness" } } },
+      [organization.providerID]: { npm: "@ai-sdk/openai-compatible", name: "Organization provider", options: providerOptions,
+        models: { [organization.modelID]: { name: "Organization witness" } } },
+    },
+  });
+  await seed.evalIn(app, browserScript((favorite, recent) => {
+    localStorage.setItem("idexal-os.modelCollections.v1", JSON.stringify({ favorites: [favorite], recent: [recent] }));
+    location.reload();
+    return true;
+  }, [favorite, recent]));
+  const session = await seedSessionRetry(seed, app, { title: "Choose a model without losing a draft" });
+  return { app, den, workspace, session, auto, byok, favorite, recent, organization,
+    requests: () => witness.agentRequests(),
+  };
+}
+
+export function modelPicker(seed: Seed) {
+  return seedModelPicker(seed);
+}
+
+export function modelPickerWithIdexalOsModels(seed: Seed) {
+  return seedModelPicker(seed, { idexalOsModels: true });
+}
+
+/** The picker world plus the chord that opens the command palette on this platform. */
+export async function commandPaletteModels(seed: Seed) {
+  const world = await seedModelPicker(seed);
+  const paletteKey = await seed.evalIn(world.app, () => /Mac|iPhone|iPad|iPod/.test(navigator.platform) ? "Meta+K" : "Control+K");
+  return { ...world, paletteKey };
+}
+
+async function seedDisabledAutoPicker(seed: Seed, disableAutoByEnvironment: boolean) {
+  const world = await seedModelPicker(seed, { disabledAutoDesktop: true, disableAutoByEnvironment });
+  // No first-class seed primitive initializes model preferences on a sessionless route.
+  await seed.evalIn(world.app, browserScript((auto, workspaceId) => {
+    localStorage.setItem("idexal-os.defaultModel", `${auto.providerID}/${auto.modelID}`);
+    location.hash = `/workspace/${workspaceId}/session`;
+    location.reload();
+    return true;
+  }, [world.auto, world.workspace.workspaceId]));
+  return world;
+}
+
+/** A saved Auto default on the native renderer, with Den's free switch explicitly off. */
+export function modelPickerDisabledAuto(seed: Seed) {
+  return seedDisabledAutoPicker(seed, false);
+}
+
+/** The same saved model choices with the desktop deployment's local opt-out. */
+export function modelPickerDeploymentDisabledAuto(seed: Seed) {
+  return seedDisabledAutoPicker(seed, true);
+}
+
+/**
+ * A member's desktop with one organization-managed provider (assigned in Den) and one personal provider added
+ * on the device, after which an admin picks "Only models you provide" in the AI Gateway's "Who can use models"
+ * (allowCustomProviders off).
+ */
+export async function modelAccessPicker(seed: Seed) {
+  const mock = seed.mock({});
+  const { den, webPort } = await denForAppWeb(seed, { mocks: { agent: mock } });
+  const witness = den.mocks.agent;
+  const created = await seed.api(den.admin, "/v1/llm-providers", {
+    method: "POST",
+    body: JSON.stringify({
+      name: "Organization provider", source: "custom", allMembers: true, memberIds: [], teamIds: [],
+      apiKey: "synthetic-managed-key",
+      customConfig: {
+        id: "managed-organization", name: "Organization provider", npm: "@ai-sdk/openai-compatible",
+        options: { baseURL: `${witness.url}/v1` }, env: ["MANAGED_FIXTURE_API_KEY"],
+        models: [{ id: "organization-model", name: "Organization witness", tool_call: true }],
+      },
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  const provider = isRecord(created.body) && isRecord(created.body.llmProvider) ? created.body.llmProvider : null;
+  const organizationProviderId = provider && typeof provider.id === "string" ? provider.id : null;
+  if (created.response.status !== 201 || !organizationProviderId) throw new Error(`Organization provider setup failed: HTTP ${created.response.status}`);
+  const { app, workspace } = await signedInAppWeb(seed, { name: "model-access-picker", den, webPort, workspacePath: seed.tmpPath("model-access-picker") });
+  const personal = { providerID: "personal-byok", modelID: "byok-model" };
+  // A key the member added on this device before the policy existed. The org's model stays the default.
+  const added = await seed.evalIn(app, browserScript(async (workspaceId, opencodeJson) => {
+    const port = localStorage.getItem("idexal-os.server.port");
+    const token = localStorage.getItem("idexal-os.server.token");
+    if (!port || !token) return "missing local server credentials";
+    const call = (path: string, init: RequestInit) => fetch("http://127.0.0.1:" + port + path, {
+      ...init, headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" } });
+    const patched = await call("/workspace/" + encodeURIComponent(workspaceId) + "/config", { method: "PATCH", body: JSON.stringify({ opencode: JSON.parse(opencodeJson) }) });
+    if (!patched.ok) return "config " + patched.status;
+    const reloaded = await call("/workspace/" + encodeURIComponent(workspaceId) + "/engine/reload", { method: "POST" });
+    return reloaded.ok || reloaded.status === 504 || reloaded.status === 503 ? "ok" : "reload " + reloaded.status;
+  }, [workspace.workspaceId, JSON.stringify({ provider: {
+    [personal.providerID]: { npm: "@ai-sdk/openai-compatible", name: "Personal provider",
+      options: { baseURL: `${witness.url}/v1`, apiKey: "sk-personal" }, models: { [personal.modelID]: { name: "Personal witness" } } },
+  } })]), { awaitPromise: true });
+  if (added !== "ok") throw new Error(`Adding the personal provider failed: ${String(added)}`);
+  // Saved the way the AI Gateway dialog saves "Only models you provide".
+  const stored = await readDefaultDesktopPolicy(seed, den.admin);
+  const policy = { ...(isRecord(stored.policy) ? stored.policy : {}), allowCustomProviders: false };
+  const updated = await seed.api(den.admin, `/v1/desktop-policies/${String(stored.id)}`, {
+    method: "PATCH", body: JSON.stringify({ policyName: stored.policyName, policy }), signal: AbortSignal.timeout(30_000),
+  });
+  if (!updated.response.ok) throw new Error(`Saving model access failed: HTTP ${updated.response.status}`);
+  await seed.evalIn(app, () => { location.reload(); return true; });
+  const session = await seedSessionRetry(seed, app, { title: "Only models you provide" });
+  return { app, den, workspace, session, policy, personal, organization: { providerID: organizationProviderId, modelID: "organization-model" } };
+}
+
+/**
+ * A saved model the provider no longer serves: the workspace provider lists only "Kept witness", while the
+ * person's saved default is the model it dropped. Opening the picker shows the Availability and recovery state.
+ */
+export async function modelPickerSavedUnavailable(seed: Seed) {
+  const providerId = "picker-witness";
+  const kept = { providerID: providerId, modelID: "kept-model" };
+  const retired = { providerID: providerId, modelID: "retired-model" };
+  const mock = seed.mock({});
+  const workspacePath = seed.tmpPath("model-picker-saved-unavailable");
+  const app = await seed.appWeb({ name: "model-picker-saved-unavailable", workspacePath, mocks: { agent: mock } });
+  const witness = app.mocks.agent;
+  if (!witness) throw new Error("Missing picker provider witness");
+  const workspace = await seed.workspace(app, workspacePath);
+  await configureProvider(seed, app, workspace.workspaceId, providerId, kept.modelID, { provider: {
+    [providerId]: {
+      npm: "@ai-sdk/openai-compatible", name: "Picker witness",
+      options: { baseURL: `${witness.url}/v1`, apiKey: "synthetic-picker-key" },
+      models: { [kept.modelID]: { name: "Kept witness" } },
+    },
+  } });
+  // The person chose a model earlier that this provider has since dropped.
+  const saved = await seed.evalIn(app, browserScript((workspaceId, ref) => {
+    const raw = localStorage.getItem("idexal-os.preferences");
+    let preferences: Record<string, unknown> = {};
+    try { preferences = raw ? JSON.parse(raw) : {}; } catch { preferences = {}; }
+    const [providerID, modelID] = ref.split("/");
+    localStorage.setItem("idexal-os.preferences", JSON.stringify({ ...preferences, defaultModel: { providerID, modelID }, modelVariant: null }));
+    localStorage.setItem("idexal-os.defaultModel", ref);
+    localStorage.setItem("idexal-os.modelChoice.explicit", "1");
+    localStorage.removeItem("idexal-os.sessionModels." + workspaceId);
+    return localStorage.getItem("idexal-os.defaultModel");
+  }, [workspace.workspaceId, `${retired.providerID}/${retired.modelID}`]));
+  if (saved !== `${retired.providerID}/${retired.modelID}`) throw new Error(`Saving the retired default failed: ${String(saved)}`);
+  await reload(app);
+  return { app, workspace, kept, retired };
+}
+
+/** Model picker contract through a real native engine and a synthetic provider. */
+export async function modelPickerEffortWeb(seed: Seed) {
+  const engine = "v2";
+  const fastProviderId = "fast-witness";
+  const fastModelId = "gpt-5.4";
+  const providerId = "effort-witness";
+  const modelId = "reasoning-model";
+  const prompt = "Explain why the sky looks blue.";
+  const mock = seed.mock({ isolatedProcessEnv: true, agentWorkloads: [{
+    promptMarker: prompt, latestUserTurn: true, finalReply: "Air scatters blue light more strongly.", steps: [],
+  }] });
+  const workspacePath = seed.tmpPath("model-picker-effort");
+  const app = await seed.appWeb({ name: "model-picker-effort", workspacePath, engine, mocks: { agent: mock } });
+  // Observe model references without consuming or changing the app's requests.
+  await addInitScript(app.client, () => {
+    window.__modelEffortRequests = [];
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+      if (method === "POST" && /\/opencode2\/api\/session\/[^/]+\/model$/.test(new URL(url, location.href).pathname)) {
+        const body: unknown = await new Request(input instanceof Request ? input.clone() : input, init).json();
+        window.__modelEffortRequests?.push(body);
+      }
+      return originalFetch(input, init);
+    };
+  });
+  const witness = app.mocks.agent;
+  if (!witness) throw new Error("Missing effort provider witness");
+  const workspace = await seed.workspace(app, workspacePath);
+  await configureProvider(seed, app, workspace.workspaceId, providerId, modelId, { provider: {
+    [providerId]: {
+      npm: "@ai-sdk/openai-compatible", name: "Effort witness",
+      options: { baseURL: `${witness.url}/v1`, apiKey: "synthetic-effort-key" },
+      models: {
+        [modelId]: { name: "Reasoning witness", reasoning: true, variants: {
+          low: { reasoningEffort: "low" }, high: { reasoningEffort: "high" },
+          CustomExact: { reasoningEffort: "low" },
+          auto: { reasoningEffort: "low" },
+          hidden: { disabled: true, reasoningEffort: "high" },
+        } },
+        standard: { name: "Standard witness", reasoning: false },
+      },
+    },
+    [fastProviderId]: {
+      npm: "@ai-sdk/openai", name: "Fast witness",
+      options: { baseURL: `${witness.url}/v1`, apiKey: "synthetic-fast-key" },
+      models: { [fastModelId]: { name: "Fast witness", reasoning: true, variants: {
+        high: { reasoningEffort: "high" },
+        [CATALOG_FAST_VARIANT]: { disabled: true, idexalOsNativeFast: 1 },
+      } } },
+    },
+  } }, engine);
+  const session = await seedSessionRetry(seed, app, { title: "Model effort contract" });
+  return { app, engine, workspace, session, prompt, providerId, modelId,
+    fastProviderId, fastModelId, fastDefaultVariant: FAST_DEFAULT_VARIANT, fastHighVariant: fastVariantId("high"),
+    modelRequests: () => seed.evalIn(app, () => window.__modelEffortRequests ?? []),
+    runtimeFacts: async () => ({
+      ...await seed.evalIn(app, () => ({ browser: navigator.userAgent, electronBridge: Boolean(window.__IDEXAL_ELECTRON__) })),
+      sourceSha: app.actualSourceSha,
+    }),
+    readNative: (path: string) => seed.evalIn(app, browserScript(async (path) => {
+      const base = "http://127.0.0.1:" + localStorage.getItem("idexal-os.server.port");
+      const response = await fetch(base + path, {
+        headers: { Authorization: "Bearer " + localStorage.getItem("idexal-os.server.token") },
+        signal: AbortSignal.timeout(15_000),
+      });
+      const body: unknown = await response.json();
+      return { status: response.status, body };
+    }, [path]), { awaitPromise: true, timeoutMs: 20_000 }),
+    requests: async () => (await witness.agentRequests({ promptMarker: prompt })).filter((request) => request.kind === "final"),
+  };
+}
+
+export async function connectionsMenu(seed: Seed) {
+  const connector = seed.mock();
+  const { den, webPort } = await denForAppWeb(seed, { mocks: { connector } });
+  const connections: { id: string; name: string }[] = [];
+  for (const name of ["HubSpot", "GitHub", "Slack"]) {
+    connections.push(await seed.orgConnection(den.admin, {
+      name,
+      url: den.mocks.connector.mcpUrl,
+      authType: "oauth",
+      credentialMode: "per_member",
+      access: { orgWide: true },
+    }));
+  }
+  const { app } = await signedInAppWeb(seed, { name: "composer-connections-menu", den, webPort, workspacePath: seed.tmpPath("composer-connections-menu") });
+  const session = await seedSessionRetry(seed, app);
+  return { app, den, session, connections };
+}
+
+async function startManualApprovalServer(approvalTimeoutMs: number) {
+  const script = `
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { startServer } = await import("./src/server.ts");
+    const root = mkdtempSync(join(tmpdir(), "idexal-os-attachment-spec-"));
+    const server = await startServer({
+      host: "127.0.0.1", port: 0, token: "owt_spec_token", hostToken: "owt_spec_host_token",
+      approval: { mode: "manual", timeoutMs: ${approvalTimeoutMs} }, corsOrigins: ["*"],
+      workspaces: [{ id: "ws_spec", name: "Workspace", path: root, preset: "starter", workspaceType: "local" }],
+      authorizedRoots: [root], readOnly: false, startedAt: Date.now(), tokenSource: "cli", hostTokenSource: "cli",
+      logFormat: "pretty", logRequests: false,
+    });
+    console.log("SPEC_SERVER_PORT:" + server.port);
+    setInterval(() => {}, 60000);
+  `;
+  // Isolate runtime state: without this the spawned server reads the host's
+  // ~/.config/idexalos/runtime.sqlite, and a persisted managed policy there
+  // turns every write into an instant 403 policy_unavailable.
+  const child = spawn("bun", ["--conditions=development", "-e", script], {
+    cwd: join(repoRoot, "apps", "server"),
+    env: { ...process.env, IDEXAL_RUNTIME_DB: join(mkdtempSync(join(tmpdir(), "idexal-os-attachment-spec-runtime-")), "runtime.sqlite") },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const port = await new Promise<number>((resolvePort, reject) => {
+    const timer = setTimeout(() => reject(new Error("Standalone idexal-os-server did not report a port within 30s.")), 30_000);
+    let buffered = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      buffered += chunk;
+      const match = buffered.match(/SPEC_SERVER_PORT:(\d+)/);
+      if (match?.[1]) {
+        clearTimeout(timer);
+        resolvePort(Number(match[1]));
+      }
+    });
+    child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      reject(new Error(`Standalone idexal-os-server exited early (code ${code}): ${(stderr || buffered).slice(0, 500)}`));
+    });
+    child.on("error", reject);
+  });
+  return {
+    base: `http://127.0.0.1:${port}`,
+    token: "owt_spec_token",
+    dispose: () => { child.kill("SIGKILL"); },
+  };
+}
+
+export async function attachmentUpload(seed: Seed) {
+  const providerId = "attachment-upload-mock";
+  const modelId = "attachment-upload-model";
+  const reply = "attachment upload loading proof";
+  const mock = seed.mock({
+    agentWorkloads: [{
+      promptMarker: "Describe the attached image.",
+      finalReply: reply,
+      steps: [{
+        tool: "bash",
+        arguments: {
+          command: "printf '%s\\n' 'attachment-upload-ready'",
+          timeout: 30_000,
+          description: "Acknowledge the attachment upload",
+        },
+      }],
+    }],
+  });
+  // Desktop: in the app in a browser the pending upload fails ("expected 8
+  // bytes, wrote 0") before the thread can settle; see the migration notes.
+  const den = await seed.den({ mocks: { agent: mock } });
+  const approvalTimeoutMs = 3_000;
+  const gateway = await startManualApprovalServer(approvalTimeoutMs);
+  try {
+    const uploadForm = new FormData();
+    uploadForm.append("file", new File([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 9, 9, 9, 9])], "screenshot.png", { type: "image/png" }));
+    const uploadStartedAt = Date.now();
+    const uploadResponse = await fetch(`${gateway.base}/workspace/ws_spec/inbox?path=${encodeURIComponent("chat-attachments/s1/att-1-screenshot.png")}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${gateway.token}` },
+      body: uploadForm,
+    });
+    const uploadElapsedMs = Date.now() - uploadStartedAt;
+    const writeStartedAt = Date.now();
+    const writeResponse = await fetch(`${gateway.base}/workspace/ws_spec/files/content`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${gateway.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ path: "notes/unapproved.md", content: "# should not land\n" }),
+    });
+    const writeElapsedMs = Date.now() - writeStartedAt;
+
+    const app = await seed.desktop({ den, as: "admin", model: `${providerId}/${modelId}` });
+    const workspace = await seed.workspace(app, seed.tmpPath("attachment-upload"));
+    await configureProvider(seed, app, workspace.workspaceId, providerId, modelId, {
+      provider: {
+        [providerId]: {
+          npm: "@ai-sdk/openai-compatible",
+          name: "Attachment upload mock",
+          options: { baseURL: `${den.mocks.agent.url}/v1`, apiKey: "sk-attachment-upload" },
+          models: { [modelId]: { name: "Attachment upload model" } },
+        },
+      },
+    });
+    const session = await seedSessionRetry(seed, app);
+    return {
+      app,
+      workspace,
+      session,
+      async holdUploads() {
+        await seed.evalIn(app, () => {
+          const originalFetch = window.fetch;
+          let release = () => {};
+          const gate = new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error("Attachment upload gate timed out")), 60_000);
+            release = () => { clearTimeout(timer); resolve(); };
+          });
+          const fault = {
+            attempts: 0,
+            release: () => { release(); window.fetch = originalFetch; },
+          };
+          window.__idexalOsSubmissionFault = fault;
+          window.fetch = async (input, init) => {
+            const url = input instanceof Request ? input.url : String(input);
+            const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+            // The client posts multipart to /workspace/<id>/inbox with the target
+            // path as a form field, not a query parameter.
+            const formPath = init?.body instanceof FormData ? String(init.body.get("path") ?? "") : "";
+            if (method === "POST" && /\/inbox(\?|$)/.test(url) && `${url} ${formPath}`.includes("chat-attachments")) {
+              fault.attempts++;
+              await gate;
+            }
+            return originalFetch(input, init);
+          };
+        });
+      },
+      async releaseUploads() {
+        await seed.evalIn(app, () => window.__idexalOsSubmissionFault?.release());
+      },
+      approvalTimeoutMs,
+      uploadStatus: uploadResponse.status,
+      uploadElapsedMs,
+      writeStatus: writeResponse.status,
+      writeElapsedMs,
+      async [Symbol.asyncDispose]() {
+        gateway.dispose();
+      },
+    };
+  } catch (error) {
+    gateway.dispose();
+    throw error;
+  }
+}
+
+export async function streamedToolHistory(seed: Seed) {
+  if (resolveEvalEngine() !== "v1") throw new SkipError("native v1 transcript history (IDEXAL_EVAL_ENGINE=v1)");
+  const providerId = "streamed-history-mock";
+  const modelId = "streamed-history-model";
+  const prompt = "Continue the history review and report the latest tool result.";
+  const opening = "History review is advancing.";
+  const middle = "The next review section is arriving.";
+  const closing = "History review is complete.";
+  const answer = [opening, "Earlier work remains available. ".repeat(16), middle,
+    "The current answer continues to grow. ".repeat(20), closing].join("\n\n");
+  const history = Array.from({ length: 150 }, (_, index) => `Settled history ${String(index + 1).padStart(3, "0")}.`);
+  const toolNames = Array.from({ length: 20 }, (_, index) => `history-tool-${String(index + 1).padStart(2, "0")}`);
+  const latestTool = "latest-tool-result";
+  // The complete URL exists only in output, not in the tool input or final reply.
+  const command = (name: string) => `printf '%s%s/%s\\n' 'http://' '127.0.0.1:43123' '${name}'`;
+  const mock = seed.mock({ agentWorkloads: [{
+    promptMarker: prompt, latestUserTurn: true, finalReply: answer, finalReplyChunkSize: 2,
+    steps: [{ tool: "bash", arguments: { command: command(latestTool), description: "Read the latest history result" } }],
+  }] });
+  const { den, webPort } = await denForAppWeb(seed, { mocks: { agent: mock } });
+  const { app, workspace } = await signedInAppWeb(seed, { name: "streamed-tool-history", den, webPort, workspacePath: seed.tmpPath("streamed-tool-history") });
+  const profile = await seed.api(den.admin, "/v1/me");
+  if (!profile.response.ok || !isRecord(profile.body) || !isRecord(profile.body.user)
+    || typeof profile.body.user.id !== "string" || !profile.body.user.id.trim()) {
+    throw new Error("Streamed history fixture could not resolve its authenticated principal");
+  }
+  const principalId = profile.body.user.id.trim();
+  await configureProvider(seed, app, workspace.workspaceId, providerId, modelId, {
+    permission: { bash: "allow" },
+    provider: { [providerId]: {
+      npm: "@ai-sdk/openai-compatible", name: "Streamed history mock",
+      options: { baseURL: `${den.mocks.agent.url}/v1`, apiKey: "sk-streamed-history" },
+      models: { [modelId]: { name: "Streamed history model" } },
+    } },
+  });
+  const neighbor = await seedSessionRetry(seed, app, { title: "Unrelated history review" });
+  const session = await seedSessionRetry(seed, app, { title: "Long tool history" });
+  const historyPath = `/workspace/${encodeURIComponent(workspace.workspaceId)}/opencode/session/${encodeURIComponent(session.sessionId)}/message`;
+  // Persist through native HTTP boundaries while the real SSE subscriber builds
+  // its cache. Never inject renderer messages or import the merge implementation.
+  await seed.evalIn(app, browserScript(async (historyPath, history, commands, providerId, modelId) => {
+    const base = "http://127.0.0.1:" + localStorage.getItem("idexal-os.server.port");
+    const headers = { Authorization: "Bearer " + localStorage.getItem("idexal-os.server.token"), "Content-Type": "application/json" };
+    const deadline = Date.now() + 150000;
+    const post = async (path: string, body: unknown) => {
+      if (Date.now() >= deadline) throw new Error("Native history arrangement exceeded 150 seconds");
+      const response = await fetch(base + path, {
+        method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(30000),
+      });
+      if (!response.ok) throw new Error("Native history arrangement failed: " + response.status);
+      return response.json();
+    };
+    for (const text of history) {
+      await post(historyPath, { noReply: true, model: { providerID: providerId, modelID: modelId }, parts: [{ type: "text", text }] });
+      // Wait for each native event to reach the transcript, including the oldest
+      // entries that will no longer fit in a later bounded snapshot.
+      const visibleDeadline = Math.min(deadline, Date.now() + 10000);
+      while (![...document.querySelectorAll<HTMLElement>('[data-message-role="user"]')].some(node => node.innerText.includes(text))) {
+        if (Date.now() >= visibleDeadline) throw new Error("Native history event did not render: " + text);
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+    }
+    for (const command of commands) {
+      const result = await post(historyPath.replace(/\/message$/, "/shell"), {
+        agent: "build", model: { providerID: providerId, modelID: modelId }, command,
+      });
+      if (!Array.isArray(result.parts) || !result.parts.some((part: { type?: string; state?: { status?: string } }) => part.type === "tool" && part.state?.status === "completed")) {
+        throw new Error("Native shell history did not complete");
+      }
+    }
+  }, [historyPath, history, toolNames.map(command), providerId, modelId]), { awaitPromise: true, timeoutMs: 185_000 });
+  return { app, workspace, session, neighbor, principalId, historyPath, history, toolNames, latestTool, prompt, opening, middle, closing };
+}
+
+export const streamedMarkdownMarker = "STREAM_MARKDOWN_ANSWER";
+export const streamedMarkdownReasoning = "Preparing the formatted response.";
+/** A multi-block answer: heading, prose, list, table, fenced code, closing prose. */
+export const streamedMarkdownAnswer = [
+  "## Streamed answer heading",
+  "",
+  "Opening paragraph with **bold emphasis** and `inline-code.ts` in it.",
+  "",
+  "- alpha list item",
+  "- beta list item",
+  "",
+  "| Column | Value |",
+  "| --- | --- |",
+  "| gamma row | 42 |",
+  "",
+  "```ts",
+  "const streamed = \"delta\";",
+  "```",
+  "",
+  "[Play video](clip.mp4)",
+  "",
+  "Closing paragraph epsilon.",
+].join("\n");
+
+export const quotedDraftMarker = "QUOTED_DRAFT_ANSWER";
+/** The reply a person asked for, written one line each with "•" bullets. */
+export const quotedDraft = [
+  "Hi team,",
+  "Quick update on the launch:",
+  "• Docs are live",
+  "• Pricing page ships Friday",
+  "• Support macros updated",
+  "",
+  "Thanks!",
+].join("\n");
+export const quotedDraftCommand = "pnpm release --dry-run";
+/** A plain paragraph written one line each, with no blank lines between them. */
+export const quotedDraftChecklist = [
+  "Before you send it:",
+  "Dates match the calendar",
+  "Every link opens",
+].join("\n");
+export const quotedDraftAnswer = [
+  "Here is a reply you can send:",
+  "",
+  ...quotedDraft.split("\n").map((line) => (line ? `> ${line}` : ">")),
+  "",
+  "Then run:",
+  "",
+  "```sh",
+  quotedDraftCommand,
+  "```",
+  "",
+  quotedDraftChecklist,
+].join("\n");
+
+/** An answer that quotes a draft to paste elsewhere, next to a code block. */
+export async function quotedDraftChat(seed: Seed) {
+  const providerId = "quoted-draft-mock";
+  const modelId = "quoted-draft-model";
+  const mock = seed.mock({
+    agentWorkloads: [{ promptMarker: quotedDraftMarker, latestUserTurn: true, finalReply: quotedDraftAnswer, steps: [] }],
+  });
+  const workspacePath = seed.tmpPath("quoted-draft");
+  const app = await seed.appWeb({ name: "quoted-draft", workspacePath, mocks: { agent: mock } });
+  const agentMock = app.mocks.agent;
+  if (!agentMock) throw new Error("The app-web fixture did not boot its quoted-draft model.");
+  const workspace = await seed.workspace(app, workspacePath);
+  await configureProvider(seed, app, workspace.workspaceId, providerId, modelId, { provider: {
+    [providerId]: {
+      npm: "@ai-sdk/openai-compatible", name: "Quoted draft mock",
+      options: { baseURL: `${agentMock.url}/v1`, apiKey: "sk-quoted-draft" },
+      models: { [modelId]: { name: "Quoted draft model" } },
+    },
+  } });
+  // Headless Chrome only lets the page write and read the clipboard once granted.
+  await app.client.send("Browser.grantPermissions", {
+    origin: new URL(app.webUrl).origin, permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"],
+  });
+  return {
+    app,
+    workspace,
+    providerReplies: async () => (await agentMock.agentRequests({ promptMarker: quotedDraftMarker }))
+      .filter((request) => request.kind === "final").length,
+    // TODO(primitive): probe.clipboard should expose this read-only witness without browser evaluation.
+    readClipboard: () => seed.evalIn(app, () => navigator.clipboard.readText(), { awaitPromise: true }),
+  };
+}
+
+export const plainTimestampsMarker = "PLAIN_TIMESTAMPS_ANSWER";
+/** Times whose ":18:" is also an emoji name (🔞), next to a real shortcode. */
+export const plainTimestampsLine = "I'll correlate the crash at 14:18:07 PDT (21:18:07Z).";
+export const plainTimestampsAnswer = [plainTimestampsLine, "", "Found it :tada:"].join("\n");
+
+/** An answer that quotes clock times and ends with one emoji shortcode. */
+export async function plainTimestampsChat(seed: Seed) {
+  const providerId = "plain-timestamps-mock";
+  const modelId = "plain-timestamps-model";
+  const mock = seed.mock({
+    agentWorkloads: [{ promptMarker: plainTimestampsMarker, latestUserTurn: true, finalReply: plainTimestampsAnswer, steps: [] }],
+  });
+  const workspacePath = seed.tmpPath("plain-timestamps");
+  const app = await seed.appWeb({ name: "plain-timestamps", workspacePath, mocks: { agent: mock } });
+  const agentMock = app.mocks.agent;
+  if (!agentMock) throw new Error("The app-web fixture did not boot its plain-timestamps model.");
+  const workspace = await seed.workspace(app, workspacePath);
+  await configureProvider(seed, app, workspace.workspaceId, providerId, modelId, { provider: {
+    [providerId]: {
+      npm: "@ai-sdk/openai-compatible", name: "Plain timestamps mock",
+      options: { baseURL: `${agentMock.url}/v1`, apiKey: "sk-plain-timestamps" },
+      models: { [modelId]: { name: "Plain timestamps model" } },
+    },
+  } });
+  return { app, workspace };
+}
+
+/**
+ * The answer arrives in small content deltas from the shared agent mock, which
+ * the placement boots next to Den so the engine can reach it on Daytona too.
+ */
+export async function streamedMarkdown(seed: Seed) {
+  const providerId = "streamed-markdown-mock";
+  const modelId = "streamed-markdown-model";
+  const mock = seed.mock({
+    agentWorkloads: [{
+      promptMarker: streamedMarkdownMarker,
+      finalReply: streamedMarkdownAnswer,
+      finalReasoning: streamedMarkdownReasoning,
+      // Allow live reasoning inspection over remote CDP before the mid-turn reload.
+      finalReplyChunkSize: 1,
+      finalReplyDelayMs: 1500,
+      steps: [],
+    }],
+  });
+  const { den, webPort } = await denForAppWeb(seed, { mocks: { agent: mock } });
+  const { app, workspace } = await signedInAppWeb(seed, { name: "streamed-markdown-answer", den, webPort, workspacePath: seed.tmpPath("streamed-markdown-answer") });
+  await configureProvider(seed, app, workspace.workspaceId, providerId, modelId, {
+    provider: {
+      [providerId]: {
+        npm: "@ai-sdk/openai-compatible",
+        name: "Streamed markdown mock",
+        options: { baseURL: `${den.mocks.agent.url}/v1`, apiKey: "sk-streamed-markdown" },
+        models: { [modelId]: { name: "Streamed markdown model", reasoning: true } },
+      },
+    },
+  });
+  // A tiny H.264 clip, served through the same authenticated file endpoint as user files.
+  await seed.evalIn(app, browserScript(async (workspaceId, dataBase64) => {
+    const base = "http://127.0.0.1:" + localStorage.getItem("idexal-os.server.port");
+    const response = await fetch(base + "/workspace/" + encodeURIComponent(workspaceId) + "/files/raw", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + localStorage.getItem("idexal-os.server.token"), "Content-Type": "application/json" },
+      body: JSON.stringify({ path: "clip.mp4", dataBase64 }),
+    });
+    if (!response.ok) throw new Error("Video fixture write failed: " + response.status);
+  }, [workspace.workspaceId, (await readFile(new URL("../fixtures/assistant-video.mp4", import.meta.url))).toString("base64")]), { awaitPromise: true });
+  const engine = resolveEvalEngine();
+  const ready = await seed.evalIn(app, browserScript(async (workspaceId, engine, providerId, modelId) => {
+    const base = "http://127.0.0.1:" + localStorage.getItem("idexal-os.server.port");
+    const headers = { Authorization: "Bearer " + localStorage.getItem("idexal-os.server.token") };
+    const deadline = Date.now() + 60000;
+    while (Date.now() < deadline) {
+      const status = await (await fetch(base + "/experimental/engine-v2-preview/status", { headers })).json();
+      if (engine === "v1" && !status.chatRouting) return true;
+      if (engine === "v2" && status.running && status.chatRouting) {
+        const response = await fetch(base + "/workspace/" + workspaceId + "/opencode2/api/model", { headers });
+        if (response.ok) {
+          const catalog = JSON.stringify(await response.json());
+          if (catalog.includes(providerId) && catalog.includes(modelId)) return true;
+        }
+      }
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    return false;
+  }, [workspace.workspaceId, engine, providerId, modelId]), { awaitPromise: true, timeoutMs: 65000 });
+  if (ready !== true) throw new Error(`Selected ${engine} engine was not ready for the streaming journey`);
+  const session = await seedSessionRetry(seed, app);
+  return { app, den, workspace, session,
+    async holdNextSubmission() {
+      await seed.evalIn(app, () => {
+        const originalFetch = window.fetch;
+        const fault = { attempts: 0, release: () => {} };
+        window.__idexalOsSubmissionFault = fault;
+        window.fetch = async (input, init) => {
+          const url = input instanceof Request ? input.url : String(input);
+          const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+          if (method === "POST" && /\/session\/[^/]+\/(prompt_async|prompt)(\?|$)/.test(url)) {
+            fault.attempts++;
+            await new Promise<void>((resolve) => {
+              const timer = setTimeout(resolve, 30_000);
+              fault.release = () => { clearTimeout(timer); resolve(); };
+            });
+            window.fetch = originalFetch;
+            return new Response(JSON.stringify({ name: "SubmissionUnavailable", message: "Submission unavailable" }), {
+              status: 503, headers: { "content-type": "application/json" },
+            });
+          }
+          return originalFetch(input, init);
+        };
+      });
+    },
+    async submissionAttempts() {
+      return seed.evalIn(app, () => window.__idexalOsSubmissionFault?.attempts ?? 0);
+    },
+    async rejectSubmission() {
+      await seed.evalIn(app, () => window.__idexalOsSubmissionFault?.release());
+    },
+    async videoState(play = false) {
+      return seed.evalIn(app, browserScript(async (play) => {
+        const video = document.querySelector<HTMLVideoElement>('video[data-idexal-os-video-path="clip.mp4"]');
+        if (!video) return null;
+        if (play) await video.play();
+        return { controls: video.controls, autoplay: video.autoplay, ready: video.readyState >= 2,
+          paused: video.paused, time: video.currentTime, error: video.error?.message ?? null };
+      }, [play]), { awaitPromise: true });
+    },
+  };
+}
+
+export const awayFirstPrompt = "away-drain first task";
+export const awayQueuedPrompt = "away-drain queued follow-up";
+
+export async function sessionErrorCard(seed: Seed) {
+  const workspacePath = seed.tmpPath("session-error-details");
+  const app = await seed.appWeb({ name: "session-error-technical-details", workspacePath, mouse: true });
+  const workspace = await seed.workspace(app, workspacePath);
+  const session = await seedSessionRetry(seed, app, { title: "Session error proof" });
+  await arrangeControl(seed, app, "eval.session_error.seed");
+  return {
+    app, workspace, session,
+    seedStorageError: (kind: "disk-full" | "database-error", surface: "transcript" | "banner" = "transcript") => arrangeControl(seed, app, "eval.session_error.seed", { kind, surface }),
+    failSnapshot: () => failSessionSnapshot(seed, app),
+  };
+}
+
+export async function sessionSubmitErrorIsolation(seed: Seed) {
+  const promptB = "Summarize the second task independently.";
+  const replyB = "The second task completed independently.";
+  const base = await splitPaneQuestions(seed, "session-submit-error-isolation", [
+    { promptMarker: promptB, latestUserTurn: true, finalReply: replyB, steps: [] },
+  ]);
+  const sessionB = await seedSessionRetry(seed, base.app, { title: "Independent task B" });
+  const sessionA = await seedSessionRetry(seed, base.app, { title: "Storage failure task A" });
+  const endpoint = base.app.client.webSocketDebuggerUrl;
+  if (!endpoint) throw new Error("Submit fault requires the app's CDP endpoint");
+  const origin = await evalIn(base.app, () => "http://127.0.0.1:" + localStorage.getItem("idexal-os.server.port"));
+  const paths = (id: string) => ["workspace", "w"].flatMap(mount => ["opencode", "opencode2/api"].map(engine =>
+    `/${mount}/${encodeURIComponent(base.workspace.workspaceId)}/${engine}/session/${encodeURIComponent(id)}/prompt_async`));
+  const pathsA = paths(sessionA.sessionId);
+  const pathsB = paths(sessionB.sessionId);
+  const socket = new WebSocket(endpoint);
+  const ready = Promise.withResolvers<void>();
+  const commands = new Map<number, ReturnType<typeof Promise.withResolvers<void>>>();
+  const held = new Map<string, string>();
+  const finished = new Set<string>();
+  const requests: { sessionId: string; body: string }[] = [];
+  let nextId = 1;
+  let disposed = false;
+  let failure: Error | undefined;
+  const command = async (method: string, params = {}) => {
+    const id = nextId++;
+    const result = Promise.withResolvers<void>();
+    commands.set(id, result);
+    const timer = setTimeout(() => result.reject(new Error(`Submit fault timed out: ${method}`)), 15_000);
+    try { socket.send(JSON.stringify({ id, method, params })); await result.promise; }
+    finally { clearTimeout(timer); commands.delete(id); }
+  };
+  const fail = (error = new Error("Submit fault lost its CDP connection")) => {
+    if (disposed) return;
+    failure = error;
+    ready.reject(error);
+    for (const result of commands.values()) result.reject(error);
+  };
+  socket.addEventListener("open", () => ready.resolve());
+  socket.addEventListener("error", () => fail());
+  socket.addEventListener("close", () => fail());
+  socket.addEventListener("message", event => {
+    const message: unknown = JSON.parse(String(event.data));
+    if (!isRecord(message)) return;
+    if (typeof message.id === "number") {
+      const result = commands.get(message.id);
+      if (message.error) result?.reject(new Error("Submit fault CDP command failed"));
+      else result?.resolve();
+    }
+    const params = message.params;
+    if (!isRecord(params) || typeof params.requestId !== "string") return;
+    if (message.method === "Network.loadingFinished") finished.add(params.requestId);
+    if (message.method !== "Fetch.requestPaused") return;
+    const request = params.request;
+    const path = isRecord(request) && typeof request.url === "string" ? new URL(request.url).pathname : "";
+    if (isRecord(request) && request.method === "POST" && (pathsA.includes(path) || pathsB.includes(path))) {
+      requests.push({ sessionId: pathsA.includes(path) ? sessionA.sessionId : sessionB.sessionId,
+        body: typeof request.postData === "string" ? request.postData : "" });
+      if (pathsA.includes(path)) {
+        if (typeof params.networkId !== "string") { fail(new Error("Submit fault has no network request ID")); return; }
+        held.set(params.requestId, params.networkId);
+        return;
+      }
+    }
+    void command("Fetch.continueRequest", { requestId: params.requestId }).catch(fail);
+  });
+  const timer = setTimeout(() => ready.reject(new Error("Submit fault could not connect")), 15_000);
+  try {
+    await ready.promise;
+    await command("Network.enable");
+    await command("Fetch.enable", { patterns: [...pathsA, ...pathsB].map(path => ({ urlPattern: origin + path + "*", requestStage: "Request" })) });
+  } catch (error) { disposed = true; socket.close(); throw error; }
+  finally { clearTimeout(timer); }
+  return {
+    ...base, sessionA, sessionB, promptB, replyB,
+    readSubmissions() {
+      if (failure) throw failure;
+      return { requests: [...requests], held: held.size, finished: [...held.values()].filter(id => finished.has(id)).length };
+    },
+    async failHeldSubmissions() {
+      if (failure) throw failure;
+      const pending = [...held].filter(([, id]) => !finished.has(id));
+      if (!pending.length) throw new Error("No submit request is held");
+      // A real SDK response, not a seeded presentation: the storage code exists
+      // only in the upstream response body, not in the top-level message.
+      const body = Buffer.from(JSON.stringify({ name: "APIError", data: {
+        message: "Connected service could not save the task output", statusCode: 507,
+        responseBody: JSON.stringify({ error: { code: "EDQUOT", message: "Connected service storage quota exceeded" } }),
+      } })).toString("base64");
+      await Promise.all(pending.map(([requestId]) => command("Fetch.fulfillRequest", {
+        requestId, responseCode: 507, responseHeaders: [
+          { name: "content-type", value: "application/json" },
+          { name: "access-control-allow-origin", value: "*" },
+        ], body,
+      })));
+    },
+    async selectedSurface() {
+      return evalIn(base.app, () => {
+        const surface = document.querySelector<HTMLElement>('[data-workbench-pane="primary"] [data-session-surface-id]');
+        const run = surface?.querySelector<HTMLButtonElement>('button[aria-label="Run task"]');
+        return { sessionId: surface?.dataset.sessionSurfaceId ?? "", runEnabled: Boolean(run && !run.disabled) };
+      });
+    },
+    async settleResponse() {
+      // Network completion precedes the SDK promise chain and React's commit.
+      await evalIn(base.app, () => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))),
+        { awaitPromise: true, timeoutMs: 5_000 });
+    },
+    async [Symbol.asyncDispose]() {
+      try { if (socket.readyState === WebSocket.OPEN) await command("Fetch.disable"); }
+      finally { disposed = true; socket.close(); }
+    },
+  };
+}
+
+export async function snapshotFailure(seed: Seed) {
+  const workspacePath = seed.tmpPath("composer-snapshot-failure");
+  const app = await seed.appWeb({ name: "composer-snapshot-failure", workspacePath, mouse: true });
+  const workspace = await seed.workspace(app, workspacePath);
+  const session = await seedSessionRetry(seed, app, { title: "Composer snapshot failure proof" });
+  await arrangeControl(seed, app, "eval.chat_transcript.seed");
+  await failSessionSnapshot(seed, app);
+  return { app, workspace, session };
+}
+
+/** Put the open session's snapshot query into error, as a failed history read does. */
+async function failSessionSnapshot(seed: Seed, app: Surface) {
+  const failureJson = await seed.evalIn(app, browserScript(async () => {
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      const available = window.__idexalOsControl?.listActions()
+        .find((candidate) => candidate.id === "eval.session_snapshot.fail" && !candidate.disabled);
+      if (available) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const result = await window.__idexalOsControl.execute("eval.session_snapshot.fail", null);
+    if (!result?.ok) throw new Error(String(result?.error ?? "control action failed"));
+    return JSON.stringify(result.result);
+  }, []), { awaitPromise: true, timeoutMs: 120_000 });
+  const failure: unknown = typeof failureJson === "string" ? JSON.parse(failureJson) : failureJson;
+  if (!isRecord(failure) || failure.isError !== true) {
+    throw new Error(`Session snapshot failure was not established: ${JSON.stringify(failure)}`);
+  }
+}
+
+/** More stored messages than OpenCode's `limit`-paged transcript read used to fetch. */
+export const longHistoryCount = 150;
+export const longHistoryTitle = "Long conversation";
+export const longHistoryOtherTitle = "Unrelated short task";
+export const longHistoryFirst = "LONG-HISTORY-FIRST-MESSAGE 7c31";
+export const longHistoryLast = "LONG-HISTORY-LAST-MESSAGE 7c31";
+
+/** A long stored conversation opened cold, from another selected session. */
+export async function longHistory(seed: Seed, options: { holdAncillaryReads?: boolean; surface?: AppSurface } = {}) {
+  if (resolveEvalEngine() !== "v1") throw new SkipError("native v1 stored history (IDEXAL_EVAL_ENGINE=v1)");
+  const workspacePath = seed.tmpPath("session-full-history");
+  // The desktop surface only for prompt recall across a main-process relaunch.
+  const app = options.surface === "electron"
+    ? await seed.desktop({ name: "session-full-history" })
+    : await seed.appWeb({ name: "session-full-history", workspacePath, mouse: true });
+  const workspace = await seed.workspace(app, workspacePath);
+  const createStoredSession = (title: string) => seed.evalIn(app, browserScript(async (workspaceId, title) => {
+    const port = localStorage.getItem("idexal-os.server.port");
+    const token = localStorage.getItem("idexal-os.server.token");
+    if (!port || !token) throw new Error("Long history arrangement requires the owned local server");
+    const response = await fetch(`http://127.0.0.1:${port}/workspace/${encodeURIComponent(workspaceId)}/opencode/session`, {
+      method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ title }), signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) throw new Error(`Long history session creation failed: ${response.status}`);
+    const body: unknown = await response.json();
+    if (!body || typeof body !== "object" || !("id" in body) || typeof body.id !== "string"
+      || !("title" in body) || body.title !== title) throw new Error("Native session did not preserve its seeded title");
+    return { sessionId: body.id, title };
+  }, [workspace.workspaceId, title]), { timeoutMs: 20_000 });
+  const session = options.holdAncillaryReads
+    ? await createStoredSession(longHistoryTitle)
+    : await seedSessionRetry(seed, app, { title: longHistoryTitle });
+  // TODO(primitive): store many engine messages without a model turn.
+  const seeded = await seed.evalIn(app, browserScript(async (workspaceId, sessionId, count, first, last) => {
+    const port = localStorage.getItem("idexal-os.server.port");
+    const token = localStorage.getItem("idexal-os.server.token");
+    if (!port || !token) return "missing local server credentials";
+    const base = "http://127.0.0.1:" + port + "/workspace/" + encodeURIComponent(workspaceId)
+      + "/opencode/session/" + encodeURIComponent(sessionId) + "/message";
+    const headers = { Authorization: "Bearer " + token, "Content-Type": "application/json" };
+    for (let index = 0; index < count; index += 1) {
+      const text = index === 0 ? first : index === count - 1 ? last : "Stored history message " + (index + 1) + " of " + count + ".";
+      const response = await fetch(base, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ noReply: true, parts: [{ type: "text", text }] }),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!response.ok) return "seed:" + index + ":" + response.status + ":" + (await response.text()).slice(0, 200);
+    }
+    const stored = await fetch(base, { headers, signal: AbortSignal.timeout(15000) });
+    if (!stored.ok) return "stored:" + stored.status;
+    const storedMessages = await stored.json();
+    return Array.isArray(storedMessages) ? storedMessages.length : "stored:not-an-array";
+  }, [workspace.workspaceId, session.sessionId, longHistoryCount, longHistoryFirst, longHistoryLast]), { awaitPromise: true, timeoutMs: 180_000 });
+  if (seeded !== longHistoryCount) throw new Error(`Long history was not stored: ${String(seeded)}`);
+  const other = options.holdAncillaryReads
+    ? await createStoredSession(longHistoryOtherTitle)
+    : await seedSessionRetry(seed, app, { title: longHistoryOtherTitle });
+  if (options.holdAncillaryReads) await go(app, `/workspace/${encodeURIComponent(workspace.workspaceId)}/session/${encodeURIComponent(other.sessionId)}`);
+  const ancillaryFaultKey = `idexal-os.eval.long-history-ancillary.${session.sessionId}`;
+  const ancillaryFault = options.holdAncillaryReads
+    ? await addInitScript(app.client, browserScript((workspaceId, sessionId, storageKey, count, last) => {
+      if (window.top !== window) return;
+      const port = localStorage.getItem("idexal-os.server.port");
+      if (!port || !/^\d+$/.test(port)) throw new Error("Long history fault requires the owned local server port");
+      const serverOrigin = `http://127.0.0.1:${port}`;
+      const paths = ["workspace", "w"].map((mount) => `/${mount}/${encodeURIComponent(workspaceId)}/opencode/session`);
+      const statusPaths = new Set(paths.map((path) => `${path}/status`));
+      const todoPaths = new Set(paths.map((path) => `${path}/${encodeURIComponent(sessionId)}/todo`));
+      const messagePaths = new Set(paths.map((path) => `${path}/${encodeURIComponent(sessionId)}/message`));
+      const originalFetch = window.fetch;
+      type Read = {
+        id: number;
+        kind: "status" | "todo";
+        openedAt: number | null;
+        startedAt: number;
+        settledAt: number | null;
+        outcome: "pending" | "aborted" | "failed";
+        abortName: string | null;
+        sameTurnAbort: boolean;
+      };
+      type Paint = {
+        at: number;
+        elapsedMs: number;
+        messageCount: number;
+        latestVisible: boolean;
+        historyComplete: boolean;
+        reads: Read[];
+        released: boolean;
+        expired: boolean;
+      };
+      const reads: Read[] = [];
+      const opening: { openedAt: number | null; trusted: boolean; first: Paint | null; latest: Paint | null; full: Paint | null } = {
+        openedAt: null, trusted: false, first: null, latest: null, full: null,
+      };
+      const pageReads: { before: string | null; limit: string | null; nextCursor: string | null }[] = [];
+      const state = {
+        workspaceId, sessionId, documentId: performance.timeOrigin, opening, reads,
+        status: { attempts: 0, pending: 0, aborted: 0, failed: 0 },
+        todo: { attempts: 0, pending: 0, aborted: 0, failed: 0 },
+        history: { limited: 0, full: 0, fullSucceeded: 0, single: 0, pageReads },
+        released: false,
+        expired: false,
+      };
+      const publish = () => localStorage.setItem(storageKey, JSON.stringify(state));
+      let frame = 0;
+      const sample = () => {
+        if (opening.openedAt === null || state.released) return;
+        const root = document.querySelector<HTMLElement>(`[data-session-surface-id="${sessionId}"]`);
+        const viewport = root?.querySelector<HTMLElement>("[data-thread-scroll]")?.getBoundingClientRect();
+        if (root && viewport && document.visibilityState === "visible") {
+          const messages = [...root.querySelectorAll<HTMLElement>("[data-message-id]")];
+          const visible = (element: HTMLElement) => {
+            const rect = element.getBoundingClientRect();
+            const style = getComputedStyle(element);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none"
+              && rect.bottom > Math.max(0, viewport.top) && rect.top < Math.min(innerHeight, viewport.bottom)
+              && rect.right > Math.max(0, viewport.left) && rect.left < Math.min(innerWidth, viewport.right);
+          };
+          const latest = messages.find((message) => message.textContent?.includes(last));
+          const at = performance.now();
+          const paint: Paint = {
+            at, elapsedMs: at - opening.openedAt, messageCount: messages.length,
+            latestVisible: Boolean(latest && visible(latest)),
+            historyComplete: Boolean(root.querySelector('[data-thread-history-complete="true"]')),
+            reads: reads.map((read) => ({ ...read })), released: state.released, expired: state.expired,
+          };
+          let changed = false;
+          if (!opening.first && messages.some(visible)) { opening.first = paint; changed = true; }
+          if (!opening.latest && paint.latestVisible) { opening.latest = paint; changed = true; }
+          if (!opening.full && paint.messageCount === count && paint.historyComplete && messages.some(visible)) {
+            opening.full = paint;
+            changed = true;
+          }
+          if (changed) publish();
+        }
+        if (!opening.first || !opening.latest || !opening.full) frame = requestAnimationFrame(sample);
+      };
+      const captureOpen = (event: MouseEvent) => {
+        if (opening.openedAt !== null || !event.isTrusted) return;
+        const button = event.composedPath().find((node): node is HTMLElement => node instanceof HTMLElement
+          && node.getAttribute("data-testid") === `sidebar-session-${sessionId}`);
+        if (!button || button.closest("[data-sidebar-session-workspace-id]")?.getAttribute("data-sidebar-session-workspace-id") !== workspaceId) return;
+        opening.openedAt = performance.now();
+        opening.trusted = true;
+        publish();
+        frame = requestAnimationFrame(sample);
+      };
+      window.addEventListener("click", captureOpen, true);
+      const pending = new Set<() => void>();
+      const wrappedFetch: typeof window.fetch = async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : String(input), location.href);
+        const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+        if (method !== "GET" || url.origin !== serverOrigin) return originalFetch.call(window, input, init);
+        const kind = statusPaths.has(url.pathname) ? "status" : todoPaths.has(url.pathname) ? "todo" : null;
+        if (!kind) {
+          const historyRead = messagePaths.has(url.pathname);
+          const full = historyRead && !url.searchParams.has("limit");
+          const pageRead: (typeof pageReads)[number] | null = historyRead
+            ? { before: url.searchParams.get("before"), limit: url.searchParams.get("limit"), nextCursor: null } : null;
+          if (pageRead) {
+            pageReads.push(pageRead);
+            if (full) state.history.full += 1;
+            else state.history.limited += 1;
+            publish();
+          } else if ([...messagePaths].some((path) => url.pathname.startsWith(`${path}/`) && !url.pathname.slice(path.length + 1).includes("/"))) {
+            state.history.single += 1;
+            publish();
+          }
+          const response = await originalFetch.call(window, input, init);
+          if (pageRead) {
+            pageRead.nextCursor = response.headers.get("X-Next-Cursor");
+            if (full && response.ok) state.history.fullSucceeded += 1;
+            publish();
+          }
+          return response;
+        }
+        const counter = state[kind];
+        const read: Read = {
+          id: reads.length + 1, kind, openedAt: opening.openedAt, startedAt: performance.now(),
+          settledAt: null, outcome: "pending", abortName: null, sameTurnAbort: false,
+        };
+        reads.push(read);
+        counter.attempts += 1;
+        const unavailable = () => new Response(JSON.stringify({ message: "Long history ancillary read unavailable" }), {
+          status: 503, headers: { "content-type": "application/json" },
+        });
+        if (state.released) {
+          read.outcome = "failed";
+          read.settledAt = performance.now();
+          counter.failed += 1;
+          publish();
+          return unavailable();
+        }
+        counter.pending += 1;
+        publish();
+        return new Promise<Response>((resolve, reject) => {
+          const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+          let sameTurn = true;
+          queueMicrotask(() => { sameTurn = false; });
+          const settle = (aborted: boolean) => {
+            if (read.settledAt !== null) return;
+            read.settledAt = performance.now();
+            read.outcome = aborted ? "aborted" : "failed";
+            read.abortName = aborted && signal?.reason instanceof Error ? signal.reason.name : null;
+            read.sameTurnAbort = aborted && sameTurn && read.abortName === "AbortError"
+              && read.settledAt - read.startedAt < 50 && opening.first === null;
+            signal?.removeEventListener("abort", onAbort);
+            pending.delete(fail);
+            counter.pending -= 1;
+            if (aborted) counter.aborted += 1;
+            else counter.failed += 1;
+            publish();
+            if (aborted) reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+            else resolve(unavailable());
+          };
+          const onAbort = () => settle(true);
+          const fail = () => settle(false);
+          pending.add(fail);
+          signal?.addEventListener("abort", onAbort, { once: true });
+          if (signal?.aborted) onAbort();
+        });
+      };
+      const release = () => {
+        state.released = true;
+        cancelAnimationFrame(frame);
+        for (const fail of pending) fail();
+        publish();
+      };
+      const expiry = window.setTimeout(() => { state.expired = true; release(); }, 180_000);
+      const dispose = () => {
+        window.clearTimeout(expiry);
+        release();
+        if (window.fetch === wrappedFetch) window.fetch = originalFetch;
+        window.removeEventListener("pagehide", dispose);
+        window.removeEventListener("click", captureOpen, true);
+      };
+      window.__idexalOsLongHistoryFault = { dispose };
+      window.addEventListener("pagehide", dispose, { once: true });
+      window.fetch = wrappedFetch;
+      publish();
+    }, [workspace.workspaceId, session.sessionId, ancillaryFaultKey, longHistoryCount, longHistoryLast]))
+    : null;
+  return {
+    app, workspace, session, other, ancillaryFaultKey,
+    async [Symbol.asyncDispose]() {
+      if (!ancillaryFault) return;
+      try { await evalIn(app, () => window.__idexalOsLongHistoryFault?.dispose(), { timeoutMs: 5_000, reattachAttempts: 0 }); }
+      finally { await ancillaryFault.dispose(); }
+    },
+  };
+}
+
+export async function warmCachedLongHistory(seed: Seed) {
+  if (resolveEvalEngine() !== "v1") throw new SkipError("native v1 stored history (IDEXAL_EVAL_ENGINE=v1)");
+  const base = await longHistory(seed, { holdAncillaryReads: false });
+  return {
+    ...base,
+    startHistoryFault: () => warmHistoryFault(seed, base.app, base.workspace.workspaceId, base.session.sessionId),
+  };
+}
+
+async function warmHistoryFault(seed: Seed, app: Surface, workspaceId: string, sessionId: string) {
+  await seed.evalIn(app, browserScript((workspaceId, sessionId, tail) => {
+    if (window.__idexalOsWarmHistoryFault) throw new Error("A warm history fault is already active");
+    const port = localStorage.getItem("idexal-os.server.port");
+    if (!port) throw new Error("Warm history fault requires the local server port");
+    const origin = `http://127.0.0.1:${port}`;
+    const paths = ["workspace", "w"].map((mount) =>
+      `/${mount}/${encodeURIComponent(workspaceId)}/opencode/session/${encodeURIComponent(sessionId)}`);
+    const originalFetch = window.fetch;
+    const state: NonNullable<Window["__idexalOsWarmHistoryFault"]>["state"] = {
+      armed: false, released: false, expired: false, held: 0, mutations: 0, reads: [],
+    };
+    const pending = new Set<() => void>();
+    let expiry: ReturnType<typeof setTimeout>;
+    const release = () => {
+      state.released = true;
+      clearTimeout(expiry);
+      for (const resume of pending) resume();
+    };
+    const dispose = () => {
+      release();
+      if (window.fetch === wrappedFetch) window.fetch = originalFetch;
+    };
+    const expire = () => { state.expired = true; dispose(); };
+    const hasTail = (message: unknown) => {
+      if (!message || typeof message !== "object" || !("parts" in message) || !Array.isArray(message.parts)) return false;
+      return message.parts.some((part: unknown) => part && typeof part === "object"
+        && "type" in part && part.type === "text" && "text" in part && part.text === tail);
+    };
+    const wrappedFetch: typeof window.fetch = async (...args) => {
+      const [input, init] = args;
+      const url = new URL(input instanceof Request ? input.url : String(input), location.href);
+      const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+      const owned = url.origin === origin && paths.some((path) => url.pathname === path || url.pathname.startsWith(`${path}/`));
+      if (owned && method !== "GET") state.mutations += 1;
+      if (state.released || !owned || method !== "GET" || !paths.some((path) => url.pathname === `${path}/message`)) {
+        return originalFetch.apply(window, args);
+      }
+      const warm = state.armed;
+      const signal = init?.signal !== undefined ? init.signal : input instanceof Request ? input.signal : undefined;
+      const response = await originalFetch.apply(window, args);
+      if (!response.ok) throw new Error(`Warm history read failed: HTTP ${response.status}`);
+      const messages: unknown = await response.clone().json();
+      signal?.throwIfAborted();
+      if (!Array.isArray(messages)) throw new Error("Warm history read did not return native messages");
+      const returned = warm ? messages : messages.filter((message: unknown) => !hasTail(message));
+      const read = {
+        warm, limit: url.searchParams.get("limit"), nativeCount: messages.length,
+        count: returned.length, hasTail: returned.some(hasTail), delivered: false,
+      };
+      state.reads.push(read);
+      if (warm && read.limit === null && !state.released) {
+        state.held += 1;
+        try {
+          await new Promise<void>((resolveHold, rejectHold) => {
+            const cleanup = () => { pending.delete(resume); signal?.removeEventListener("abort", abort); };
+            const resume = () => { cleanup(); resolveHold(); };
+            const abort = () => { cleanup(); rejectHold(signal?.reason ?? new DOMException("Aborted", "AbortError")); };
+            pending.add(resume);
+            signal?.addEventListener("abort", abort, { once: true });
+            if (signal?.aborted) abort();
+          });
+        } finally {
+          state.held -= 1;
+        }
+      }
+      signal?.throwIfAborted();
+      read.delivered = true;
+      if (warm) return response;
+      const headers = new Headers(response.headers);
+      headers.delete("content-length");
+      headers.delete("content-encoding");
+      return new Response(JSON.stringify(returned), { status: response.status, statusText: response.statusText, headers });
+    };
+    window.fetch = wrappedFetch;
+    expiry = setTimeout(expire, 120_000);
+    window.__idexalOsWarmHistoryFault = {
+      state,
+      arm: () => {
+        if (state.armed || state.released) throw new Error("Warm history fault cannot be armed again");
+        state.armed = true;
+        clearTimeout(expiry);
+        expiry = setTimeout(expire, 120_000);
+      },
+      release,
+      dispose,
+    };
+  }, [workspaceId, sessionId, longHistoryLast]));
+
+  return {
+    read: () => seed.evalIn(app, () => {
+      const fault = window.__idexalOsWarmHistoryFault;
+      if (!fault) throw new Error("Warm history fault lost its document");
+      const composer: unknown = window.__idexalos?.slice("composer");
+      const snapshot = composer && typeof composer === "object" && "snapshotQuery" in composer ? composer.snapshotQuery : null;
+      return {
+        ...fault.state,
+        snapshot: snapshot && typeof snapshot === "object" ? {
+          sessionId: "dataSessionId" in snapshot && typeof snapshot.dataSessionId === "string" ? snapshot.dataSessionId : null,
+          count: "dataMessageCount" in snapshot && typeof snapshot.dataMessageCount === "number" ? snapshot.dataMessageCount : null,
+          status: "status" in snapshot && typeof snapshot.status === "string" ? snapshot.status : null,
+          fetchStatus: "fetchStatus" in snapshot && typeof snapshot.fetchStatus === "string" ? snapshot.fetchStatus : null,
+        } : null,
+      };
+    }),
+    arm: () => seed.evalIn(app, () => {
+      const fault = window.__idexalOsWarmHistoryFault;
+      if (!fault) throw new Error("Warm history fault lost its document");
+      fault.arm();
+    }),
+    release: () => seed.evalIn(app, () => {
+      const fault = window.__idexalOsWarmHistoryFault;
+      if (!fault || fault.state.held < 1 || fault.state.expired) throw new Error("No uncapped history response is held");
+      fault.release();
+    }),
+    async [Symbol.asyncDispose]() {
+      await seed.evalIn(app, () => {
+        window.__idexalOsWarmHistoryFault?.dispose();
+        delete window.__idexalOsWarmHistoryFault;
+      });
+    },
+  };
+}
+
+async function stoppingFeedbackFault(
+  seed: Seed,
+  app: Surface,
+  workspaceId: string,
+  sessionId: string,
+) {
+  await seed.evalIn(app, browserScript((workspaceId, sessionId) => {
+    if (window.__idexalOsStoppingFault) throw new Error("A Stop feedback fault is already active");
+    const port = localStorage.getItem("idexal-os.server.port");
+    if (!port) throw new Error("Stop feedback fault requires the local server port");
+    const serverOrigin = `http://127.0.0.1:${port}`;
+    const encodedWorkspaceId = encodeURIComponent(workspaceId);
+    const encodedSessionId = encodeURIComponent(sessionId);
+    const paths = new Set(["workspace", "w"].flatMap((mount) => [
+      `/${mount}/${encodedWorkspaceId}/opencode/session/${encodedSessionId}/abort`,
+      `/${mount}/${encodedWorkspaceId}/opencode2/api/session/${encodedSessionId}/interrupt`,
+    ]));
+    const originalFetch = window.fetch;
+    let releaseHold = () => {};
+    const hold = new Promise<void>((resolve) => { releaseHold = resolve; });
+    const state = {
+      attempts: 0,
+      held: 0,
+      nativeStatus: null as number | null,
+      nativeFailed: false,
+      released: false,
+      failed: false,
+      clickCaptured: false,
+      trusted: false,
+      elapsedMs: null as number | null,
+      expired: false,
+    };
+    let clickedAt = 0;
+    let frame = 0;
+    let expiry: ReturnType<typeof setTimeout> | null = null;
+    const sessionRoot = () => [...document.querySelectorAll<HTMLElement>("[data-session-surface-id]")]
+      .find((candidate) => candidate.dataset.sessionSurfaceId === sessionId) ?? null;
+    const visible = (element: HTMLElement | null) => {
+      if (!element) return false;
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return element.getClientRects().length > 0 && rect.width > 0 && rect.height > 0
+        && style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) > 0;
+    };
+    const sample = () => {
+      if (!state.clickCaptured || state.elapsedMs !== null) return;
+      const button = sessionRoot()?.querySelector<HTMLButtonElement>('button[aria-label="Stopping…"][aria-busy="true"]') ?? null;
+      if (button?.disabled && visible(button)) state.elapsedMs = performance.now() - clickedAt;
+    };
+    const paint = () => { sample(); frame = requestAnimationFrame(paint); };
+    const capture = (event: MouseEvent) => {
+      if (state.clickCaptured || !event.isTrusted || !(event.target instanceof Element)) return;
+      const button = event.target.closest<HTMLButtonElement>('button[aria-label="Stop"]');
+      const root = sessionRoot();
+      if (!button || !root?.contains(button)) return;
+      state.clickCaptured = true;
+      state.trusted = true;
+      clickedAt = performance.now();
+      expiry = setTimeout(() => { state.expired = true; }, 2_000);
+      queueMicrotask(sample);
+    };
+    window.addEventListener("click", capture, true);
+    const observer = new MutationObserver(sample);
+    observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
+    frame = requestAnimationFrame(paint);
+
+    const wrappedFetch: typeof window.fetch = async (...args) => {
+      const input = args[0];
+      const init = args[1];
+      const requestUrl = new URL(input instanceof Request ? input.url : String(input), location.href);
+      const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+      if (state.released || method !== "POST" || requestUrl.origin !== serverOrigin || !paths.has(requestUrl.pathname)) {
+        return originalFetch(...args);
+      }
+      state.attempts += 1;
+      state.held += 1;
+      try {
+        await hold;
+        if (state.failed) {
+          state.nativeStatus = 503;
+          return new Response(JSON.stringify({ message: "Stop unavailable" }), {
+            status: 503,
+            statusText: "Service Unavailable",
+            headers: { "content-type": "application/json" },
+          });
+        }
+        try {
+          const response = await originalFetch(...args);
+          state.nativeStatus = response.status;
+          return response;
+        } catch (error) {
+          state.nativeFailed = true;
+          throw error;
+        }
+      } finally {
+        state.held -= 1;
+      }
+    };
+    window.fetch = wrappedFetch;
+    const release = (failed: boolean) => {
+      if (state.released) return;
+      state.failed = failed;
+      state.released = true;
+      releaseHold();
+    };
+    const dispose = () => {
+      release(true);
+      if (window.fetch === wrappedFetch) window.fetch = originalFetch;
+      if (expiry) clearTimeout(expiry);
+      observer.disconnect();
+      cancelAnimationFrame(frame);
+      window.removeEventListener("click", capture, true);
+    };
+    window.__idexalOsStoppingFault = { state, fail: () => release(true), dispose };
+  }, [workspaceId, sessionId]));
+
+  let disposed = false;
+  return {
+    async read() {
+      return seed.evalIn(app, browserScript((sessionId) => {
+        const fault = window.__idexalOsStoppingFault;
+        if (!fault) throw new Error("Stop feedback fault lost its document");
+        const root = [...document.querySelectorAll<HTMLElement>("[data-session-surface-id]")]
+          .find((candidate) => candidate.dataset.sessionSurfaceId === sessionId) ?? null;
+        const stopping = root?.querySelector<HTMLButtonElement>('button[aria-label="Stopping…"]') ?? null;
+        const retry = root?.querySelector<HTMLButtonElement>('button[aria-label="Stop"]') ?? null;
+        const run = root?.querySelector<HTMLButtonElement>('button[aria-label="Run task"]') ?? null;
+        const error = root?.querySelector<HTMLElement>('[data-testid="session-error-card"]') ?? null;
+        const aggregate = root?.querySelector<HTMLElement>("[data-tool-aggregate]") ?? null;
+        const composer: unknown = window.__idexalos?.slice("composer");
+        const snapshotQuery = composer && typeof composer === "object" && "snapshotQuery" in composer
+          ? composer.snapshotQuery
+          : null;
+        const visible = (element: HTMLElement | null) => {
+          if (!element) return false;
+          const rect = element.getBoundingClientRect();
+          const style = getComputedStyle(element);
+          return element.getClientRects().length > 0 && rect.width > 0 && rect.height > 0
+            && style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) > 0;
+        };
+        return {
+          ...fault.state,
+          stoppingVisible: visible(stopping),
+          stoppingDisabled: stopping?.disabled ?? false,
+          ariaBusy: stopping?.getAttribute("aria-busy") ?? null,
+          spinnerVisible: visible(stopping?.querySelector<HTMLElement>("svg.lucide-loader-circle.animate-spin") ?? null),
+          retryEnabled: Boolean(retry && visible(retry) && !retry.disabled),
+          runVisible: visible(run),
+          errorText: error?.innerText.replace(/\s+/g, " ").trim() ?? "",
+          aggregateText: aggregate?.innerText.replace(/\s+/g, " ").trim() ?? "",
+          snapshotMessageCount: snapshotQuery && typeof snapshotQuery === "object" && "dataMessageCount" in snapshotQuery
+            && typeof snapshotQuery.dataMessageCount === "number" ? snapshotQuery.dataMessageCount : 0,
+          surfaceError: composer && typeof composer === "object" && "error" in composer ? composer.error : null,
+        };
+      }, [sessionId]));
+    },
+    async fail() {
+      await seed.evalIn(app, () => {
+        const fault = window.__idexalOsStoppingFault;
+        if (!fault || fault.state.held < 1) throw new Error("No native Stop response is held");
+        fault.fail();
+      });
+    },
+    async [Symbol.asyncDispose]() {
+      if (disposed) return;
+      disposed = true;
+      await seed.evalIn(app, () => {
+        window.__idexalOsStoppingFault?.dispose();
+        delete window.__idexalOsStoppingFault;
+      });
+    },
+  };
+}
+
+export async function unfinishedToolsWeb(seed: Seed, options: { editRunning?: boolean } = {}) {
+  const engine = resolveEvalEngine();
+  const prompt = "Hold the native tool open for Stop feedback proof.";
+  const warmup = { prompt: "Create the Stop feedback fixture.", reply: "Stop feedback fixture ready." };
+  // Opt-in turns whose answers stream one chunk and then hold, so a person can
+  // edit or queue behind a turn that is still running.
+  const editRunning = {
+    original: "Review the initial draft EDIT-RUNNING", partial: "Review in progress.", neverReleased: "Unfinished answer that must never show.",
+    edited: "Review the corrected draft EDIT-RUNNING", answer: "Corrected review is ready.",
+    held: "Keep this turn running EDIT-RUNNING", heldPartial: "Still working on it.", followup: "A later follow-up EDIT-RUNNING",
+  };
+  const held = (promptMarker: string, partial: string): MockAgentWorkload => ({
+    promptMarker, latestUserTurn: true, steps: [], finalReply: `${partial} ${editRunning.neverReleased}`,
+    finalReplyChunks: [`${partial} `, editRunning.neverReleased], finalReplyInitiallyReleasedChunks: 1,
+  });
+  const base = await splitPaneQuestions(seed, "unfinished-tool-lifecycle", [
+    ...(options.editRunning ? [
+      held(editRunning.original, editRunning.partial),
+      { promptMarker: editRunning.edited, latestUserTurn: true, finalReply: editRunning.answer, steps: [] },
+      held(editRunning.held, editRunning.heldPartial),
+    ] : []),
+    { promptMarker: warmup.prompt, latestUserTurn: true, finalReply: warmup.reply, steps: [] },
+    {
+      promptMarker: prompt,
+      latestUserTurn: true,
+      finalReply: "The held tool finished without Stop.",
+      steps: [{ tool: engine === "v2" ? "shell" : "bash", arguments: {
+        command: "sleep 120",
+        description: "Hold the native tool for Stop feedback",
+        timeout: 180_000,
+      } }],
+    },
+  ], { permission: { bash: "allow" } }, "web");
+  const session = await seedSessionRetry(seed, base.app);
+  // v2 exposes live runs through /session/active ({ type: "running" }) rather than /session/status.
+  const statusPath = `/workspace/${encodeURIComponent(base.workspace.workspaceId)}`
+    + `/${engine === "v2" ? "opencode2/api/session/active" : "opencode/session/status"}`;
+  return {
+    ...base,
+    session,
+    prompt,
+    warmup,
+    editRunning,
+    engine,
+    startStopFault: () => stoppingFeedbackFault(seed, base.app, base.workspace.workspaceId, session.sessionId),
+    nativeStatus: () => seed.evalIn(base.app, browserScript(async (statusPath, sessionId) => {
+      const port = localStorage.getItem("idexal-os.server.port");
+      const token = localStorage.getItem("idexal-os.server.token");
+      const response = await fetch(`http://127.0.0.1:${port}${statusPath}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!response.ok) return `http-${response.status}`;
+      const payload: unknown = await response.json();
+      // v2 wraps its body in { data }; v1 answers with the bare status map.
+      const statuses: unknown = payload && typeof payload === "object" && "data" in payload ? payload.data : payload;
+      if (!statuses || typeof statuses !== "object") return "missing";
+      // The engine only lists sessions with live work; an absent session is idle.
+      if (!(sessionId in statuses)) return "idle";
+      const status: unknown = Object.entries(statuses).find(([id]) => id === sessionId)?.[1];
+      if (!status || typeof status !== "object" || !("type" in status) || typeof status.type !== "string") return "invalid";
+      return status.type === "running" ? "busy" : status.type;
+    }, [statusPath, session.sessionId]), { awaitPromise: true }),
+  };
+}
+
+/** Signed-in chat with a deterministic model and a scheduled desktop task. */
+export async function computerMentions(seed: Seed) {
+  const providerId = "computer-mentions-mock";
+  const modelId = "computer-mentions-model";
+  const mock = seed.mock({
+    allowUnauthenticatedMcp: true,
+    tools: [
+      {
+        name: "search_capabilities",
+        description: "Find a computer task capability.",
+        inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+        result: { content: [{ type: "text", text: JSON.stringify({ items: [{ name: "remote-session:create" }] }) }] },
+      },
+      {
+        name: "execute_capability",
+        description: "Start a task on the selected computer.",
+        inputSchema: { type: "object", properties: { name: { type: "string" }, body: { type: "object", properties: { target: { type: "string", enum: ["cloud", "desktop"] }, prompt: { type: "string" } }, required: ["target", "prompt"] } }, required: ["name", "body"] },
+        result: { content: [{ type: "text", text: JSON.stringify({ state: "queued", commandId: "computer-task-witness" }) }] },
+      },
+    ],
+    agentWorkloads: [
+      ...["cloud", "desktop"].map((target): MockAgentWorkload => ({
+        // Only the app's synthetic instruction contains this marker. Without routing, the model refuses the task.
+        promptMarker: `[The user selected @${target}:`,
+        finalReply: "Received computer task.",
+        steps: [
+          { tool: "computer_witness_search_capabilities", arguments: { query: "remote-session:create" } },
+          { tool: "computer_witness_execute_capability", arguments: {}, argumentsFrom: "computer-mention" },
+        ],
+      })),
+      { promptMarker: "COMPUTER-PLAIN-TASK", finalReply: "Received computer task.", steps: [] },
+    ],
+  });
+  const { den, webPort } = await denForAppWeb(seed, { mocks: { agent: mock }, env: { DEN_AUTOMATIONS_ENABLED: "true" } });
+  const created = await seed.api(den.admin, "/v1/automations", {
+    method: "POST",
+    body: JSON.stringify({
+      name: "Daily project summary",
+      instructions: "Summarize today's project notes.",
+      schedule: { kind: "daily", timezone: "UTC", hour: 23, minute: 59 },
+      model: { providerId: "opencode", modelId: "big-pickle", variant: null },
+    }),
+  });
+  if (created.response.status !== 201) throw new Error(`Automation setup failed: ${created.text}`);
+  const { app, workspace } = await signedInAppWeb(seed, { name: "computer-mentions", den, webPort, workspacePath: seed.tmpPath("computer-mentions") });
+  await configureProvider(seed, app, workspace.workspaceId, providerId, modelId, {
+    permission: { "computer_witness_*": "allow" },
+    mcp: { computer_witness: { type: "remote", url: den.mocks.agent.mcpUrl, enabled: true, oauth: false } },
+    provider: {
+      [providerId]: {
+        npm: "@ai-sdk/openai-compatible",
+        name: "Computer mentions mock",
+        options: { baseURL: `${den.mocks.agent.url}/v1`, apiKey: "sk-computer-mentions" },
+        models: { [modelId]: { name: "Computer mentions model" } },
+      },
+    },
+  });
+  const session = await seedSessionRetry(seed, app, { title: "Computer task mentions" });
+  return {
+    den, app, workspace, session,
+    async submittedParts() {
+      // TODO(primitive): inspect submitted engine parts, including synthetic routing instructions.
+      return seed.evalIn(app, browserScript(async (workspaceId) => {
+        const port = localStorage.getItem("idexal-os.server.port");
+        const token = localStorage.getItem("idexal-os.server.token");
+        const base = "http://127.0.0.1:" + port + "/workspace/" + encodeURIComponent(workspaceId) + "/opencode/session";
+        const headers = { Authorization: "Bearer " + token };
+        const listed = await fetch(base, { headers });
+        if (!listed.ok) throw new Error("Session list failed: " + listed.status);
+        const sessions = await listed.json();
+        const messages = [];
+        for (const session of sessions) {
+          const response = await fetch(base + "/" + encodeURIComponent(session.id) + "/message", { headers });
+          if (!response.ok) throw new Error("Transcript read failed: " + response.status);
+          messages.push(...await response.json());
+        }
+        messages.sort((a, b) => a.info.time.created - b.info.time.created);
+        return messages.filter((message) => message.info.role === "user").map((message) => ({
+          visible: message.parts.filter((part: { type: string; synthetic?: boolean; text: string }) => part.type === "text" && !part.synthetic).map((part: { text: string }) => part.text).join("").trim(),
+          routing: message.parts.filter((part: { type: string; synthetic?: boolean; text: string }) => part.type === "text" && part.synthetic).map((part: { text: string }) => part.text),
+        }));
+      }, [workspace.workspaceId]), { awaitPromise: true });
+    },
+  };
+}
+
+/** One profile across engine switches; the journey, not the seed, creates its history. */
+export async function workspaceEngineUpgrade(seed: Seed) {
+  if (resolveEvalEngine() !== "v1") throw new SkipError("upgrade baseline requires IDEXAL_EVAL_ENGINE=v1");
+  const live = liveOpenAiEnabled();
+  const orgName = "Workspace engine upgrade";
+  const mocks: Record<string, ReturnType<Seed["mock"]>> = live ? {} : { agent: seed.mock({ agentWorkloads: [{
+    promptMarker: "upgrade conversation",
+    finalReply: "Hello. Your upgrade conversation is working.",
+    finalReplyChunkSize: 3,
+    finalReplyDelayMs: 750,
+    steps: [],
+  }] }) };
+  const den = await seed.den({ org: { name: orgName }, mocks });
+  const managed = await provisionLiveOpenAi(den.admin, orgName);
+  try {
+    const primaryPath = seed.tmpPath("upgrade-primary");
+    const otherPath = seed.tmpPath("upgrade-after-switch");
+    const app = await seed.desktop({ den, as: "admin", workspacePath: primaryPath });
+    const request = async (path: string, method = "GET", body?: unknown) => {
+      const result = await seed.evalIn(app, browserScript(async (path, method, body) => {
+        const response = await fetch("http://127.0.0.1:" + localStorage.getItem("idexal-os.server.port") + path, {
+          method, headers: { Authorization: "Bearer " + localStorage.getItem("idexal-os.server.token"), "Content-Type": "application/json" },
+          body, signal: AbortSignal.timeout(30_000),
+        });
+        const json: unknown = await response.json();
+        return { status: response.status, json };
+      }, [path, method, body === undefined ? null : JSON.stringify(body)]), { awaitPromise: true, timeoutMs: 35_000 });
+      assertNoLiveSecret(result);
+      return result;
+    };
+    const providerId = live ? await liveProviderId(request, managed.id) : "workspace-upgrade-mock";
+    const modelId = live ? liveOpenAiModel() : "workspace-upgrade-model";
+    const primary = await seed.workspace(app, primaryPath);
+    const provider = !live ? { provider: { [providerId]: {
+      npm: "@ai-sdk/openai-compatible", name: "Upgrade mock",
+      options: { baseURL: `${den.mocks.agent.url}/v1`, apiKey: "sk-upgrade-fixture" },
+      models: { [modelId]: { name: "Upgrade model" } },
+    } } } : {};
+    await configureProvider(seed, app, primary.workspaceId, providerId, modelId, provider, "v1");
+    const paletteShortcut = await seed.evalIn(app, browserScript(() =>
+      /Mac|iPhone|iPad|iPod/.test(navigator.platform) ? "Meta+K" : "Control+K", []));
+    return {
+      app, den, primary, providerId, modelId, live, paletteShortcut,
+      async readFinalAnswerRows(): Promise<{ id: string; text: string }[]> {
+        // This journey requests plain-text answers. Reasoning folds into :steps;
+        // the answer keeps its native ID and has no timestamp/action children.
+        return seed.evalIn(app, browserScript(() => [...document.querySelectorAll<HTMLElement>(
+          '[data-message-role="assistant"][data-message-id]:not([data-message-id$=":steps"])',
+        )].filter(node => node.getClientRects().length && getComputedStyle(node).visibility !== "hidden")
+          .map(node => ({ id: node.getAttribute("data-message-id") ?? "", text: node.innerText.replace(/\s+/g, " ").trim() })), []));
+      },
+      async readRendererLifetime(): Promise<{ timeOrigin: number; now: number }> {
+        return seed.evalIn(app, browserScript(() => ({ timeOrigin: performance.timeOrigin, now: Date.now() }), []));
+      },
+      async readWorkspaceInventoryRefresh(workspaceId: string, engine: "v1" | "v2", since: number): Promise<{
+        route: string;
+        selectedWorkspaceId: string | null;
+        loading: boolean | null;
+        error: string | null;
+        sessionIds: string[];
+        requests: { path: string; status: number; startedAt: number; completedAt: number }[];
+      }> {
+        // Observe only renderer-owned inventory reads and sidebar state, never
+        // issue an API request that could satisfy the refresh witness itself.
+        return seed.evalIn(app, browserScript((workspaceId, engine, since) => {
+          const sessionPath = `/workspace/${workspaceId}/${engine === "v2" ? "opencode2/api" : "opencode"}/session`;
+          const route = window.__idexalos?.slice("route");
+          const workspace = route?.workspaces.find(workspace => workspace.id === workspaceId);
+          const requests = (window.__idexalos?.events(200) ?? []).flatMap(event => {
+            const data = event.data;
+            if (event.name !== "log.fetch" || typeof data !== "object" || data === null
+              || !("url" in data) || typeof data.url !== "string"
+              || !("method" in data) || data.method !== "GET"
+              || !("status" in data) || data.status !== 200
+              || !("durationMs" in data) || typeof data.durationMs !== "number"
+              || event.at - data.durationMs < since) return [];
+            const path = new URL(data.url, location.href).pathname;
+            return path === sessionPath ? [{ path, status: data.status, startedAt: event.at - data.durationMs, completedAt: event.at }] : [];
+          });
+          return {
+            route: location.hash.replace(/^#/, ""), selectedWorkspaceId: route?.selectedWorkspaceId ?? null,
+            loading: workspace?.loading ?? null,
+            error: workspace?.error ?? null,
+            sessionIds: (route?.sessionsByWorkspaceId[workspaceId] ?? []).map(session => session.id).sort(),
+            requests,
+          };
+        }, [workspaceId, engine, since]));
+      },
+      async createOtherWorkspace() {
+        const status = await request("/experimental/engine-v2-preview/status");
+        if (!isRecord(status.json) || status.json.chatRouting !== true || status.json.running !== true) {
+          throw new Error("Workspace B must be created only after the Settings switch to v2");
+        }
+        const other = await seed.workspace(app, otherPath, { create: true });
+        // Hot-mirror the mock without reloading the renderer or clearing pending rows.
+        // Live mode inherits its managed provider through normal organization sync.
+        if (!live && (await request(`/workspace/${other.workspaceId}/config`, "PATCH", { opencode: provider })).status !== 200) {
+          throw new Error("Could not configure workspace B's model");
+        }
+        return other;
+      },
+      async [Symbol.asyncDispose]() { await managed[Symbol.asyncDispose](); },
+    };
+  } catch (error) {
+    await managed[Symbol.asyncDispose]();
+    throw error;
+  }
+}
+
+/** A running conversation whose workspace skills can change through idexal Os. */
+export async function skillLifecycle(seed: Seed) {
+  const live = liveOpenAiEnabled();
+  const orgName = "Skill lifecycle";
+  const { den, webPort } = await denForAppWeb(seed, { org: { name: orgName }, mocks: { model: seed.mock({}) } });
+  const managed = await provisionLiveOpenAi(den.admin, orgName);
+  try {
+    const { app, workspace } = await signedInAppWeb(seed, { name: "skill-lifecycle", den, webPort, workspacePath: seed.tmpPath("skill-lifecycle") });
+    const request = async (path: string) => {
+      const response = await seed.evalIn(app, browserScript(async (path) => {
+        const response = await fetch("http://127.0.0.1:" + localStorage.getItem("idexal-os.server.port") + path, {
+          headers: { Authorization: "Bearer " + localStorage.getItem("idexal-os.server.token") },
+          signal: AbortSignal.timeout(10000),
+        });
+        return { status: response.status, json: await response.json() };
+      }, [path]), { awaitPromise: true });
+      if (!isRecord(response) || typeof response.status !== "number") throw new Error("Missing desktop response");
+      assertNoLiveSecret(response);
+      return { status: response.status, json: response.json };
+    };
+    const providerId = live ? await liveProviderId(request, managed.id) : "skill-lifecycle";
+    const modelId = live ? liveOpenAiModel() : "skill-lifecycle-model";
+    // This world arranges an opted-in native v2 conversation, including when
+    // invoked by the standard E2E command without an engine override.
+    await seed.evalIn(app, async () => {
+      const response = await fetch("http://127.0.0.1:" + localStorage.getItem("idexal-os.server.port") + "/experimental/engine-v2-preview", {
+        method: "PUT", headers: { Authorization: "Bearer " + localStorage.getItem("idexal-os.server.token"), "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: true, chatRouting: true }), signal: AbortSignal.timeout(180000),
+      });
+      if (!response.ok) throw new Error("Could not enable the native engine");
+      return true;
+    }, { awaitPromise: true, timeoutMs: 185_000 });
+    await configureProvider(seed, app, workspace.workspaceId, providerId, modelId, {
+      permission: { skill: "allow" },
+      ...(!live ? { provider: { [providerId]: {
+        npm: "@ai-sdk/openai-compatible", name: "Skill lifecycle model",
+        options: { baseURL: `${den.mocks.model.url}/v1`, apiKey: "eval-only-key" },
+        models: { [modelId]: { name: "Skill lifecycle model", tool_call: true } },
+      } } } : {}),
+    }, "v2");
+    const session = await seedSessionRetry(seed, app, { title: "Release report" });
+    // CDP keyboard input needs page focus even when the browser has none.
+    await app.client.send("Emulation.setFocusEmulationEnabled", { enabled: true });
+    const skillName = "release-briefing";
+    return {
+      app, den, workspace, session, skillName, live, modelId,
+      async prepareTurn(prompt: string) {
+        if (live) return;
+        const result = await fetch(`${den.mocks.model.url}/admin/agent-workloads`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ workloads: [{ latestUserTurn: true, promptMarker: prompt,
+            finalReply: "idexal Os: UNAVAILABLE", finalReplyFrom: "last-tool-text",
+            steps: [{ tool: "skill", argumentsFrom: "skill-catalog", arguments: { skill: skillName } }],
+          }] }),
+        });
+        if (!result.ok) throw new Error("Could not arrange model response");
+      },
+      /**
+       * Every completed reply in the conversation came from the arranged
+       * provider and model, never from an organization model that replaced it.
+       * Only a live provider reports token usage; the fixture model streams none.
+       */
+      async conversationState() {
+        const result = await request(`/workspace/${workspace.workspaceId}/opencode2/api/session/${session.sessionId}/message`);
+        const messages = isRecord(result.json) && Array.isArray(result.json.data) ? result.json.data.filter(isRecord) : [];
+        return {
+          users: messages.filter(message => message.type === "user").map(message => {
+            if (typeof message.text !== "string") throw new Error("Native user message is missing its text");
+            return message.text;
+          }),
+          completed: messages.filter(message => message.type === "assistant" && message.finish === "stop").map(message => message.id),
+        };
+      },
+      async usedConfiguredModel() {
+        const result = await request(`/workspace/${workspace.workspaceId}/opencode2/api/session/${session.sessionId}/message`);
+        const messages = isRecord(result.json) && Array.isArray(result.json.data) ? result.json.data.filter(isRecord) : [];
+        const replies = messages.filter(message => message.type === "assistant" && message.finish === "stop");
+        return replies.length > 0 && replies.every(message => isRecord(message.model)
+          && message.model.id === modelId && message.model.providerID === providerId
+          && (!live || (isRecord(message.tokens) && typeof message.tokens.output === "number" && message.tokens.output > 0)));
+      },
+      async runtimeIdentity() {
+        const result = await request("/experimental/engine-v2-preview/status");
+        if (!isRecord(result.json) || result.json.running !== true || result.json.chatRouting !== true
+          || typeof result.json.pid !== "number") throw new Error("The v2 conversation runtime is not running");
+        return result.json.pid;
+      },
+      async [Symbol.asyncDispose]() { await managed[Symbol.asyncDispose](); },
+    };
+  } catch (error) {
+    await managed[Symbol.asyncDispose]();
+    throw error;
+  }
+}
+
+export const emojiShortcodesMarker = "EMOJI_SHORTCODES_ANSWER";
+/** Real GitHub shortcodes next to plain words that only look like shortcodes. */
+export const emojiShortcodesAnswer = "Shipped :rocket: :fire: :white_check_mark:\n\nBack :home: for a :test: run.";
+export const emojiShortcodesRendered = "Shipped 🚀 🔥 ✅";
+export const emojiShortcodesPlainLine = "Back :home: for a :test: run.";
+
+/** An answer that mixes emoji shortcodes with words wrapped in colons. */
+export async function emojiShortcodesChat(seed: Seed) {
+  const providerId = "emoji-shortcodes-mock";
+  const modelId = "emoji-shortcodes-model";
+  const mock = seed.mock({
+    agentWorkloads: [{ promptMarker: emojiShortcodesMarker, latestUserTurn: true, finalReply: emojiShortcodesAnswer, steps: [] }],
+  });
+  const workspacePath = seed.tmpPath("emoji-shortcodes");
+  const app = await seed.appWeb({ name: "emoji-shortcodes", workspacePath, mocks: { agent: mock } });
+  const agentMock = app.mocks.agent;
+  if (!agentMock) throw new Error("The app-web fixture did not boot its emoji-shortcodes model.");
+  const workspace = await seed.workspace(app, workspacePath);
+  await configureProvider(seed, app, workspace.workspaceId, providerId, modelId, { provider: {
+    [providerId]: {
+      npm: "@ai-sdk/openai-compatible", name: "Emoji shortcodes mock",
+      options: { baseURL: `${agentMock.url}/v1`, apiKey: "sk-emoji-shortcodes" },
+      models: { [modelId]: { name: "Emoji shortcodes model" } },
+    },
+  } });
+  return { app, workspace };
+}

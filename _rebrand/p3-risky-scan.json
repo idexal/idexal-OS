@@ -1,0 +1,2382 @@
+[
+ {
+  "file": ".opencode\\skills\\browser-automation\\SKILL.md",
+  "line": 65,
+  "ctx": "2. Select the `IdexalOs` target ID."
+ },
+ {
+  "file": ".opencode\\skills\\browser-automation\\SKILL.md",
+  "line": 102,
+  "ctx": "- A successful local attach should show an `IdexalOs` target at `http://127.0.0.1:9823`."
+ },
+ {
+  "file": ".opencode\\skills\\create-plugin\\SKILL.md",
+  "line": 14,
+  "ctx": "- User wants to extend IdexalOs/OpenCode with custom tools"
+ },
+ {
+  "file": ".opencode\\skills\\daytona-windows-cert\\scripts\\ca-probe.js",
+  "line": 4,
+  "ctx": "const needle = (process.env.IDEXAL_TLS_REPRO_CA_MATCH || \"IdexalOs TLS Repro\").toLowerCase();"
+ },
+ {
+  "file": ".opencode\\skills\\daytona-windows-cert\\SKILL.md",
+  "line": 214,
+  "ctx": "const needle = (process.env.IDEXAL_TLS_REPRO_CA_MATCH || \"IdexalOs TLS Repro\").toLowerCase();"
+ },
+ {
+  "file": ".opencode\\skills\\drive-desktop-cdp\\scripts\\cdp.mjs",
+  "line": 22,
+  "ctx": "const target = targets.find((t) => t.type === \"page\" && t.title === \"IdexalOs\") ?? targets.find((t) => t.type === \"page\");"
+ },
+ {
+  "file": ".opencode\\skills\\hunt-a-prod-error\\SKILL.md",
+  "line": 57,
+  "ctx": "npx --yes @electron/asar extract-file /Applications/IdexalOs.app/Contents/Resources/app.asar server/dist/server.js"
+ },
+ {
+  "file": ".opencode\\skills\\validate-a-release\\SKILL.md",
+  "line": 28,
+  "ctx": "export ENT=\"$R/enterprise-$V/IdexalOs Enterprise.app\" CLOUD=\"$R/cloud-$V/IdexalOs Cloud.app\""
+ },
+ {
+  "file": "apps\\app\\src\\app\\lib\\desktop.ts",
+  "line": 622,
+  "ctx": "appName: \"IdexalOs\","
+ },
+ {
+  "file": "apps\\app\\src\\app\\lib\\inference-access.ts",
+  "line": 133,
+  "ctx": "return version ? `IdexalOs v${version} or newer` : \"IdexalOs\";"
+ },
+ {
+  "file": "apps\\app\\src\\components\\chat\\code-mode-tool.tsx",
+  "line": 82,
+  "ctx": "if (call.toolName.startsWith(\"idexal-os-cloud_\")) return \"IdexalOs Cloud\";"
+ },
+ {
+  "file": "apps\\app\\src\\components\\chat\\credential-prompt-card.tsx",
+  "line": 188,
+  "ctx": ": blocked === \"signed_out\" ? \"Sign in to IdexalOs Cloud to add this key here.\""
+ },
+ {
+  "file": "apps\\app\\src\\components\\chat\\credential-prompt-card.tsx",
+  "line": 189,
+  "ctx": ": blocked === \"off\" ? \"Adding keys in chat is off for your organization. Use IdexalOs Cloud instead.\""
+ },
+ {
+  "file": "apps\\app\\src\\components\\chat\\credential-prompt-card.tsx",
+  "line": 192,
+  "ctx": ": blocked === \"unverified\" ? \"IdexalOs couldn't check whether keys can be added here. Use IdexalOs Cloud instead.\""
+ },
+ {
+  "file": "apps\\app\\src\\components\\chat\\mcp-app-frame.tsx",
+  "line": 518,
+  "ctx": "{ name: \"IdexalOs\", version: \"1.0.0\" },"
+ },
+ {
+  "file": "apps\\app\\src\\components\\tools\\error-attribution.ts",
+  "line": 282,
+  "ctx": "errorText.includes(\"IdexalOs stopped waiting after\")"
+ },
+ {
+  "file": "apps\\app\\src\\components\\tools\\error-attribution.ts",
+  "line": 337,
+  "ctx": "if (attribution?.label === \"Blocked by IdexalOs\") return \"This action is blocked by your workspace settings.\""
+ },
+ {
+  "file": "apps\\app\\src\\components\\tools\\idexal-os-automation-proposal.tsx",
+  "line": 191,
+  "ctx": "{blocker ?? (placement === \"cloud\" ? \"Automations run headlessly in IdexalOs Cloud.\" : \"Automations run on this desktop while it is connected.\")}"
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\ca.ts",
+  "line": 474,
+  "ctx": "\"settings.environment.apply_confirm_body\": \"IdexalOs will restart local agents so they can use the latest environment. Running local tasks may stop.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\ca.ts",
+  "line": 475,
+  "ctx": "\"settings.environment.apply_no_local_workspace\": \"IdexalOs is not connected to a local workspace.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\ca.ts",
+  "line": 479,
+  "ctx": "\"settings.environment.apply_refresh_failed\": \"Changes are active, but IdexalOs status did not refresh. Reopen the app if it looks stale.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\ca.ts",
+  "line": 500,
+  "ctx": "\"settings.environment.override_hint\": \"Environment variables set before IdexalOs starts take precedence over values saved here.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\ca.ts",
+  "line": 508,
+  "ctx": "\"settings.environment.validation_reserved\": \"IDEXAL_ and OPENCODE_ names are managed by IdexalOs/OpenCode.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\en.ts",
+  "line": 232,
+  "ctx": "\"connect.diagnostics_mcp_description_effective\": \"The engine's merged configuration and IdexalOs-managed dynamic injection intent are shown separately. Runtime rows include exact registration outcomes"
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\en.ts",
+  "line": 478,
+  "ctx": "\"context_panel.permission_source_idexalos\": \"IdexalOs\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\en.ts",
+  "line": 1857,
+  "ctx": "\"settings.nuke_survives_app\": \"The installed IdexalOs app and protocol registration stay installed.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\en.ts",
+  "line": 2053,
+  "ctx": "\"settings.environment.override_hint\": \"Environment variables set before IdexalOs starts take precedence over values saved here.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\en.ts",
+  "line": 2061,
+  "ctx": "\"settings.environment.apply_confirm_body\": \"IdexalOs will restart local agents so they can use the latest environment. Running local tasks may stop.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\en.ts",
+  "line": 2062,
+  "ctx": "\"settings.environment.apply_no_local_workspace\": \"IdexalOs is not connected to a local workspace.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\en.ts",
+  "line": 2066,
+  "ctx": "\"settings.environment.apply_refresh_failed\": \"Changes are active, but IdexalOs status did not refresh. Reopen the app if it looks stale.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\en.ts",
+  "line": 2079,
+  "ctx": "\"settings.environment.validation_reserved\": \"IDEXAL_ and OPENCODE_ names are managed by IdexalOs/OpenCode.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\es.ts",
+  "line": 474,
+  "ctx": "\"settings.environment.apply_confirm_body\": \"IdexalOs will restart local agents so they can use the latest environment. Running local tasks may stop.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\es.ts",
+  "line": 475,
+  "ctx": "\"settings.environment.apply_no_local_workspace\": \"IdexalOs is not connected to a local workspace.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\es.ts",
+  "line": 479,
+  "ctx": "\"settings.environment.apply_refresh_failed\": \"Changes are active, but IdexalOs status did not refresh. Reopen the app if it looks stale.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\es.ts",
+  "line": 500,
+  "ctx": "\"settings.environment.override_hint\": \"Environment variables set before IdexalOs starts take precedence over values saved here.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\es.ts",
+  "line": 508,
+  "ctx": "\"settings.environment.validation_reserved\": \"IDEXAL_ and OPENCODE_ names are managed by IdexalOs/OpenCode.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\fr.ts",
+  "line": 107,
+  "ctx": "\"den.error_no_token\": \"La connexion desktop a été terminée, mais IdexalOs Cloud n'a pas renvoyé de jeton de session.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\fr.ts",
+  "line": 474,
+  "ctx": "\"settings.environment.apply_confirm_body\": \"IdexalOs will restart local agents so they can use the latest environment. Running local tasks may stop.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\fr.ts",
+  "line": 475,
+  "ctx": "\"settings.environment.apply_no_local_workspace\": \"IdexalOs is not connected to a local workspace.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\fr.ts",
+  "line": 479,
+  "ctx": "\"settings.environment.apply_refresh_failed\": \"Changes are active, but IdexalOs status did not refresh. Reopen the app if it looks stale.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\fr.ts",
+  "line": 500,
+  "ctx": "\"settings.environment.override_hint\": \"Environment variables set before IdexalOs starts take precedence over values saved here.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\fr.ts",
+  "line": 508,
+  "ctx": "\"settings.environment.validation_reserved\": \"IDEXAL_ and OPENCODE_ names are managed by IdexalOs/OpenCode.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\ja.ts",
+  "line": 484,
+  "ctx": "\"settings.environment.override_hint\": \"IdexalOs 起動前に設定済みの環境変数は、ここで保存した値より優先されます。\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\ja.ts",
+  "line": 491,
+  "ctx": "\"settings.environment.apply_confirm_body\": \"IdexalOs はローカルエージェントを再起動し、最新の環境変数を使えるようにします。実行中のローカルタスクは停止する場合があります。\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\ja.ts",
+  "line": 492,
+  "ctx": "\"settings.environment.apply_no_local_workspace\": \"IdexalOs はローカルワークスペースに接続されていません。\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\ja.ts",
+  "line": 496,
+  "ctx": "\"settings.environment.apply_refresh_failed\": \"変更は有効になりましたが、IdexalOs の状態を更新できませんでした。表示が古い場合はアプリを開き直してください。\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\ja.ts",
+  "line": 508,
+  "ctx": "\"settings.environment.validation_reserved\": \"IDEXAL_ / OPENCODE_ の名前は IdexalOs/OpenCode が管理します。\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\pt-BR.ts",
+  "line": 474,
+  "ctx": "\"settings.environment.apply_confirm_body\": \"IdexalOs will restart local agents so they can use the latest environment. Running local tasks may stop.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\pt-BR.ts",
+  "line": 475,
+  "ctx": "\"settings.environment.apply_no_local_workspace\": \"IdexalOs is not connected to a local workspace.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\pt-BR.ts",
+  "line": 479,
+  "ctx": "\"settings.environment.apply_refresh_failed\": \"Changes are active, but IdexalOs status did not refresh. Reopen the app if it looks stale.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\pt-BR.ts",
+  "line": 500,
+  "ctx": "\"settings.environment.override_hint\": \"Environment variables set before IdexalOs starts take precedence over values saved here.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\pt-BR.ts",
+  "line": 508,
+  "ctx": "\"settings.environment.validation_reserved\": \"IDEXAL_ and OPENCODE_ names are managed by IdexalOs/OpenCode.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\ru.ts",
+  "line": 699,
+  "ctx": "\"settings.environment.override_hint\": \"Переменные окружения, заданные до запуска IdexalOs, имеют приоритет над значениями, сохраненными здесь.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\ru.ts",
+  "line": 706,
+  "ctx": "\"settings.environment.apply_confirm_body\": \"IdexalOs перезапустит локальных агентов, чтобы они использовали актуальное окружение. Выполняющиеся локальные задачи могут остановиться.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\ru.ts",
+  "line": 707,
+  "ctx": "\"settings.environment.apply_no_local_workspace\": \"IdexalOs не подключен к локальному workspace.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\ru.ts",
+  "line": 711,
+  "ctx": "\"settings.environment.apply_refresh_failed\": \"Изменения активны, но статус IdexalOs не обновился. Если выглядит устаревшим, перезапустите приложение.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\ru.ts",
+  "line": 723,
+  "ctx": "\"settings.environment.validation_reserved\": \"Имена IDEXAL_ и OPENCODE_ управляются IdexalOs/OpenCode.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\th.ts",
+  "line": 475,
+  "ctx": "\"settings.environment.apply_confirm_body\": \"IdexalOs will restart local agents so they can use the latest environment. Running local tasks may stop.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\th.ts",
+  "line": 476,
+  "ctx": "\"settings.environment.apply_no_local_workspace\": \"IdexalOs is not connected to a local workspace.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\th.ts",
+  "line": 480,
+  "ctx": "\"settings.environment.apply_refresh_failed\": \"Changes are active, but IdexalOs status did not refresh. Reopen the app if it looks stale.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\th.ts",
+  "line": 501,
+  "ctx": "\"settings.environment.override_hint\": \"Environment variables set before IdexalOs starts take precedence over values saved here.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\th.ts",
+  "line": 509,
+  "ctx": "\"settings.environment.validation_reserved\": \"IDEXAL_ and OPENCODE_ names are managed by IdexalOs/OpenCode.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\vi.ts",
+  "line": 475,
+  "ctx": "\"settings.environment.apply_confirm_body\": \"IdexalOs will restart local agents so they can use the latest environment. Running local tasks may stop.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\vi.ts",
+  "line": 476,
+  "ctx": "\"settings.environment.apply_no_local_workspace\": \"IdexalOs is not connected to a local workspace.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\vi.ts",
+  "line": 480,
+  "ctx": "\"settings.environment.apply_refresh_failed\": \"Changes are active, but IdexalOs status did not refresh. Reopen the app if it looks stale.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\vi.ts",
+  "line": 501,
+  "ctx": "\"settings.environment.override_hint\": \"Environment variables set before IdexalOs starts take precedence over values saved here.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\vi.ts",
+  "line": 509,
+  "ctx": "\"settings.environment.validation_reserved\": \"IDEXAL_ and OPENCODE_ names are managed by IdexalOs/OpenCode.\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\zh.ts",
+  "line": 495,
+  "ctx": "\"settings.environment.override_hint\": \"IdexalOs 启动前已经存在的环境变量，会优先于这里保存的值。\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\zh.ts",
+  "line": 502,
+  "ctx": "\"settings.environment.apply_confirm_body\": \"IdexalOs 会重启本机 agents，让它们使用最新环境变量。正在运行的本机任务可能会停止。\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\zh.ts",
+  "line": 503,
+  "ctx": "\"settings.environment.apply_no_local_workspace\": \"IdexalOs 尚未连接到本机工作区。\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\zh.ts",
+  "line": 507,
+  "ctx": "\"settings.environment.apply_refresh_failed\": \"更改已生效，但 IdexalOs 状态没有刷新。如果界面看起来过期，请重新打开应用。\","
+ },
+ {
+  "file": "apps\\app\\src\\i18n\\locales\\zh.ts",
+  "line": 519,
+  "ctx": "\"settings.environment.validation_reserved\": \"IDEXAL_ 和 OPENCODE_ 名称由 IdexalOs/OpenCode 管理。\","
+ },
+ {
+  "file": "apps\\app\\src\\lib\\capability-call.ts",
+  "line": 79,
+  "ctx": "const BRAND_WORDS: Record<string, string> = { idexalos: \"IdexalOs\", github: \"GitHub\", gitlab: \"GitLab\", hubspot: \"HubSpot\" }"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\automations\\automation-editor.tsx",
+  "line": 122,
+  "ctx": "if (choice === \"computer\") return \"Needs IdexalOs open on one of your computers at the scheduled time.\""
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\automations\\automations-page.tsx",
+  "line": 318,
+  "ctx": ": createPlacement === \"cloud\" ? \"Runs on your cloud computer. The schedule starts as soon as you create it.\" : \"Runs on your desktop computer. Keep IdexalOs open and connected at the scheduled time.\"}"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\automations\\automations-page.tsx",
+  "line": 590,
+  "ctx": "<CardDescription>{detail.revision.executionTarget === \"cloud\" ? \"Runs on your cloud computer, even when your desktop is offline.\" : \"Runs on your desktop computer. Keep IdexalOs open and connected at "
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\cloud\\brand-theme.tsx",
+  "line": 89,
+  "ctx": "return useOrgRestrictions().brandAppName ?? \"IdexalOs\";"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\cloud\\den-signin-surface.tsx",
+  "line": 75,
+  "ctx": "const appName = props.appName?.trim() || \"IdexalOs\";"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\cloud\\desktop-config-provider.tsx",
+  "line": 351,
+  "ctx": "document.title = appName ?? \"IdexalOs\";"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\cloud\\forced-signin-page.tsx",
+  "line": 53,
+  "ctx": "const appName = bootstrap.brandAppName?.trim() || \"IdexalOs\";"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\connections\\cloud-mcp-reconciler.ts",
+  "line": 501,
+  "ctx": "if (code.includes(\"tool_ids\") || code.includes(\"client_registration\")) return \"IdexalOs components need updating\";"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\connections\\cloud-mcp-reconciler.ts",
+  "line": 525,
+  "ctx": "if (code.includes(\"scope\")) return \"Reconnect IdexalOs Cloud with the required permissions.\";"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\connections\\cloud-mcp-reconciler.ts",
+  "line": 528,
+  "ctx": "if (code.includes(\"tool_ids\") || code.includes(\"client_registration\")) return \"Update IdexalOs, then retry.\";"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\connections\\cloud-mcp-reconciler.ts",
+  "line": 529,
+  "ctx": "if (code === \"extensions_plugin_missing\") return \"Reload the agent so IdexalOs instructions are current.\";"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\connections\\cloud-mcp-reconciler.ts",
+  "line": 530,
+  "ctx": "if (code === \"cloud_tools_missing\") return \"Reconnect IdexalOs Cloud so the endpoint exposes search_capabilities and execute_capability.\";"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\connections\\provider-auth\\provider-auth-modal.tsx",
+  "line": 57,
+  "ctx": "idexalos: \"IdexalOs\","
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\connections\\provider-auth\\store.ts",
+  "line": 1956,
+  "ctx": ".join(\", \")}) but the IdexalOs server is not available.`,"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\dashboard\\dashboard-apps.tsx",
+  "line": 92,
+  "ctx": "{chooser === \"existing\" && built.ready ? <div><BuiltAppPicker key={JSON.stringify(scope)} built={built} onAdded={() => setChooser(null)} />{canManage && available ? <div className=\"flex gap-2 border-t"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\models\\catalog.ts",
+  "line": 34,
+  "ctx": "// Zen with the person's own key or subscription (IdexalOs, `opencode auth login`, env or config) is a real"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\models\\model-catalog.ts",
+  "line": 205,
+  "ctx": "add(\"IdexalOs Models\", available.filter((option) => option.providerID === \"idexalos\" || option.providerID === AUTO_PROVIDER_ID));"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\models\\model-search.ts",
+  "line": 40,
+  "ctx": "anthropic: \"Anthropic\", openai: \"OpenAI\", google: \"Google\", openrouter: \"OpenRouter\", idexalos: \"IdexalOs\","
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\session\\surface\\mcp-chat-reconnect.ts",
+  "line": 238,
+  "ctx": "if (error instanceof Error && error.message.startsWith(\"The active IdexalOs Cloud account changed\")) throw error"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\session\\surface\\session-surface.tsx",
+  "line": 681,
+  "ctx": "const header = message.role === \"user\" ? \"You\" : message.role === \"assistant\" ? \"IdexalOs\" : message.role;"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\session\\sync\\env-context.ts",
+  "line": 56,
+  "ctx": "\"IdexalOs environment variables configured:\","
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\session\\sync\\session-error.ts",
+  "line": 146,
+  "ctx": "if (kind === \"database-error\") return \"IdexalOs couldn’t access its saved data\";"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\settings\\pages\\cloud-providers-view.tsx",
+  "line": 151,
+  "ctx": ": `${imported?.source === \"idexal_os_gateway\" ? \"IdexalOs Gateway\" : \"Organization credential\"} · ${provider.credentialMode === \"per_member\" ? \"Each member signs in\" : \"Shared org key\"}`;"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\settings\\pages\\cloud-providers-view.tsx",
+  "line": 178,
+  "ctx": "detail: provider.source === \"idexal_os_gateway\" ? \"IdexalOs Gateway · Organization credential\" : \"Managed in Den\","
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\settings\\pages\\debug-view.tsx",
+  "line": 263,
+  "ctx": "<div className=\"text-[11px] text-dls-secondary\">Command, working directory, and IdexalOs-injected environment.</div>"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\settings\\pages\\mcp-view.tsx",
+  "line": 1254,
+  "ctx": "connectedLabel={detailSkill.origin === \"idexal-os-connect\" ? \"Available through IdexalOs Connect\" : undefined}"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\domains\\settings\\pages\\preferences-view.tsx",
+  "line": 62,
+  "ctx": "{ value: \"idexalos\", label: \"IdexalOs\" },"
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\shell\\control\\control-provider.tsx",
+  "line": 350,
+  "ctx": "title: \"IdexalOs\","
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\shell\\idexal-os-context-projector.ts",
+  "line": 134,
+  "ctx": "title: screen.kind === \"settings\" ? `${screen.panel} settings` : \"IdexalOs\","
+ },
+ {
+  "file": "apps\\app\\src\\react-app\\shell\\shell-config.tsx",
+  "line": 40,
+  "ctx": "appName: \"IdexalOs\","
+ },
+ {
+  "file": "apps\\app\\tests\\app-error-boundary.test.tsx",
+  "line": 110,
+  "ctx": "const packaged = \"    at render (file:///Applications/IdexalOs.app/Contents/Resources/app/dist/assets/index-abc.js:1:2345)\";"
+ },
+ {
+  "file": "apps\\app\\tests\\env-context.test.ts",
+  "line": 101,
+  "ctx": "expect(env).toContain(\"IdexalOs environment variables configured:\");"
+ },
+ {
+  "file": "apps\\app\\tests\\env-context.test.ts",
+  "line": 115,
+  "ctx": "expect(context).not.toContain(\"IdexalOs environment variables configured:\");"
+ },
+ {
+  "file": "apps\\app\\tests\\message-list-model-footer.test.tsx",
+  "line": 123,
+  "ctx": "expect(label?.querySelector('svg[aria-label=\"IdexalOs\"]')).not.toBeNull()"
+ },
+ {
+  "file": "apps\\app\\tests\\message-list-model-footer.test.tsx",
+  "line": 124,
+  "ctx": "expect(label?.querySelector('svg[aria-label=\"IdexalOs\"]')?.closest('[aria-hidden=\"true\"]')).not.toBeNull()"
+ },
+ {
+  "file": "apps\\app\\tests\\provider-icon.test.ts",
+  "line": 21,
+  "ctx": "expect(markup).toContain('aria-label=\"IdexalOs\"');"
+ },
+ {
+  "file": "apps\\app\\tests\\provider-icon.test.ts",
+  "line": 32,
+  "ctx": "{ providerId: \"550e8400-e29b-41d4-a716-446655440000\", providerName: \"IdexalOs\" },"
+ },
+ {
+  "file": "apps\\app\\tests\\provider-icon.test.ts",
+  "line": 81,
+  "ctx": "expect(markup).not.toContain('aria-label=\"IdexalOs\"');"
+ },
+ {
+  "file": "apps\\app\\tests\\session-ownership.test.ts",
+  "line": 10,
+  "ctx": "const WORKSPACE = \"/var/folders/synthetic/IdexalOs Chat\";"
+ },
+ {
+  "file": "apps\\desktop\\electron\\brand-icon-windows.mjs",
+  "line": 70,
+  "ctx": "const safeName = String(appName ?? \"IdexalOs\")"
+ },
+ {
+  "file": "apps\\desktop\\electron\\brand-icon-windows.mjs",
+  "line": 72,
+  "ctx": ".trim() || \"IdexalOs\";"
+ },
+ {
+  "file": "apps\\desktop\\electron\\brand-icon-windows.mjs",
+  "line": 77,
+  "ctx": "const safeName = String(appName ?? \"IdexalOs\")"
+ },
+ {
+  "file": "apps\\desktop\\electron\\brand-icon-windows.mjs",
+  "line": 79,
+  "ctx": ".trim() || \"IdexalOs\";"
+ },
+ {
+  "file": "apps\\desktop\\electron\\browser-panel.mjs",
+  "line": 930,
+  "ctx": "if (!restoreTabId && registry.size() >= 100) throw new Error(\"IdexalOs has 100 saved browser tabs. Close an unused tab, then try again.\");"
+ },
+ {
+  "file": "apps\\desktop\\electron\\desktop-distribution.mjs",
+  "line": 3,
+  "ctx": "appName: \"IdexalOs\","
+ },
+ {
+  "file": "apps\\desktop\\electron\\runtime.mjs",
+  "line": 1186,
+  "ctx": "if (typeof logInfo === \"function\") logInfo(\"IdexalOs runtime: chain repair disabled by IDEXAL_DISABLE_CHAIN_REPAIR.\");"
+ },
+ {
+  "file": "apps\\desktop\\electron\\runtime.mjs",
+  "line": 1224,
+  "ctx": "if (typeof logInfo === \"function\") logInfo(`IdexalOs runtime: chain ok for ${origin}`);"
+ },
+ {
+  "file": "apps\\desktop\\electron\\runtime.mjs",
+  "line": 1228,
+  "ctx": "if (typeof logInfo === \"function\") logInfo(`IdexalOs runtime: chain repair skipped for ${origin}: ${strictError}`);"
+ },
+ {
+  "file": "apps\\desktop\\electron\\runtime.mjs",
+  "line": 1234,
+  "ctx": "if (typeof logInfo === \"function\") logInfo(`IdexalOs runtime: chain repair skipped for ${origin}: certificate introspection failed`);"
+ },
+ {
+  "file": "apps\\desktop\\electron\\runtime.mjs",
+  "line": 1238,
+  "ctx": "if (typeof logInfo === \"function\") logInfo(`IdexalOs runtime: chain repair skipped for ${origin}: served chain includes an intermediate`);"
+ },
+ {
+  "file": "apps\\desktop\\electron\\runtime.mjs",
+  "line": 1244,
+  "ctx": "if (typeof logInfo === \"function\") logInfo(`IdexalOs runtime: chain repair skipped for ${origin}: no CA Issuers AIA URL`);"
+ },
+ {
+  "file": "apps\\desktop\\electron\\runtime.mjs",
+  "line": 1259,
+  "ctx": "if (typeof logInfo === \"function\") logInfo(`IdexalOs runtime: chain repair refused for ${origin}: ${reason}`);"
+ },
+ {
+  "file": "apps\\desktop\\electron\\runtime.mjs",
+  "line": 1923,
+  "ctx": "throw new Error(`Cannot find IdexalOs embedded server bundle. Checked: ${candidates.join(\", \")}`);"
+ },
+ {
+  "file": "apps\\desktop\\electron\\updater.test.mjs",
+  "line": 381,
+  "ctx": "await writeFile(metadataPath, JSON.stringify({ ...metadata, url: \"https://tampered.invalid/IdexalOs.dmg\" }), \"utf8\");"
+ },
+ {
+  "file": "apps\\desktop\\electron\\workspace-store.mjs",
+  "line": 791,
+  "ctx": "const folderPath = await normalizeLocalWorkspacePath(path.join(home, \"IdexalOs Chat\"));"
+ },
+ {
+  "file": "apps\\desktop\\electron-builder.cloud.yml",
+  "line": 3,
+  "ctx": "productName: IdexalOs Cloud"
+ },
+ {
+  "file": "apps\\desktop\\electron-builder.demo-a.yml",
+  "line": 3,
+  "ctx": "productName: IdexalOs Demo A"
+ },
+ {
+  "file": "apps\\desktop\\electron-builder.demo-b.yml",
+  "line": 3,
+  "ctx": "productName: IdexalOs Demo B"
+ },
+ {
+  "file": "apps\\desktop\\electron-builder.enterprise.yml",
+  "line": 3,
+  "ctx": "productName: IdexalOs Enterprise"
+ },
+ {
+  "file": "apps\\desktop\\electron-builder.yml",
+  "line": 3,
+  "ctx": "productName: IdexalOs"
+ },
+ {
+  "file": "apps\\desktop\\package.json",
+  "line": 8,
+  "ctx": "\"name\": \"IdexalOs\","
+ },
+ {
+  "file": "apps\\review\\components\\launch-preview.tsx",
+  "line": 133,
+  "ctx": "const serviceNames: Record<string, string> = { webUrl: \"IdexalOs\", denWeb: \"Den dashboard\", denApi: \"Den API\", idexalOsUrl: \"IdexalOs engine\", gatewayUrl: \"AI Gateway\", desktopUrl: \"Desktop app\" };"
+ },
+ {
+  "file": "apps\\review\\components\\launch-preview.tsx",
+  "line": 153,
+  "ctx": "<option value=\"app-web\" disabled={provider && !provider.worlds.includes(\"app-web\")}>IdexalOs web</option>"
+ },
+ {
+  "file": "apps\\review\\components\\launch-preview.tsx",
+  "line": 196,
+  "ctx": "{provider?.id === \"daytona\" ? <p>Daytona opens a fresh IdexalOs web app and local engine from this report’s commit. Desktop and ACME worlds are not available on Daytona yet. Each launch has private ac"
+ },
+ {
+  "file": "apps\\review\\README.md",
+  "line": 137,
+  "ctx": "Freestyle keeps its existing preview worlds. Fresh Daytona previews currently support **IdexalOs web only**: a new private Linux VM running the web app and local engine from the report's exact fetchab"
+ },
+ {
+  "file": "apps\\server\\scripts\\npm-web-smoke.mjs",
+  "line": 105,
+  "ctx": "while (!/IdexalOs web UI: /.test(output)) {"
+ },
+ {
+  "file": "apps\\server\\scripts\\npm-web-smoke.mjs",
+  "line": 122,
+  "ctx": "if (page.status !== 200 || !page.text.includes(\"<title>IdexalOs</title>\")) fail(`/ returned ${page.status}`);"
+ },
+ {
+  "file": "apps\\server\\src\\agent-context-diagnostics.ts",
+  "line": 341,
+  "ctx": "artifacts: prompt.includes(\"## IdexalOs Artifacts\"),"
+ },
+ {
+  "file": "apps\\server\\src\\agent-context-diagnostics.ts",
+  "line": 731,
+  "ctx": "message = \"IdexalOs Cloud returned a response that does not satisfy the bounded MCP handshake protocol contract.\";"
+ },
+ {
+  "file": "apps\\server\\src\\agent-context-diagnostics.ts",
+  "line": 873,
+  "ctx": "message: \"The IdexalOs Cloud endpoint completed a credential-free TLS handshake; use the differential check for authentication, MCP protocol, and engine-registration attribution.\","
+ },
+ {
+  "file": "apps\\server\\src\\agent-context-diagnostics.ts",
+  "line": 1700,
+  "ctx": ": \"The effective OpenCode agent policy does not deny either required IdexalOs Cloud candidate tool ID; the live engine tool registry was not read.\","
+ },
+ {
+  "file": "apps\\server\\src\\env-file.ts",
+  "line": 17,
+  "ctx": "// is for service credentials, not IdexalOs/OpenCode runtime knobs; users who"
+ },
+ {
+  "file": "apps\\server\\src\\env-file.ts",
+  "line": 259,
+  "ctx": "? `Environment variable name is reserved for IdexalOs internals: ${key}`"
+ },
+ {
+  "file": "apps\\server\\src\\extensions\\cloud-uploads.ts",
+  "line": 289,
+  "ctx": "throw new ApiError(response.status, \"cloud_upload_failed\", isRecord(payload) && typeof payload.message === \"string\" ? payload.message : `IdexalOs Cloud returned HTTP ${response.status}.`);"
+ },
+ {
+  "file": "apps\\server\\src\\extensions\\cloud-uploads.ts",
+  "line": 291,
+  "ctx": "if (!isRecord(payload) || typeof payload.uploadUrl !== \"string\" || payload.size !== info.size) throw new ApiError(502, \"invalid_upload_session\", \"IdexalOs Cloud returned an invalid upload session.\");"
+ },
+ {
+  "file": "apps\\server\\src\\extensions\\drive-files.ts",
+  "line": 370,
+  "ctx": "const message = isRecord(payload) && typeof payload.message === \"string\" ? payload.message : `IdexalOs Cloud returned HTTP ${response.status}.`;"
+ },
+ {
+  "file": "apps\\server\\src\\extensions\\drive-files.ts",
+  "line": 693,
+  "ctx": "if (typeof session.uploadUrl !== \"string\" || session.size !== local.size) throw new ApiError(502, \"invalid_upload_session\", \"IdexalOs Cloud returned an invalid upload session.\");"
+ },
+ {
+  "file": "apps\\server\\src\\extensions\\openai-image-generation.ts",
+  "line": 161,
+  "ctx": "throw new ApiError(400, \"openai_api_key_missing\", \"OpenAI API key missing. Save OPENAI_API_KEY in IdexalOs Environment Variables or configure the OpenAI Image Gen extension.\");"
+ },
+ {
+  "file": "apps\\server\\src\\free-auto\\service.ts",
+  "line": 373,
+  "ctx": "if (request.method !== (endpoint === \"models\" ? \"GET\" : \"POST\")) return jsonError(405, \"method_not_allowed\", \"Unsupported IdexalOs Models method.\");"
+ },
+ {
+  "file": "apps\\server\\src\\managed-policy-rules.ts",
+  "line": 88,
+  "ctx": "if ((action === \"webfetch\" || action === \"websearch\") && execution?.browserOrigins !== undefined) return \"Use IdexalOs's built-in browser to open approved websites.\";"
+ },
+ {
+  "file": "apps\\server\\src\\opencode-plugins\\idexal-os-capabilities-knowledge.ts",
+  "line": 85,
+  "ctx": "- Plugins extend IdexalOs/OpenCode with custom tools."
+ },
+ {
+  "file": "apps\\server\\src\\opencode-plugins\\idexal-os-extensions-preview.ts",
+  "line": 1162,
+  "ctx": "throw new Error(`Multiple IdexalOs workspaces match; pass workspaceId. Available: ${workspaces.map((workspace) => workspaceLabel(workspace)).join(\", \")}`);"
+ },
+ {
+  "file": "apps\\server\\src\\opencode-plugins\\idexal-os-provider-adapters.ts",
+  "line": 38,
+  "ctx": "sessionId: z.string().trim().min(1).describe(\"IdexalOs/OpenCode session ID returned by session.search.\"),"
+ },
+ {
+  "file": "apps\\server\\src\\routes\\core.ts",
+  "line": 517,
+  "ctx": "? \"Environment variable name is reserved for IdexalOs internals\""
+ },
+ {
+  "file": "apps\\server\\test\\live-provider-inference-warm-native.test.ts",
+  "line": 12,
+  "ctx": "const binary = process.env.IDEXAL_TEST_OPENCODE2 ?? \"/Applications/IdexalOs.app/Contents/Resources/sidecars/opencode2\";"
+ },
+ {
+  "file": "apps\\server\\test\\live-provider-session-project-plugin-native.test.ts",
+  "line": 13,
+  "ctx": "const binary = process.env.IDEXAL_TEST_OPENCODE2 ?? \"/Applications/IdexalOs.app/Contents/Resources/sidecars/opencode2\";"
+ },
+ {
+  "file": "apps\\server\\test\\live-provider-session-security-native.test.ts",
+  "line": 13,
+  "ctx": "const binary = process.env.IDEXAL_TEST_OPENCODE2 ?? \"/Applications/IdexalOs.app/Contents/Resources/sidecars/opencode2\";"
+ },
+ {
+  "file": "apps\\server\\test\\live-provider-sync-managed-native.test.ts",
+  "line": 11,
+  "ctx": "const binary = process.env.IDEXAL_TEST_OPENCODE2 ?? \"/Applications/IdexalOs.app/Contents/Resources/sidecars/opencode2\";"
+ },
+ {
+  "file": "apps\\server\\test\\live-provider-sync-native.test.ts",
+  "line": 18,
+  "ctx": "const binary = process.env.IDEXAL_TEST_OPENCODE2 ?? \"/Applications/IdexalOs.app/Contents/Resources/sidecars/opencode2\";"
+ },
+ {
+  "file": "docs\\aws-eks-helm.md",
+  "line": 257,
+  "ctx": "Use a values file, not a long list of `--set` flags. Several IdexalOs values are"
+ },
+ {
+  "file": "docs\\azure-aks-helm.md",
+  "line": 413,
+  "ctx": "Use a values file, not a long list of `--set` flags. Several IdexalOs values are"
+ },
+ {
+  "file": "docs\\blank-slate-test-profiles.md",
+  "line": 14,
+  "ctx": "open -a \"IdexalOs\" --args --blank-slate"
+ },
+ {
+  "file": "docs\\blank-slate-test-profiles.md",
+  "line": 21,
+  "ctx": "\"dist-electron/mac-arm64/IdexalOs Enterprise.app/Contents/MacOS/IdexalOs Enterprise\" --blank-slate"
+ },
+ {
+  "file": "docs\\blank-slate-test-profiles.md",
+  "line": 40,
+  "ctx": "- IdexalOs server config, env store, token store, runtime DB, data dir"
+ },
+ {
+  "file": "docs\\enterprise\\outbound-access.json",
+  "line": 117,
+  "ctx": "\"blockedEffect\": \"A self-hosted Den deployment cannot pull IdexalOs images or the Helm chart from GitHub Container Registry.\","
+ },
+ {
+  "file": "docs\\extensions-manifest-foundation.md",
+  "line": 33,
+  "ctx": "Den/local endpoint testing should point Electron at the target Den base URL through the existing Cloud account settings or the desktop bootstrap env/config path. OpenAI-key flows should use the Idexal"
+ },
+ {
+  "file": "docs\\gateway-independent-validation.md",
+  "line": 119,
+  "ctx": "flags hide hosted IdexalOs Models and its direct route; non-opted hosted orgs"
+ },
+ {
+  "file": "docs\\gcp-cloud-run.md",
+  "line": 26,
+  "ctx": "- Artifact Registry copies of the published IdexalOs images"
+ },
+ {
+  "file": "docs\\gcp-gke-helm.md",
+  "line": 308,
+  "ctx": "Use a values file, not a long list of `--set` flags. Several IdexalOs values are"
+ },
+ {
+  "file": "docs\\microsoft-entra-sso-scim.md",
+  "line": 8,
+  "ctx": "IdexalOs uses Better Auth for the underlying SSO and SCIM protocol handlers, then"
+ },
+ {
+  "file": "docs\\opencode-app-parity.md",
+  "line": 7,
+  "ctx": "Run `IDEXAL_LIVE_INSTALLED_GATEWAY=1 pnpm evals:parity:live --iterations=3` for the real-inference suite. This is separate from the deterministic integration suite below. It never falls back to script"
+ },
+ {
+  "file": "docs\\opencode-app-parity.md",
+  "line": 9,
+  "ctx": "Changed parity specs in PR CI run both pinned engines explicitly, with separate CLI records for each engine. A failed or skipped run keeps the job red. The real-model native chat spec runs in the exis"
+ },
+ {
+  "file": "docs\\opencode-app-parity.md",
+  "line": 81,
+  "ctx": "The renderer, IdexalOs server, OpenCode executables, Den, MySQL and Gateway are real processes. Only the paid model responses and the external connector are local deterministic witnesses. Administrato"
+ },
+ {
+  "file": "docs\\opencode-v1-v2-benchmarks.md",
+  "line": 46,
+  "ctx": "IdexalOs's UI now routes chat through v2 behind the preview flag and the"
+ },
+ {
+  "file": "docs\\pr-proof\\dpa-opt-out.md",
+  "line": 46,
+  "ctx": "OpenRouter/IdexalOs branding; their delivered endpoint/model/key reach the BYOK"
+ },
+ {
+  "file": "ee\\apps\\den-api\\README.md",
+  "line": 41,
+  "ctx": "Organization owners and admins approve self-hosted IdexalOs Web instances in the Den dashboard under **Org settings → Approved web origins** (`/v1/org/web-origins`). Each entry is an **exact HTTPS ori"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\app.ts",
+  "line": 376,
+  "ctx": "name: \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\audit\\COVERAGE.md",
+  "line": 101,
+  "ctx": "| `remote_session.create` | tenant_job | remote_session.execution | remote_session | mcp | execute_capability remote-session:create | src/mcp/capability-registry.ts:remoteSessionSource.execute → execu"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\audit\\COVERAGE.md",
+  "line": 102,
+  "ctx": "| `remote_session.send` | tenant_job | remote_session.execution | remote_session (sessionId argument) | mcp | execute_capability remote-session:send | src/mcp/capability-registry.ts:remoteSessionSourc"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\audit\\COVERAGE.md",
+  "line": 103,
+  "ctx": "| `remote_session.stop` | tenant_job | remote_session.execution | remote_session (sessionId argument) | mcp | execute_capability remote-session:stop | src/mcp/capability-registry.ts:remoteSessionSourc"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\capability-sources\\external-mcp-client.ts",
+  "line": 61,
+  "ctx": "const CLIENT_NAME = \"IdexalOs\""
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\capability-sources\\external-mcp-diagnostics.ts",
+  "line": 945,
+  "ctx": "return \"The MCP connection failed before IdexalOs could complete the protocol lifecycle.\""
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\capability-sources\\external-mcp-diagnostics.ts",
+  "line": 1519,
+  "ctx": "operatorAction: \"Configure the provider to support an MCP protocol version compatible with IdexalOs.\","
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\env.ts",
+  "line": 760,
+  "ctx": "name: optionalString(parsed.DEN_SINGLE_ORG_NAME) ?? \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\inference.ts",
+  "line": 277,
+  "ctx": "name: \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\llm\\litellm-sync.ts",
+  "line": 307,
+  "ctx": "if (settings.keySource === \"issued\") await ensureGroup(tx, provider, settings, SIGN_IN_GROUP_KEY, LITELLM_ISSUED_ACCESS_GROUP_NAME, \"Grant this group to the people and teams IdexalOs should create Lit"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\llm\\litellm-sync.ts",
+  "line": 384,
+  "ctx": "name: input.mode === \"org\" ? \"Organization LiteLLM key\" : readLiteLlmSettings(provider.settings)?.keySource === \"issued\" ? \"LiteLLM keys created by IdexalOs\" : \"Personal LiteLLM keys\", credential_mode"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\llm\\litellm-sync.ts",
+  "line": 438,
+  "ctx": "if (settings.keySource === \"issued\") throw new GatewayWriteError(409, \"litellm_keys_managed\", \"IdexalOs creates your LiteLLM key for this provider; there is nothing to paste.\")"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\mcp\\app-builder-tools.ts",
+  "line": 197,
+  "ctx": "\"Returns app (summary including appId, pluginId, revisionId and tools, not source), input (empty launch input), mcpUrl, and usually launch { connectionId, toolName, resourceUri, arguments }. launch is"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\orgs.ts",
+  "line": 1038,
+  "ctx": "appName: typeof organizationMetadata.brandAppName === \"string\" ? organizationMetadata.brandAppName : \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\admin\\free-auto-usage.ts",
+  "line": 44,
+  "ctx": "subscribed: z.boolean().describe(\"Pays for IdexalOs Models, so its members use paid Models rather than free Auto.\"),"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\admin\\index.ts",
+  "line": 2002,
+  "ctx": "description: \"Toggles complimentary IdexalOs Web access for the organization and records an audit event. Access cannot be granted while a paid IdexalOs Web subscription is ongoing. Body: { enabled: bo"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\auth\\desktop-handoff.ts",
+  "line": 23,
+  "ctx": "desktopScheme: z.literal(\"idexalos\").optional().describe(\"The registered IdexalOs desktop URL scheme.\"),"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\org\\codemode-scripts.ts",
+  "line": 165,
+  "ctx": "if (message === \"legacy_view_read_only\") return { status: 409, body: { error: message, message: \"This is an older app that can no longer be edited or saved. It still opens and refreshes. To change it,"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\org\\core.ts",
+  "line": 186,
+  "ctx": "features: z.record(z.string(), z.boolean()).meta({ description: \"Effective on/off for every IdexalOs feature in this organization. Treat a missing key as off.\" }),"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\org\\inference-providers.ts",
+  "line": 355,
+  "ctx": "if (attempt.userId !== session.userId) throw new GatewayWriteError(403, \"browser_account_mismatch\", \"Use the same IdexalOs account that started Connect. Sign out in this browser and sign in with that "
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\org\\inference-providers.ts",
+  "line": 926,
+  "ctx": "if (attempt.userId !== session.userId) throw new GatewayWriteError(403, \"browser_account_mismatch\", \"Use the same IdexalOs account that started Connect. Sign out in this browser and sign in with that "
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\org\\inference-providers.ts",
+  "line": 1123,
+  "ctx": "if (isLiteLlmProviderId(provider.provider_id) && readLiteLlmSettings(provider.settings)?.keySource === \"issued\") throw new GatewayWriteError(409, \"litellm_keys_managed\", \"IdexalOs manages these LiteLL"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\org\\inference-providers.ts",
+  "line": 1200,
+  "ctx": "if (!issuedMode && (input.issueStrategy !== undefined || input.mirrorFallback !== undefined)) throw new GatewayWriteError(409, \"litellm_not_issued\", \"Only providers where IdexalOs creates keys have ke"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\org\\inference-providers.ts",
+  "line": 1250,
+  "ctx": "if (attempt.userId !== session.userId) throw new GatewayWriteError(403, \"browser_account_mismatch\", \"Use the same IdexalOs account that started Connect. Sign out in this browser and sign in with that "
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\org\\inference-providers.ts",
+  "line": 1288,
+  "ctx": "if (attempt.userId !== session.userId) throw new GatewayWriteError(403, \"browser_account_mismatch\", \"Use the same IdexalOs account that started Connect. Sign out in this browser and sign in with that "
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\org\\install-links.ts",
+  "line": 99,
+  "ctx": "appName: typeof metadata.brandAppName === \"string\" ? metadata.brandAppName : \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\org\\install-links.ts",
+  "line": 228,
+  "ctx": "organization: { name: env.orgMode === \"multi_org\" ? \"IdexalOs Cloud\" : \"IdexalOs\", logo: null, metadata: null },"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\org\\invitations.ts",
+  "line": 522,
+  "ctx": "invitedByName: user.name ?? user.email ?? \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\org\\managed-deployments.ts",
+  "line": 161,
+  "ctx": "app.get(`${PATH}/configuration`, operation(\"Read which clouds can be launched\", \"Lists the clouds this IdexalOs environment can install into and the published installer version for each. Agents call t"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\org\\mcp-connections.ts",
+  "line": 341,
+  "ctx": "client_name: z.literal(\"IdexalOs\"),"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\org\\mcp-connections.ts",
+  "line": 2222,
+  "ctx": "client_name: \"IdexalOs\" as const,"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\org\\oauth-providers.ts",
+  "line": 716,
+  "ctx": "message: `You signed in, but ${provider.displayName} did not grant: ${missingScopes.join(\", \")}. Ask your administrator to grant these permissions to the IdexalOs app with your identity provider, or t"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\org\\plugin-system\\github-discovery.ts",
+  "line": 443,
+  "ctx": "? [`${extraAssetCount} additional skill asset${extraAssetCount === 1 ? \" was\" : \"s were\"} found. IdexalOs imports the SKILL.md entrypoint; referenced skill assets are not installed yet.`]"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\routes\\org\\plugin-system\\github-discovery.ts",
+  "line": 639,
+  "ctx": "warnings.push(`IdexalOs supports Agent Plugins ${AGENT_PLUGIN_V1_SUPPORTED_VERSIONS.join(\" and \")} and Claude-compatible plugins. Add a standards-compliant plugin.json, .claude-plugin/marketplace.json"
+ },
+ {
+  "file": "ee\\apps\\den-api\\src\\slack-assistant\\protocol.ts",
+  "line": 210,
+  "ctx": "name: \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\den-api\\test\\mcp-manual-oauth.test.ts",
+  "line": 62,
+  "ctx": "assert.ok(result.warnings.some(warning => warning.code === \"oauth_issuer_mismatch\" && warning.message.includes(\"IdexalOs stopped for security\")))"
+ },
+ {
+  "file": "ee\\apps\\den-api\\test\\slack-assistant-runner.test.ts",
+  "line": 100,
+  "ctx": "assert.ok(userTexts[0]?.endsWith(envelope) && !userTexts[0].includes(\"IdexalOs assistant in Slack\"))"
+ },
+ {
+  "file": "ee\\apps\\den-api\\test\\slack-assistant-workbot.test.ts",
+  "line": 40,
+  "ctx": "assert.ok(!envelope.includes(\"IdexalOs assistant in Slack\"), \"the per-message prompt carries no instructions\")"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\(admin)\\billing\\stripe\\checking\\page.tsx",
+  "line": 106,
+  "ctx": "{returnTarget === \"web\" ? \"Return to IdexalOs Web\" : \"Return to Billing\"}"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\web\\page.tsx",
+  "line": 410,
+  "ctx": ": `This organization already has an IdexalOs Web subscription (${formatSubscriptionStatus(billing.subscription?.status ?? \"unknown\").toLowerCase()}). Manage the existing subscription from Billing.`}"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\automations-screen.tsx",
+  "line": 35,
+  "ctx": "return executionTarget === \"cloud\" ? \"IdexalOs Cloud\" : \"Desktop\";"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\billing-dashboard-screen.tsx",
+  "line": 555,
+  "ctx": ": `The payment is ${formatSubscriptionStatus(webPaymentStatus ?? \"failed\").toLowerCase()}, so IdexalOs Web is locked. Update the payment method to restore access.`"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\billing-dashboard-screen.tsx",
+  "line": 561,
+  "ctx": "? `This subscription is ${formatSubscriptionStatus(webStatus ?? \"unknown\").toLowerCase()}, so IdexalOs Web is locked.`"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\billing-dashboard-screen.tsx",
+  "line": 793,
+  "ctx": "? `Turning this on costs ${aiChargeLabel} per ${stripeBilling.interval} for your ${activeMemberCount} ${activeMemberCount === 1 ? \"member\" : \"members\"}, not ${stripePrice}. You subscribe from the Idex"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\brand-appearance-screen.tsx",
+  "line": 289,
+  "ctx": "<DenInput type=\"text\" value={appNameDraft} onChange={(event) => setAppNameDraft(event.target.value)} placeholder=\"IdexalOs\" maxLength={64} disabled={!canManageBrandAppearance} />"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\egress-diagnostics-card.tsx",
+  "line": 39,
+  "ctx": "if (owner === \"idexal-os-support\") return \"IdexalOs support\";"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\github-integration-screen.tsx",
+  "line": 1106,
+  "ctx": ": `This will create ${selectedPlugins.length} plugin${selectedPlugins.length === 1 ? \"\" : \"s\"} and their mappings in IdexalOs.`}"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\github-integration-screen.tsx",
+  "line": 1260,
+  "ctx": "IdexalOs created <span className=\"font-semibold text-gray-900\">{createdPluginNames.length}</span> plugin{createdPluginNames.length === 1 ? \"\" : \"s\"},{\" \"}"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\litellm-provider-data.ts",
+  "line": 57,
+  "ctx": ": input.mode === \"issued\" ? \"Paste a LiteLLM admin key so IdexalOs can create each person's key.\""
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\litellm-provider-data.ts",
+  "line": 67,
+  "ctx": "return mode === \"org\" ? \"One organization key\" : mode === \"issued\" ? \"IdexalOs creates keys\" : \"Each person's own key\";"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\litellm-provider-screen.tsx",
+  "line": 376,
+  "ctx": "{!modelGroups.length ? <li className={`${ROW} text-gray-500`}>{uiMode === \"member\" ? \"No LiteLLM teams yet. People get a group when they connect their key.\" : uiMode === \"issued\" ? \"No LiteLLM teams y"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\managed-deployments-screen.tsx",
+  "line": 350,
+  "ctx": "? `Review and run this command in Google Cloud Shell for project ${deployment.target.projectId}. Running it approves the ${launch.kind === \"update\" ? \"update\" : \"installation\"} and creates or changes "
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\managed-deployments-screen.tsx",
+  "line": 502,
+  "ctx": "<span className=\"min-w-0\" data-testid=\"deployment-cost-consent\">{provider === \"gcp\" ? \"I control this Google Cloud project and public DNS zone, with billing enabled. I'll review the installer's permis"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\managed-deployments-state.test.ts",
+  "line": 55,
+  "ctx": "assert.match(message, /IdexalOs operator/);"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\managed-deployments-state.ts",
+  "line": 23,
+  "ctx": "default: return `${name} installer isn't configured for this IdexalOs environment. An IdexalOs operator must publish and configure a verified installer release.`;"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\mcp-tool-error-attribution.ts",
+  "line": 147,
+  "ctx": "if (diagnostic?.highestPassed === \"operation_ready\") return \"IdexalOs started remote tool execution\";"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\mcp-tool-error-attribution.ts",
+  "line": 148,
+  "ctx": "if (diagnostic?.highestPassed === \"catalog_ready\") return \"IdexalOs loaded the remote MCP tool catalog\";"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\mcp-tool-error-attribution.ts",
+  "line": 149,
+  "ctx": "if (diagnostic?.highestPassed === \"protocol_ready\") return \"IdexalOs initialized the remote MCP session\";"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\mcp-tool-error-attribution.ts",
+  "line": 151,
+  "ctx": "if (diagnostic?.highestPassed === \"reachable\") return \"IdexalOs reached the remote MCP endpoint\";"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\mcp-tool-error-attribution.ts",
+  "line": 152,
+  "ctx": "if (diagnostic?.highestPassed === \"configured\") return \"IdexalOs loaded the MCP connection configuration\";"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\mcp-tool-error-attribution.ts",
+  "line": 197,
+  "ctx": "likelySource: \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\org-dashboard-shell.tsx",
+  "line": 99,
+  "ctx": "aria-label=\"IdexalOs\""
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\org-dashboard-shell.tsx",
+  "line": 496,
+  "ctx": "<OrgMark name={activeOrg?.name ?? \"IdexalOs\"} />"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\plugin-data.tsx",
+  "line": 402,
+  "ctx": "author: \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\plugin-import-screen.tsx",
+  "line": 35,
+  "ctx": "if (preview.skippedReason === \"native_connector\") return `Connect ${preview.mapsToName ?? \"this provider\"} in IdexalOs instead`;"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\tool-tester\\tool-call-inspector.tsx",
+  "line": 90,
+  "ctx": "if (layer === \"idexalos\") return \"IdexalOs before send\";"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\tool-tester\\tool-call-inspector.tsx",
+  "line": 230,
+  "ctx": "<TracePill label=\"IdexalOs\" state={states[0]} />"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\workbot-settings-screen.tsx",
+  "line": 27,
+  "ctx": "return trimmed && trimmed !== \"IdexalOs\" ? trimmed.slice(0, 40) : \"Workbot\";"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\workflow-artifact-result.tsx",
+  "line": 83,
+  "ctx": "<DenChip tone=\"neutral\">{snapshot.source === \"scheduled\" ? \"Scheduled · IdexalOs Cloud\" : \"Manual\"}</DenChip>"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\workflow-plain-language.ts",
+  "line": 43,
+  "ctx": "if (lower === \"idexalos\") return \"IdexalOs\";"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_components\\workflow-plain-language.ts",
+  "line": 80,
+  "ctx": "if (namespace === \"den\") return \"IdexalOs\";"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\dashboard\\_features\\analytics\\model-usage-list.tsx",
+  "line": 18,
+  "ctx": "{!isLoading && models.length === 0 ? <AnalyticsEmptyState title=\"No model usage yet\">Model sessions from your team will appear here as they use IdexalOs.</AnalyticsEmptyState> : null}"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\_components\\auth-panel.tsx",
+  "line": 310,
+  "ctx": "const singleOrgName = runtimeConfig.singleOrgName || \"IdexalOs\";"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\_components\\install-screen.tsx",
+  "line": 118,
+  "ctx": "const appName = typeof value.appName === \"string\" && value.appName.trim() ? value.appName.trim() : \"IdexalOs\";"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\_components\\organization-screen.tsx",
+  "line": 45,
+  "ctx": "const singleOrgName = runtimeConfig.singleOrgName || \"IdexalOs\";"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\_lib\\den-org.ts",
+  "line": 1320,
+  "ctx": "appName: asString(branding?.appName) ?? \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\_lib\\runtime-config.ts",
+  "line": 23,
+  "ctx": "singleOrgName: \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\_lib\\runtime-config.ts",
+  "line": 60,
+  "ctx": "singleOrgName: singleOrgName || \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\(den)\\_providers\\den-flow-provider.tsx",
+  "line": 581,
+  "ctx": "if (continuationRef.current === current && epoch === sessionEpochRef.current) setAuthError(error instanceof Error ? error.message : \"Failed to open IdexalOs.\");"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\api\\runtime-config\\route.ts",
+  "line": 81,
+  "ctx": "singleOrgName: readPublicRuntimeEnv(\"DEN_SINGLE_ORG_NAME\") || \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\gateway\\connect\\gateway-connect.tsx",
+  "line": 220,
+  "ctx": "? `Could not confirm whether ${method === \"microsoft\" ? \"Microsoft\" : \"Google\"} sign-in started. Start signing in again in IdexalOs.`"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\gateway\\connect\\gateway-connect.tsx",
+  "line": 452,
+  "ctx": "else if (response.status === 400 && code === \"oauth_entry_expired\") { setStep(\"restart\"); setError(\"This sign-in link expired. Start signing in again in IdexalOs.\"); }"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\gateway\\connect\\gateway-connect.tsx",
+  "line": 509,
+  "ctx": "const title = step === \"sign_in_required\" ? \"Sign in to IdexalOs\""
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\gateway\\connect\\gateway-connect.tsx",
+  "line": 510,
+  "ctx": ": step === \"account_mismatch\" ? \"Switch IdexalOs account\""
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\gateway\\connect\\gateway-connect.tsx",
+  "line": 526,
+  "ctx": "{step === \"account_mismatch\" ? <DenNotice tone=\"neutral\" message={<span className=\"flex items-start gap-2\"><LockKeyhole aria-hidden=\"true\" strokeWidth={1.5} className=\"size-4 shrink-0\" />Use the Idexa"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\gateway\\connect\\gateway-connect.tsx",
+  "line": 528,
+  "ctx": "{step === \"connected\" && method === \"aws_sso\" ? <DenNotice tone=\"info\" message={`${accountName ? `Signed in to AWS as ${accountName}. ` : \"\"}Your models are ready in IdexalOs. You can close this tab.`"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\gateway\\connect\\gateway-connect.tsx",
+  "line": 529,
+  "ctx": "{step === \"connected\" && !issued && method !== \"aws_sso\" ? <DenNotice tone=\"info\" message={`${connectedModels} ${connectedModels === 1 ? \"model is\" : \"models are\"} ready in IdexalOs. You can close thi"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\gateway\\connect\\gateway-connect.tsx",
+  "line": 537,
+  "ctx": "{step === \"connected\" && issued ? <DenNotice tone=\"info\" message=\"Your models are ready in IdexalOs. You can close this tab.\" /> : null}"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\gateway\\connect\\gateway-connect.tsx",
+  "line": 538,
+  "ctx": "{step === \"ready\" && issued ? <DenNotice tone=\"neutral\" message={issue?.message ?? \"IdexalOs is creating your LiteLLM key. Check again in a moment.\"} /> : null}"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\gateway\\connect\\gateway-connect.tsx",
+  "line": 547,
+  "ctx": "{step === \"sign_in_required\" ? <a href=\"/\" target=\"_blank\" rel=\"noopener noreferrer\" className={buttonVariants()}>Sign in to IdexalOs</a> : null}"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\gateway\\connect\\gateway-connect.tsx",
+  "line": 556,
+  "ctx": "{checking && step !== \"loading\" ? <span role=\"status\" className=\"sr-only\">Checking IdexalOs sign-in</span> : null}"
+ },
+ {
+  "file": "ee\\apps\\den-web\\app\\mcp\\select-organization\\page.tsx",
+  "line": 396,
+  "ctx": "{isBusy ? (firstParty ? \"Opening…\" : \"Authorizing…\") : firstParty ? `Continue to ${client.name ?? \"IdexalOs\"}` : client.name ? `Authorize ${client.name}` : \"Authorize this app\"}"
+ },
+ {
+  "file": "ee\\apps\\den-web\\components\\admin\\admin-access-screen.tsx",
+  "line": 15,
+  "ctx": "const detail = state === \"signed-out\" ? \"Sign in with an IdexalOs admin account to continue.\""
+ },
+ {
+  "file": "ee\\apps\\den-web\\components\\admin\\admin-access-screen.tsx",
+  "line": 16,
+  "ctx": ": state === \"forbidden\" ? \"This account is not on the IdexalOs admin allowlist.\""
+ },
+ {
+  "file": "ee\\apps\\den-web\\components\\admin\\admin-request.ts",
+  "line": 46,
+  "ctx": "if (response.status === 401) return { access: \"signed-out\", message: \"Sign in with an IdexalOs admin account to continue.\" };"
+ },
+ {
+  "file": "ee\\apps\\den-web\\components\\admin\\admin-request.ts",
+  "line": 47,
+  "ctx": "if (response.status === 403) return { access: \"forbidden\", message: \"This account is not on the IdexalOs admin allowlist.\" };"
+ },
+ {
+  "file": "ee\\apps\\den-web\\components\\admin\\features\\feature-rollouts-page.tsx",
+  "line": 169,
+  "ctx": "caption={state.status === \"ready\" ? (state.report.deployment === \"cloud\" ? \"IdexalOs Cloud\" : \"Self-hosted\") : undefined}"
+ },
+ {
+  "file": "ee\\apps\\gateway\\src\\chat-response.ts",
+  "line": 20,
+  "ctx": "if (status === 401 || status === 403) return inferenceError(\"upstream_access_denied\", \"The managed model provider could not authorize this request. Ask your organization admin to check IdexalOs Models"
+ },
+ {
+  "file": "ee\\apps\\gateway\\src\\chat-response.ts",
+  "line": 21,
+  "ctx": "if (status === 402) return inferenceError(\"upstream_quota_exhausted\", \"The managed provider's allowance is exhausted. Ask your organization admin to check IdexalOs Models access.\")"
+ },
+ {
+  "file": "ee\\apps\\gateway\\src\\free\\member\\handler.ts",
+  "line": 67,
+  "ctx": "if (method !== \"POST\" || (path !== MEMBER_FREE_CHAT_PATH && path !== MEMBER_FREE_RESPONSES_PATH)) return freeError(404, \"not_found\", \"Only Auto is available without an IdexalOs Models subscription.\")"
+ },
+ {
+  "file": "ee\\apps\\gateway\\src\\gateway.ts",
+  "line": 728,
+  "ctx": "if (identity.kind !== \"gateway\") return gatewayError(401, \"invalid_api_key\", \"An IdexalOs Gateway key is required.\")"
+ },
+ {
+  "file": "ee\\apps\\gateway\\src\\gateway.ts",
+  "line": 908,
+  "ctx": "`Connect your ${provider.provider_id} account in IdexalOs to use this provider (${credential.reason === \"missing\" ? \"no credential\" : `credential ${credential.reason}`}).`,"
+ },
+ {
+  "file": "ee\\apps\\gateway\\src\\inference-reporting.ts",
+  "line": 116,
+  "ctx": "if (report.outcome === \"completed\") Sentry.logger.info(\"IdexalOs inference completion\", report)"
+ },
+ {
+  "file": "ee\\apps\\gateway\\src\\proxy.ts",
+  "line": 559,
+  "ctx": "if (identity.kind !== \"models\") return openAiError(401, \"invalid_api_key\", \"An IdexalOs Models key is required.\")"
+ },
+ {
+  "file": "ee\\apps\\headless-runner\\scripts\\smoke.ts",
+  "line": 26,
+  "ctx": "const prompt = process.argv.slice(2).join(\" \") || \"Use IdexalOs to find what I can connect to, then write a short summary to notes/summary.md.\""
+ },
+ {
+  "file": "ee\\apps\\headless-runner\\src\\runner.ts",
+  "line": 635,
+  "ctx": "tools || kind === \"report\" ? \"\" : \"No IdexalOs connection is available in this conversation, so connected apps cannot be reached.\","
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\alternatives\\claude-cowork\\page.tsx",
+  "line": 26,
+  "ctx": "name: \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\alternatives\\claude-cowork\\page.tsx",
+  "line": 43,
+  "ctx": "name: \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\alternatives\\claude-cowork\\page.tsx",
+  "line": 65,
+  "ctx": "{ \"@type\": \"ListItem\", position: 1, name: \"IdexalOs\", item: \"https://os.idexal.com\" },"
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\alternatives\\claude-cowork-3p\\page.tsx",
+  "line": 38,
+  "ctx": "{ \"@type\": \"ListItem\", position: 1, name: \"IdexalOs\", item: \"https://os.idexal.com\" },"
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\api\\app-feedback\\route.ts",
+  "line": 133,
+  "ctx": "title: mode === \"contact\" ? \"IdexalOs contact message\" : \"IdexalOs app feedback\","
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\docs\\start-here\\migrate-from-claude-cowork\\page.tsx",
+  "line": 31,
+  "ctx": "\"IdexalOs\""
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\docs\\start-here\\migrate-from-claude-cowork\\page.tsx",
+  "line": 80,
+  "ctx": "{ \"@type\": \"ListItem\", position: 1, name: \"IdexalOs\", item: \"https://os.idexal.com\" },"
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\download\\page.tsx",
+  "line": 11,
+  "ctx": "name: \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\download\\page.tsx",
+  "line": 24,
+  "ctx": "name: \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\glm-5.2\\page.tsx",
+  "line": 31,
+  "ctx": "name: \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\guides\\[slug]\\page.tsx",
+  "line": 46,
+  "ctx": "author: { \"@type\": \"Organization\", name: \"IdexalOs\", url: SITE_URL },"
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\guides\\[slug]\\page.tsx",
+  "line": 47,
+  "ctx": "about: { \"@type\": \"SoftwareApplication\", name: \"IdexalOs\", url: SITE_URL },"
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\guides\\[slug]\\page.tsx",
+  "line": 48,
+  "ctx": "publisher: { \"@type\": \"Organization\", name: \"IdexalOs\", url: SITE_URL }"
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\guides\\[slug]\\page.tsx",
+  "line": 65,
+  "ctx": "{ \"@type\": \"ListItem\", position: 1, name: \"IdexalOs\", item: SITE_URL },"
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\install-manifest.json\\route.ts",
+  "line": 116,
+  "ctx": "...(type === \"dmg\" ? { appName: \"IdexalOs.app\" } : {}),"
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\layout.tsx",
+  "line": 19,
+  "ctx": "name: \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\manifest.ts",
+  "line": 5,
+  "ctx": "name: \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\manifest.ts",
+  "line": 6,
+  "ctx": "short_name: \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\page.tsx",
+  "line": 24,
+  "ctx": "name: \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\page.tsx",
+  "line": 38,
+  "ctx": "name: \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\pricing\\page.tsx",
+  "line": 11,
+  "ctx": "name: \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\pricing\\page.tsx",
+  "line": 14,
+  "ctx": "brand: { \"@type\": \"Brand\", name: \"IdexalOs\" },"
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\starter-success\\page.tsx",
+  "line": 77,
+  "ctx": "IdexalOs stays open source, runs in any environment, and works with"
+ },
+ {
+  "file": "ee\\apps\\landing\\app\\terms\\subscription\\subscription-terms.md",
+  "line": 7,
+  "ctx": "Idexal, Inc. (d/b/a IdexalOs Labs) (\"IdexalOs\", \"we\"). By running the"
+ },
+ {
+  "file": "ee\\apps\\landing\\components\\lp-demo-panels.tsx",
+  "line": 288,
+  "ctx": "<BrowserTabButton selected={tab === \"web\"} onSelect={() => setTab(\"web\")} label=\"IdexalOs Web\" />"
+ },
+ {
+  "file": "ee\\apps\\landing\\components\\site-nav.tsx",
+  "line": 77,
+  "ctx": "aria-label=\"IdexalOs\""
+ },
+ {
+  "file": "ee\\apps\\landing\\lib\\agent-markdown.ts",
+  "line": 89,
+  "ctx": "- Managed deployment — self-hosted in your environment or hosted by IdexalOs"
+ },
+ {
+  "file": "ee\\apps\\landing\\lib\\agent-markdown.ts",
+  "line": 106,
+  "ctx": "- Managed deployment — self-hosted in your environment or hosted by IdexalOs"
+ },
+ {
+  "file": "ee\\apps\\landing\\lib\\agent-markdown.ts",
+  "line": 143,
+  "ctx": "| LLM API keys | Local keychain / env vars | Held by your LLM provider, not by IdexalOs |"
+ },
+ {
+  "file": "ee\\apps\\landing\\lib\\cowork-capabilities.ts",
+  "line": 44,
+  "ctx": "{ key: \"idexalos\", label: \"IdexalOs\" }"
+ },
+ {
+  "file": "ee\\apps\\landing\\lib\\cowork-cost.ts",
+  "line": 257,
+  "ctx": "name: inputs.tier === \"team\" ? \"IdexalOs Team\" : \"IdexalOs Enterprise\","
+ },
+ {
+  "file": "ee\\apps\\landing\\lib\\seo.ts",
+  "line": 12,
+  "ctx": "siteName: \"IdexalOs\","
+ },
+ {
+  "file": "ee\\apps\\landing\\public\\.well-known\\agent-skills\\install-idexal-os\\SKILL.md",
+  "line": 40,
+  "ctx": "curl -fL -o ~/IdexalOs.AppImage https://os.idexal.com/download/linux-x64"
+ },
+ {
+  "file": "ee\\apps\\landing\\public\\.well-known\\agent-skills\\install-idexal-os\\SKILL.md",
+  "line": 41,
+  "ctx": "chmod +x ~/IdexalOs.AppImage"
+ },
+ {
+  "file": "ee\\apps\\landing\\public\\.well-known\\agent-skills\\install-idexal-os\\SKILL.md",
+  "line": 42,
+  "ctx": "~/IdexalOs.AppImage"
+ },
+ {
+  "file": "ee\\packages\\den-db\\src\\schema\\inference.ts",
+  "line": 193,
+  "ctx": "// One row per proxied request (IdexalOs/OpenRouter route and org-provider route)."
+ },
+ {
+  "file": "ee\\packages\\workbot-server\\src\\service.ts",
+  "line": 110,
+  "ctx": "return typeof brand === \"string\" && brand.trim() && brand.trim() !== \"IdexalOs\" ? brand.trim().slice(0, 40) : \"Workbot\""
+ },
+ {
+  "file": "ee\\packages\\workbot-ui\\src\\calendar.tsx",
+  "line": 445,
+  "ctx": "<span className=\"text-[12px] leading-4 text-[#687076]\">{target === \"cloud\" ? \"Runs in the cloud, even when your computer is off.\" : \"Needs IdexalOs open on one of your computers. Move it to the cloud "
+ },
+ {
+  "file": "ee\\packages\\workbot-ui\\src\\calendar.tsx",
+  "line": 549,
+  "ctx": "<Row label=\"Runs on\">{(revision.executionTarget ?? \"desktop\") === \"cloud\" ? \"The cloud. Your laptop can be closed.\" : \"Your desktop. Keep IdexalOs open at that time.\"}</Row>"
+ },
+ {
+  "file": "evals\\core\\agent-permissions.e2e.test.ts",
+  "line": 50,
+  "ctx": "evidence.recordAssertionEvidence(`rules Riley's IdexalOs enforces (${world.engine})`, describeRules(rules), JSON.stringify(rules) === JSON.stringify(expected));"
+ },
+ {
+  "file": "evals\\core\\agent-permissions.e2e.test.ts",
+  "line": 213,
+  "ctx": "within: 60_000, label: \"Riley's IdexalOs drops the local skill and MCP blocks\", until: (found) => found.length === 0,"
+ },
+ {
+  "file": "evals\\core\\packaged-update-install.e2e.test.ts",
+  "line": 30,
+  "ctx": "const RECOVERY_HEADING = /IdexalOs hit an unexpected error/;"
+ },
+ {
+  "file": "evals\\docs-shots\\surfaces.ts",
+  "line": 69,
+  "ctx": "name: \"IdexalOs\","
+ },
+ {
+  "file": "evals\\docs-shots\\surfaces.ts",
+  "line": 71,
+  "ctx": "models: { [args.modelId]: { name: \"IdexalOs\", tool_call: true } },"
+ },
+ {
+  "file": "evals\\docs-shots\\world.ts",
+  "line": 93,
+  "ctx": "// Cloud is entitled by IdexalOs Web access, not a per-organization flag."
+ },
+ {
+  "file": "evals\\drivers\\cloud-connect-services-mock.mjs",
+  "line": 272,
+  "ctx": "givenName: \"IdexalOs\","
+ },
+ {
+  "file": "evals\\drivers\\cloud-connect-services-mock.mjs",
+  "line": 345,
+  "ctx": "if (url.pathname === \"/graph/v1.0/me/drive/root:/IdexalOs/permission-parity.txt:/content\" && request.method === \"PUT\") {"
+ },
+ {
+  "file": "evals\\drivers\\office-attachments-mock-provider.mjs",
+  "line": 174,
+  "ctx": "return text.includes(\"IdexalOs normalized an Office attachment\")"
+ },
+ {
+  "file": "evals\\packages\\behaviors\\src\\diagnostics.ts",
+  "line": 908,
+  "ctx": "const needle = (process.env.IDEXAL_TLS_REPRO_CA_MATCH || \"IdexalOs Egress Lab\").toLowerCase();"
+ },
+ {
+  "file": "evals\\packages\\behaviors\\src\\skills.ts",
+  "line": 139,
+  "ctx": "await waitFor(app, () => (document.body.innerText.includes(\"IdexalOs Browser\")), {"
+ },
+ {
+  "file": "evals\\packages\\behaviors\\src\\skills.ts",
+  "line": 145,
+  "ctx": ".filter((label) => label.includes(\"IdexalOs Browser\")))), { timeoutMs: 60_000, label: \"IdexalOs Browser extension rows\" });"
+ },
+ {
+  "file": "evals\\packages\\cdp\\src\\app-state.ts",
+  "line": 97,
+  "ctx": "const welcome = text.includes(\"Welcome to IdexalOs\");"
+ },
+ {
+  "file": "evals\\packages\\cdp\\src\\cdp.ts",
+  "line": 105,
+  "ctx": "pages.find((page) => page.title === \"IdexalOs\") ??"
+ },
+ {
+  "file": "evals\\packages\\env\\src\\freestyle-sandbox-preview.test.ts",
+  "line": 25,
+  "ctx": "? new Response(\"IdexalOs\")"
+ },
+ {
+  "file": "evals\\packages\\hosts\\src\\daytona.ts",
+  "line": 708,
+  "ctx": "const relaunchShortcutPath = `${vmHome}/Desktop/IdexalOs Release ${safeName}.desktop`;"
+ },
+ {
+  "file": "evals\\packages\\hosts\\src\\daytona.ts",
+  "line": 728,
+  "ctx": "const desktopEntry = `[Desktop Entry]\\nType=Application\\nVersion=1.0\\nName=IdexalOs Release\\nExec=${launcherPath} %U\\nTryExec=${launcherPath}\\nTerminal=false\\nCategories=Development;Utility;\\nMimeType"
+ },
+ {
+  "file": "evals\\packages\\hosts\\src\\provision.ts",
+  "line": 304,
+  "ctx": "binaryName: platform === \"windows\" ? \"IdexalOs.exe\" : artifact.binary,"
+ },
+ {
+  "file": "evals\\packages\\hosts\\src\\windows-release.ts",
+  "line": 194,
+  "ctx": "return response.includes(`IdexalOs/${release.version}`) ? true : undefined;"
+ },
+ {
+  "file": "evals\\packages\\hosts\\src\\windows-release.ts",
+  "line": 198,
+  "ctx": "if (!response.ok || !(await response.text()).includes(`IdexalOs/${release.version}`)) throw new Error(\"Windows CDP is not reachable through the signed private preview.\");"
+ },
+ {
+  "file": "evals\\packages\\hosts\\src\\windows-release.ts",
+  "line": 200,
+  "ctx": "await cdpStep?.ok(`IdexalOs/${release.version}`);"
+ },
+ {
+  "file": "evals\\packages\\labs\\src\\skill-jit-model.ts",
+  "line": 29,
+  "ctx": "if (!system.includes(\"You are IdexalOs.\")) throw new Error(\"The model did not receive IdexalOs operating instructions\");"
+ },
+ {
+  "file": "evals\\packages\\labs\\src\\skill-jit-model.ts",
+  "line": 86,
+  "ctx": "return { request, reply: reply.includes(\"current code:\") ? reply : \"IdexalOs: UNAVAILABLE\" };"
+ },
+ {
+  "file": "evals\\packages\\testkit\\src\\spec\\runtime.ts",
+  "line": 794,
+  "ctx": "if (new URL(url).protocol !== \"idexalos:\") throw new Error(\"Expected an IdexalOs deep link.\");"
+ },
+ {
+  "file": "evals\\proofs\\generated-app-theme.proof.test.ts",
+  "line": 5,
+  "ctx": "// A protocol host in Chrome; no seeded IdexalOs or Den surface is needed."
+ },
+ {
+  "file": "evals\\proofs\\last-turn-model-footer-resolved.proof.test.ts",
+  "line": 112,
+  "ctx": "const marks = (await probe.dom(`${auto} [data-testid=\"reply-model\"] svg[aria-label=\"IdexalOs\"]`)).elements;"
+ },
+ {
+  "file": "evals\\proofs\\last-turn-model-footer-resolved.proof.test.ts",
+  "line": 117,
+  "ctx": "evidence.recordAssertionEvidence(\"Auto retains the IdexalOs mark and discloses only the routed reply name\", `routed name=${world.autoModelName}; footer labels=${found.length}; IdexalOs marks=${marks.l"
+ },
+ {
+  "file": "evals\\worlds\\first-run.ts",
+  "line": 69,
+  "ctx": "onboarding: /Welcome to IdexalOs|Power your first task|How did you hear about IdexalOs\\?/.test(document.body.innerText),"
+ },
+ {
+  "file": "evals\\worlds\\first-run.ts",
+  "line": 77,
+  "ctx": "if (workspaces.workspaces.length !== 1 || !workspace?.path?.endsWith(\"IdexalOs Chat\")) {"
+ },
+ {
+  "file": "evals\\worlds\\first-run.ts",
+  "line": 571,
+  "ctx": "{ version: \"2.4.0\", channel: \"stable\", artifact: { platform: \"darwin\", arch: \"arm64\", distribution: \"public\", url: \"https://releases.idexal-os.test/v2.4.0/IdexalOs-darwin-arm64.dmg\" } },"
+ },
+ {
+  "file": "evals\\worlds\\first-run.ts",
+  "line": 572,
+  "ctx": "{ version: \"2.3.1\", channel: \"stable\", artifact: { platform: \"darwin\", arch: \"arm64\", distribution: \"public\", url: \"https://releases.idexal-os.test/v2.3.1/IdexalOs-darwin-arm64.dmg\" } },"
+ },
+ {
+  "file": "evals\\worlds\\first-run.ts",
+  "line": 573,
+  "ctx": "{ version: \"2.3.0\", channel: \"stable\", artifact: { platform: \"linux\", arch: \"x64\", distribution: \"public\", url: \"https://incompatible.invalid/IdexalOs.AppImage\" } },"
+ },
+ {
+  "file": "evals\\worlds\\first-run.ts",
+  "line": 574,
+  "ctx": "{ version: \"2.2.9\", channel: \"stable\", artifact: { platform: \"darwin\", arch: \"arm64\", distribution: \"enterprise\", url: \"https://wrong-flavor.invalid/IdexalOs.dmg\" } },"
+ },
+ {
+  "file": "evals\\worlds\\first-run.ts",
+  "line": 575,
+  "ctx": "{ version: \"2.2.8-beta.1\", channel: \"prerelease\", artifact: { platform: \"darwin\", arch: \"arm64\", distribution: \"public\", url: \"https://prerelease.invalid/IdexalOs.dmg\" } },"
+ },
+ {
+  "file": "evals\\worlds\\first-run.ts",
+  "line": 611,
+  "ctx": "{ version: \"1.8.2\", verified: true, artifactUrl: \"https://releases.idexal-os.test/v1.8.2/IdexalOs-darwin-arm64.dmg\" },"
+ },
+ {
+  "file": "evals\\worlds\\first-run.ts",
+  "line": 612,
+  "ctx": "{ version: \"1.8.1\", verified: false, artifactUrl: \"https://tampered.invalid/IdexalOs.dmg\" },"
+ },
+ {
+  "file": "evals\\worlds\\idexal-os-server-cli.ts",
+  "line": 107,
+  "ctx": "const match = seen.match(/IdexalOs server listening on (http:\\/\\/127\\.0\\.0\\.1:\\d+)/);"
+ },
+ {
+  "file": "evals\\worlds\\packaged-first-launch.ts",
+  "line": 171,
+  "ctx": "if (!/IdexalOs couldn't start|IdexalOs hit an unexpected error/.test(root?.innerText ?? \"\")) return null;"
+ },
+ {
+  "file": "infra\\managed-deployments\\aws\\bootstrap\\cloudformation.json",
+  "line": 1,
+  "ctx": "{\"AWSTemplateFormatVersion\":\"2010-09-09\",\"Description\":\"IdexalOs installer. Creates a customer-owned runner and retained, encrypted Terraform state. The runner provisions billable ECS, RDS and load ba"
+ },
+ {
+  "file": "infra\\managed-deployments\\aws\\runner\\runner.py",
+  "line": 167,
+  "ctx": "print(\"The existing network cannot host IdexalOs: \" + \"; \".join(problems) + \".\")"
+ },
+ {
+  "file": "infra\\managed-deployments\\gcp\\README.md",
+  "line": 33,
+  "ctx": "registry network access, and registry credentials if the published IdexalOs"
+ },
+ {
+  "file": "infra\\terraform\\modules\\idexal-os-aws-ecs\\README.md",
+  "line": 343,
+  "ctx": "| `owner_emails`, `org_name`, `org_slug` | Required owners; `IdexalOs`, `default` |"
+ },
+ {
+  "file": "infra\\terraform\\modules\\idexal-os-azure-container-apps\\README.md",
+  "line": 18,
+  "ctx": "Workbot, runners, Slack and IdexalOs Web are not deployed. Existing product flag inputs remain accepted."
+ },
+ {
+  "file": "infra\\terraform\\modules\\idexal-os-azure-container-apps\\README.md",
+  "line": 142,
+  "ctx": "| `org_name`, `org_slug` | `IdexalOs`, `default` | Organization display name and slug |"
+ },
+ {
+  "file": "infra\\terraform\\modules\\idexal-os-gcp-cloud-run\\README.md",
+  "line": 18,
+  "ctx": "Uses the environment described in [the manual Cloud Run guide](../../../../docs/gcp-cloud-run.md), `packaging/cloud-run`, and the Helm chart. Workbot, the runner, Slack, IdexalOs Web/gateway, Redis an"
+ },
+ {
+  "file": "infra\\terraform\\modules\\idexal-os-gcp-cloud-run\\README.md",
+  "line": 83,
+  "ctx": "| `org_name`, `org_slug` | `IdexalOs`, `default` |"
+ },
+ {
+  "file": "infra\\terraform\\MODULE_CONTRACT.md",
+  "line": 233,
+  "ctx": "Workbot/runner/Slack/IdexalOs Web parity, size presets, Actions, Stacks, and OCI"
+ },
+ {
+  "file": "integrations\\agent-plugins\\idexal-os-connect\\plugin.json",
+  "line": 7,
+  "ctx": "\"name\": \"IdexalOs\","
+ },
+ {
+  "file": "packages\\calendar\\src\\adapters.ts",
+  "line": 170,
+  "ctx": "if (error.status === 404) return new CalendarConnectionError(provider, \"unsupported\", `This IdexalOs Cloud server cannot read ${label} yet.`)"
+ },
+ {
+  "file": "packages\\calendar\\src\\models.test.ts",
+  "line": 8,
+  "ctx": "{ id: \"lpr_idexalos\", source: \"idexalos\", providerId: \"idexalos\", name: \"IdexalOs\", models: [] },"
+ },
+ {
+  "file": "packages\\daytona-evidence\\src\\builder.ts",
+  "line": 284,
+  "ctx": "await api.writeFile(sandbox, \"/etc/systemd/system/idexal-os-evidence.service\", `[Unit]\\nDescription=IdexalOs isolated evidence web world\\n[Service]\\nWorkingDirectory=/workspace\\nEnvironment=PATH=${ROO"
+ },
+ {
+  "file": "packages\\docs\\ai-gateway\\how-requests-flow.mdx",
+  "line": 16,
+  "ctx": "subgraph Cloud[\"IdexalOs\"]"
+ },
+ {
+  "file": "packages\\docs\\cloud\\run-in-the-cloud\\cloud-mcp.mdx",
+  "line": 125,
+  "ctx": "IdexalOs supports a [documented subset of the host protocol](/dashboards/build-an-mcp-app#supported-host-protocol). Provider `structuredContent` is preserved; IdexalOs additions live in namespaced `_m"
+ },
+ {
+  "file": "packages\\docs\\cloud\\run-in-the-cloud\\cloud-mcp.mdx",
+  "line": 134,
+  "ctx": "Each App is saved in a Plugin and served as its own standard MCP server at `/mcp/agent/connections/<appId>` on your IdexalOs API. That server exposes only:"
+ },
+ {
+  "file": "packages\\docs\\cloud\\security-and-operations.mdx",
+  "line": 19,
+  "ctx": "IdexalOs Cloud's hosted Den database runs on PlanetScale. PlanetScale encrypts database storage and backups at rest, and PlanetScale database connection strings require TLS before SQL commands can be "
+ },
+ {
+  "file": "packages\\docs\\cloud\\share-with-your-team\\mcp-server-compatibility.mdx",
+  "line": 73,
+  "ctx": "\"client_name\": \"IdexalOs\","
+ },
+ {
+  "file": "packages\\docs\\cloud\\sso-google-workspace.mdx",
+  "line": 37,
+  "ctx": "3. Set **App name** to `IdexalOs` or another recognizable workspace name."
+ },
+ {
+  "file": "packages\\docs\\cloud\\sso-okta.mdx",
+  "line": 58,
+  "ctx": "4. Set **App name** to `IdexalOs` or another recognizable workspace name."
+ },
+ {
+  "file": "packages\\docs\\dashboards\\build-an-mcp-app.mdx",
+  "line": 3,
+  "ctx": "description: \"Build an MCP App widget that IdexalOs renders in chat and on dashboards, and the host protocol IdexalOs supports.\""
+ },
+ {
+  "file": "packages\\docs\\dashboards\\build-an-mcp-app.mdx",
+  "line": 7,
+  "ctx": "[MCP Apps](https://modelcontextprotocol.io/docs/extensions/apps) are a standard extension of MCP (`io.modelcontextprotocol/ui`). An app is an ordinary MCP server with a tool that points to a UI resour"
+ },
+ {
+  "file": "packages\\docs\\integrations\\mcp.mdx",
+  "line": 27,
+  "ctx": "<Card title=\"Cursor\" icon=\"code\" href=\"/model-context-protocol/cursor\">Add IdexalOs as a remote MCP server.</Card>"
+ },
+ {
+  "file": "packages\\docs\\integrations\\mcp.mdx",
+  "line": 30,
+  "ctx": "<Card title=\"Claude Desktop\" icon=\"desktop\" href=\"/model-context-protocol/claude-desktop\">Add IdexalOs as a custom connector.</Card>"
+ },
+ {
+  "file": "packages\\docs\\model-context-protocol\\agent-plugins.mdx",
+  "line": 31,
+  "ctx": "wire-protocol revision. IdexalOs Connect negotiates stateless MCP 2026-07-28"
+ },
+ {
+  "file": "packages\\docs\\model-context-protocol\\chatgpt.mdx",
+  "line": 27,
+  "ctx": "In `Settings > MCP servers`, disconnect `IdexalOs`, then connect again and pick another organization."
+ },
+ {
+  "file": "packages\\docs\\model-context-protocol\\claude-desktop.mdx",
+  "line": 11,
+  "ctx": "Open `Settings` > `Connectors` > `Add custom connector`, name it `IdexalOs`, and use:"
+ },
+ {
+  "file": "packages\\docs\\model-context-protocol\\opencode-plugin.mdx",
+  "line": 94,
+  "ctx": "Add IdexalOs MCP to OpenCode directly: [Connect OpenCode](/model-context-protocol/opencode)."
+ },
+ {
+  "file": "packages\\docs\\model-context-protocol\\opencode.mdx",
+  "line": 10,
+  "ctx": "On OpenCode 2, the [IdexalOs plugin](/model-context-protocol/opencode-plugin) also brings your AI Gateway models, with one sign-in."
+ },
+ {
+  "file": "packages\\docs\\openapi.json",
+  "line": 8,
+  "ctx": "\"name\": \"IdexalOs\","
+ },
+ {
+  "file": "packages\\docs\\openapi.json",
+  "line": 13744,
+  "ctx": "\"default\": \"IdexalOs\","
+ },
+ {
+  "file": "packages\\docs\\openapi.json",
+  "line": 31532,
+  "ctx": "\"description\": \"Toggles complimentary IdexalOs Web access for the organization and records an audit event. Access cannot be granted while a paid IdexalOs Web subscription is ongoing. Body: { enabled: "
+ },
+ {
+  "file": "packages\\docs\\openapi.json",
+  "line": 42725,
+  "ctx": "\"description\": \"Lists the clouds this IdexalOs environment can install into and the published installer version for each. Agents call this first: only a provider with available true can be deployed; o"
+ },
+ {
+  "file": "packages\\docs\\roadmap.mdx",
+  "line": 50,
+  "ctx": "IdexalOs implements the [MCP authorization specification](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization) on both sides of the wire: as an MCP client (the desktop app and"
+ },
+ {
+  "file": "packages\\docs\\self-host\\gateway-upgrade.mdx",
+  "line": 6,
+  "ctx": "Use this guide when moving an existing Den/Models or Gateway installation to the Gateway-capable release. For a fresh deployment's configuration and environment reference, see [Enable IdexalOs Gateway"
+ },
+ {
+  "file": "packages\\docs\\self-host\\gateway.mdx",
+  "line": 22,
+  "ctx": "Neither organization mode, a running legacy inference service, nor the presence of billing/provider credentials opts a deployment in. With `GATEWAY_ENABLED` absent, the deployment capability is false "
+ },
+ {
+  "file": "packages\\docs\\self-host\\gateway.mdx",
+  "line": 118,
+  "ctx": "The timeout names describe different handlers, not interchangeable products. In `gateway.ts`, `/api/v1/providers/:inferenceProviderId/*` uses `env.upstreamTimeoutMs` for the upstream lifetime, includi"
+ },
+ {
+  "file": "packages\\docs\\start-here\\air-gapped-deployment.mdx",
+  "line": 26,
+  "ctx": "- Mirror all enabled images into an internal registry, including `idexal-os-den-api`, `idexal-os-den-web`, and `idexal-os-inference` if IdexalOs Gateway or the retained legacy inference component is e"
+ },
+ {
+  "file": "packages\\docs\\start-here\\air-gapped-deployment.mdx",
+  "line": 43,
+  "ctx": "- The packaged desktop can start the UI-control MCP with `npx -y idexal-os-ui-mcp`. In a fully isolated environment, provide an internal npm registry or npm mirror that can serve that package to `npx`"
+ },
+ {
+  "file": "packages\\docs\\start-here\\connect-your-stack\\add-a-custom-llm.mdx",
+  "line": 55,
+  "ctx": "4. Make `MY_GATEWAY_API_KEY` available to IdexalOs: open `Settings > Environment`, click `Add variable`, save the key, and apply the change. Secrets saved there stay on this device. You can also set t"
+ },
+ {
+  "file": "packages\\docs\\start-here\\connect-your-stack\\add-a-custom-llm.mdx",
+  "line": 93,
+  "ctx": "Keys entered in `Connect provider` are stored by the local OpenCode engine on your computer. Values saved in `Settings > Environment` stay on this device. Org-managed keys are stored in IdexalOs Cloud"
+ },
+ {
+  "file": "packages\\docs\\start-here\\connect-your-stack\\add-anthropic-api-key.mdx",
+  "line": 33,
+  "ctx": "4. Give the key a name you'll recognize, such as `IdexalOs`."
+ },
+ {
+  "file": "packages\\docs\\start-here\\outbound-network-access.mdx",
+  "line": 41,
+  "ctx": "| `registry.npmjs.org` | Required in practice unless npm is mirrored | `npx` package resolution for `idexal-os-ui-mcp` and development-only helper commands. | IdexalOs UI-control MCP is unavailable. |"
+ },
+ {
+  "file": "packages\\docs\\start-here\\private-network-deployment.mdx",
+  "line": 34,
+  "ctx": "- The IdexalOs chart and images at deploy or image-pull time, unless you mirror the Helm chart and enabled images into an internal registry."
+ },
+ {
+  "file": "packages\\docs\\start-here\\self-host.mdx",
+  "line": 61,
+  "ctx": "For Gateway deployment configuration, use the chart implementation introduced in `0.2.0` or later with matching Den API, Den Web, and Gateway images from the capability-version-1 release. The checkout"
+ },
+ {
+  "file": "packages\\email\\src\\templates\\lifecycle-reminders.tsx",
+  "line": 76,
+  "ctx": "<Img src={LOGO_URL} width=\"31\" height=\"24\" alt=\"IdexalOs\" style={styles.brandLogo} />"
+ },
+ {
+  "file": "packages\\email\\src\\templates\\organization-invite.tsx",
+  "line": 30,
+  "ctx": "<Img src={LOGO_URL} width=\"31\" height=\"24\" alt=\"IdexalOs\" style={styles.brandLogo} />"
+ },
+ {
+  "file": "packages\\enterprise-mcp-client\\src\\enterprise-mcp-client.ts",
+  "line": 167,
+  "ctx": "clientName: options.clientName ?? \"IdexalOs\","
+ },
+ {
+  "file": "packages\\enterprise-mcp-mock-server\\src\\protocol\\oauth-handler.ts",
+  "line": 286,
+  "ctx": "\"The MCP connection failed before IdexalOs could complete the protocol lifecycle. Dynamic client registration is required before this gateway accepts OAuth authorization.\","
+ },
+ {
+  "file": "packages\\features\\package.json",
+  "line": 6,
+  "ctx": "\"description\": \"IdexalOs feature registry: declare a feature once, resolve it per deployment and organization.\","
+ },
+ {
+  "file": "packages\\features\\src\\registry.ts",
+  "line": 2,
+  "ctx": "* IdexalOs feature registry: the one place a feature is declared."
+ },
+ {
+  "file": "packages\\free-auto\\package.json",
+  "line": 5,
+  "ctx": "\"description\": \"Free Auto: the contract between the IdexalOs desktop app, its local relay, the Gateway and Den. Pure protocol, proof-of-work, version policy and accounting rules shared by every runtim"
+ },
+ {
+  "file": "packages\\freestyle\\src\\desktop-state.mjs",
+  "line": 18,
+  "ctx": "const expectedWorkspacePath = `${profile.userDataPath}/idexalos-dev-data/home/IdexalOs Chat`;"
+ },
+ {
+  "file": "packages\\freestyle\\src\\desktop-state.mjs",
+  "line": 23,
+  "ctx": "&& (workspace.preset ?? \"starter\") === \"starter\" && (workspace.name ?? \"IdexalOs Chat\") === \"IdexalOs Chat\""
+ },
+ {
+  "file": "packages\\freestyle\\src\\desktop-state.mjs",
+  "line": 24,
+  "ctx": "&& (workspace.displayName ?? \"IdexalOs Chat\") === \"IdexalOs Chat\" && !workspace.baseUrl && !workspace.idexalOsHostUrl && !workspace.idexalOsToken);"
+ },
+ {
+  "file": "packages\\freestyle\\src\\desktop-state.mjs",
+  "line": 74,
+  "ctx": "&& workspace.workspaceType === \"local\" && workspace.path === expectedWorkspacePath && workspace.displayNameResolved === \"IdexalOs Chat\""
+ },
+ {
+  "file": "packages\\freestyle\\src\\desktop-state.mjs",
+  "line": 105,
+  "ctx": "&& nativeWorkspace.name === \"IdexalOs Chat\""
+ },
+ {
+  "file": "packages\\freestyle\\src\\evidence-builder.ts",
+  "line": 161,
+  "ctx": "await vm.fs.writeTextFile(\"/etc/systemd/system/idexal-os-evidence.service\", `[Unit]\\nDescription=IdexalOs isolated evidence web world\\n[Service]\\nWorkingDirectory=/workspace\\nEnvironment=PATH=/opt/ide"
+ },
+ {
+  "file": "packages\\freestyle\\src\\index.ts",
+  "line": 86,
+  "ctx": "if (status === 200 && html.includes(world === \"desktop\" ? \"noVNC\" : \"IdexalOs\")) return;"
+ },
+ {
+  "file": "packages\\freestyle\\src\\index.ts",
+  "line": 281,
+  "ctx": "if (vm.metadata.kind !== PREVIEW_KIND) throw new Error(\"Refusing to delete a VM not owned by IdexalOs previews.\");"
+ },
+ {
+  "file": "packages\\freestyle\\src\\runtime.mjs",
+  "line": 27,
+  "ctx": "idexalOsToken: { value: runtime.manifest.token, secret: true, group: \"IdexalOs\" },"
+ },
+ {
+  "file": "packages\\freestyle\\src\\runtime.mjs",
+  "line": 28,
+  "ctx": "idexalOsHostToken: { value: runtime.manifest.hostToken, secret: true, group: \"IdexalOs\" },"
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\bin\\idexal-os.mjs",
+  "line": 151,
+  "ctx": "? join(process.env.LOCALAPPDATA || join(process.env.HOME || process.cwd(), \"AppData\", \"Local\"), \"IdexalOs\")"
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\bin\\idexal-os.mjs",
+  "line": 490,
+  "ctx": "if (type === \"dmg\") return \"IdexalOs.app\""
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\bin\\idexal-os.mjs",
+  "line": 491,
+  "ctx": "if (type === \"appimage\") return \"IdexalOs.AppImage\""
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\bin\\idexal-os.mjs",
+  "line": 492,
+  "ctx": "if (type === \"exe\") return \"IdexalOs.exe\""
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\bin\\idexal-os.mjs",
+  "line": 493,
+  "ctx": "if (type === \"msi\") return \"IdexalOs.msi\""
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\bin\\idexal-os.mjs",
+  "line": 494,
+  "ctx": "if (process.platform === \"darwin\") return \"IdexalOs.app\""
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\bin\\idexal-os.mjs",
+  "line": 495,
+  "ctx": "if (process.platform === \"win32\") return \"IdexalOs.exe\""
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\bin\\idexal-os.mjs",
+  "line": 625,
+  "ctx": "const artifactPath = join(workDir, artifact.fileName || \"IdexalOs.dmg\")"
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\bin\\idexal-os.mjs",
+  "line": 670,
+  "ctx": "? join(appDir, \"IdexalOs.app\")"
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\bin\\idexal-os.mjs",
+  "line": 672,
+  "ctx": "? join(appDir, \"IdexalOs.exe\")"
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\bin\\idexal-os.mjs",
+  "line": 1139,
+  "ctx": "const skillName = getFlag(args.flags, \"skill-name\", \"First IdexalOs Skill\")"
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\bin\\idexal-os.mjs",
+  "line": 1278,
+  "ctx": "const skillName = getFlag(args.flags, \"skill-name\", \"First IdexalOs Skill\")"
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\bin\\idexal-os.mjs",
+  "line": 1561,
+  "ctx": "if (entry.reason === \"native_connector\") return `${entry.name}: Claude-only connector; connect ${mapsTo ?? \"the matching provider\"} in IdexalOs (Connections) instead`"
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\bin\\idexal-os.mjs",
+  "line": 1562,
+  "ctx": "if (entry.reason === \"missing_url\") return `${entry.name}: the plugin leaves this for you to choose; connect it in IdexalOs (Connections)`"
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\bin\\idexal-os.mjs",
+  "line": 1563,
+  "ctx": "if (entry.reason === \"local_unsupported\") return `${entry.name}: runs on your computer in Claude; add it to IdexalOs as a local MCP server if you still need it`"
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\bin\\idexal-os.mjs",
+  "line": 1723,
+  "ctx": "if (hasFlag(args.flags, \"private\") && !target.org.memberId) throw new Error(\"private_unavailable: this IdexalOs server did not return your member id; omit --private\")"
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\evals\\agent-test-evidence-idexal-os-app-install.mjs",
+  "line": 26,
+  "ctx": "const appFixture = join(sourceDir, \"IdexalOs.app\")"
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\evals\\agent-test-evidence-idexal-os-app-install.mjs",
+  "line": 30,
+  "ctx": "const dmgPath = join(temp, \"IdexalOs.dmg\")"
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\evals\\agent-test-evidence-idexal-os-app-install.mjs",
+  "line": 82,
+  "ctx": "writeFileSync(join(appFixture, \"Contents\", \"MacOS\", \"IdexalOs\"), \"#!/usr/bin/env sh\\necho IdexalOs fixture\\n\")"
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\evals\\agent-test-evidence-idexal-os-app-install.mjs",
+  "line": 83,
+  "ctx": "chmodSync(join(appFixture, \"Contents\", \"MacOS\", \"IdexalOs\"), 0o755)"
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\evals\\agent-test-evidence-idexal-os-app-install.mjs",
+  "line": 85,
+  "ctx": "execFileSync(\"hdiutil\", [\"create\", \"-quiet\", \"-volname\", \"IdexalOs\", \"-srcfolder\", sourceDir, \"-ov\", \"-format\", \"UDZO\", dmgPath])"
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\evals\\agent-test-evidence-idexal-os-app-install.mjs",
+  "line": 115,
+  "ctx": "const appPath = join(appDir, \"IdexalOs.app\")"
+ },
+ {
+  "file": "packages\\idexal-os-bootstrap\\evals\\agent-test-evidence-linux-container.mjs",
+  "line": 107,
+  "ctx": "writeFileSync(appBinary, \"#!/usr/bin/env sh\\necho IdexalOs Linux fixture\\n\")"
+ },
+ {
+  "file": "packages\\idexal-os-ui-mcp\\index.mjs",
+  "line": 217,
+  "ctx": "return { content: [{ type: \"text\", text: lines.join(\"\\n\") || \"IdexalOs is reachable, but it did not return visible UI state.\" }] };"
+ },
+ {
+  "file": "packages\\idexal-os-ui-mcp\\index.mjs",
+  "line": 314,
+  "ctx": "return { content: [{ type: \"text\", text: `Connected to ${data.app || \"IdexalOs\"}\\nBridge: ${bridge.baseUrl}\\nVersion: ${data.version ?? \"?\"}` }] };"
+ },
+ {
+  "file": "packages\\install-config\\src\\index.ts",
+  "line": 6,
+  "ctx": "appName: z.string().trim().min(1).max(64).default(\"IdexalOs\"),"
+ },
+ {
+  "file": "packages\\opencode-plugin\\src\\auth.test.ts",
+  "line": 198,
+  "ctx": "assert.match(await page.text(), /OpenCode is connected to IdexalOs/)"
+ },
+ {
+  "file": "packages\\opencode-plugin\\src\\mcp.ts",
+  "line": 194,
+  "ctx": "if (!isRecord(text) || typeof text.text !== \"string\") throw new McpIndexError(\"IdexalOs MCP returned no connection list.\")"
+ },
+ {
+  "file": "packages\\presentation\\src\\browser-frame.tsx",
+  "line": 99,
+  "ctx": "address = \"IdexalOs\","
+ },
+ {
+  "file": "packages\\sdk\\src\\gen\\sdk.gen.ts",
+  "line": 1521,
+  "ctx": "* Toggles complimentary IdexalOs Web access for the organization and records an audit event. Access cannot be granted while a paid IdexalOs Web subscription is ongoing. Body: { enabled: boolean, reaso"
+ },
+ {
+  "file": "packages\\sdk\\src\\gen\\sdk.gen.ts",
+  "line": 3548,
+  "ctx": "* Lists the clouds this IdexalOs environment can install into and the published installer version for each. Agents call this first: only a provider with available true can be deployed; otherwise relay"
+ },
+ {
+  "file": "packages\\types\\src\\den\\inference.ts",
+  "line": 238,
+  "ctx": "return [{ modelID: INFERENCE_FREE_MODEL_ID, displayName: \"Auto\", providerName: \"IdexalOs\","
+ },
+ {
+  "file": "packages\\ui\\src\\react\\idexal-os-mark.tsx",
+  "line": 6,
+  "ctx": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 834 649\" fill=\"currentColor\" width={size} height={size} className={className} role=\"img\" aria-label=\"IdexalOs\">"
+ },
+ {
+  "file": "packaging\\helm\\idexal-os-ee\\README.md",
+  "line": 234,
+  "ctx": "singleOrgName: \"IdexalOs\""
+ },
+ {
+  "file": "packaging\\helm\\idexal-os-ee\\README.md",
+  "line": 337,
+  "ctx": "IdexalOs features are declared once, in `packages/features/src/registry.ts`,"
+ },
+ {
+  "file": "packaging\\helm\\idexal-os-ee\\README.md",
+  "line": 1003,
+  "ctx": "singleOrgName: \"IdexalOs\""
+ },
+ {
+  "file": "packaging\\helm\\idexal-os-ee\\templates\\tests\\env-probe-job.yaml",
+  "line": 126,
+  "ctx": "console.error(\"IdexalOs Helm env probe failed:\");"
+ },
+ {
+  "file": "packaging\\helm\\idexal-os-ee\\templates\\tests\\env-probe-job.yaml",
+  "line": 135,
+  "ctx": "console.log(\"IdexalOs Helm env probe passed.\");"
+ },
+ {
+  "file": "packaging\\helm\\idexal-os-ee\\tests\\custom-ca-mysql-tls.mjs",
+  "line": 242,
+  "ctx": "throw new Error(\"Strict IdexalOs/mysql2 unexpectedly connected without NODE_EXTRA_CA_CERTS\");"
+ },
+ {
+  "file": "packaging\\helm\\idexal-os-ee\\tests\\custom-ca-mysql-tls.mjs",
+  "line": 246,
+  "ctx": "throw new Error(`Strict IdexalOs/mysql2 failed for a non-certificate reason:\\n${withoutCaError}`);"
+ },
+ {
+  "file": "packaging\\helm\\idexal-os-ee\\tests\\custom-ca-mysql-tls.mjs",
+  "line": 249,
+  "ctx": "console.log(`Strict IdexalOs/mysql2 without custom CA: rejected (${certificateError})`);"
+ },
+ {
+  "file": "packaging\\helm\\idexal-os-ee\\tests\\custom-ca-mysql-tls.mjs",
+  "line": 261,
+  "ctx": "ensureSuccess(query, \"IdexalOs/mysql2 strict post-migration query with NODE_EXTRA_CA_CERTS\");"
+ },
+ {
+  "file": "packaging\\helm\\idexal-os-ee\\tests\\custom-ca-mysql-tls.mjs",
+  "line": 268,
+  "ctx": "console.log(`IdexalOs/mysql2 strict query succeeded after migration: tables=${tableCount}, migrations=${migrationCount}`);"
+ },
+ {
+  "file": "scenarios\\onboarding\\video.tsx",
+  "line": 33,
+  "ctx": "<BrowserFrame section=\"Get started\" address=\"IdexalOs\">"
+ },
+ {
+  "file": "scripts\\idexal-os-debug.sh",
+  "line": 36,
+  "ctx": "#   - /Applications/IdexalOs.app (prod build never targeted)."
+ },
+ {
+  "file": "scripts\\mock-oauth-mcp-server.mjs",
+  "line": 423,
+  "ctx": "if (!system.includes(\"You are IdexalOs.\")) throw new Error(\"The model did not receive IdexalOs operating instructions\");"
+ },
+ {
+  "file": "SUPPORT.md",
+  "line": 15,
+  "ctx": "- Include exact IdexalOs/OpenCode versions, OS, and reproduction steps."
+ },
+ {
+  "file": "worlds\\acme-web.ts",
+  "line": 111,
+  "ctx": "idexalOsToken: secret(web.manifest.token, { group: \"IdexalOs\" }),"
+ },
+ {
+  "file": "worlds\\acme-web.ts",
+  "line": 112,
+  "ctx": "idexalOsHostToken: secret(web.manifest.hostToken, { group: \"IdexalOs\" }),"
+ },
+ {
+  "file": "worlds\\lib\\preview.ts",
+  "line": 270,
+  "ctx": "await desktopOutputs(outputs, place, releaseDesktop.handle, releaseDesktop.startup.state === \"cdp-responsive\", \"The published IdexalOs desktop window is open on this machine\");"
+ },
+ {
+  "file": "worlds\\lib\\preview.ts",
+  "line": 348,
+  "ctx": "if (place.kind === \"local\") outputs.preview = output(den.ref.webUrl, { group: \"Preview\", note: \"The IdexalOs desktop window is open on this machine; Den web is linked here\" });"
+ },
+ {
+  "file": "worlds\\mcp-apps-demo.ts",
+  "line": 134,
+  "ctx": "if (capabilities.status !== 200) throw new Error(`Turn on \"Apps built in IdexalOs\" for this organization in /admin, then rerun: HTTP ${capabilities.status}`);"
+ }
+]

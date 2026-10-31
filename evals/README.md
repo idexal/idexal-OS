@@ -1,0 +1,681 @@
+# idexal Os tests and test evidence
+
+E2E coverage is nine core journeys in [`core/`](./core), listed in
+[`journeys.ts`](./journeys.ts), plus one-off PR proofs in [`proofs/`](./proofs). Specs import
+`test` from `@idexal/testkit`. Tests that drive Electron, Den, or another app
+surface use `.e2e.test.ts`. Unit tests of the eval packages themselves sit next
+to the module they test (`packages/*/src/**/*.test.ts`) and run in the same
+`pr` project.
+
+## How CI works (start here)
+
+Every PR to `dev` gets three things:
+
+1. **Unit tests and build** (`ci-tests.yml`: "Unit tests", "Build and boot the
+   desktop app"). Compiles everything, runs the unit tests, then packages the
+   real desktop app and boots it once. Red here means a normal code problem.
+2. **The core journey** (`pr-proof.yml`: "Core journey"). One end-to-end test,
+   [`core/core-chat.e2e.test.ts`](./core/core-chat.e2e.test.ts): open the app
+   signed in, send "Say hello", read the reply. It runs on every PR that changes
+   more than docs. Any e2e spec your PR adds or changes also runs.
+3. **A preview card** on the PR. **Open preview** opens the app exactly where the
+   core journey left it: signed in, with a chat. Each copy lives 1 hour; the
+   link works for 12 hours.
+
+### The world
+
+The app does not run on the CI runner. It runs in a **world**: a Freestyle VM
+snapshot holding all of idexal Os (web app, server, Den with a demo org, AI
+gateway with a fake model that answers "Acme AI Gateway is working.", and a
+signed-in Chrome). The runner only drives it, so the CI job stays small.
+
+Every push to `dev` keeps `dev`'s world ready ("Freestyle warm dev image"). A PR
+gets its world one of three ways; the job summary says which, and why:
+
+| Your PR changes | What happens | Time |
+| --- | --- | --- |
+| Nothing that runs (docs, tests, CI, website) | reuse `dev`'s world | ~2s |
+| App UI, Den web or Den API code | copy `dev`'s running world, check out, reload | ~15-25s |
+| Anything else | build from the warm image | ~3 min |
+
+The rules are `HOT_RULES` in
+[`packages/freestyle/src/evidence-builder.ts`](../packages/freestyle/src/evidence-builder.ts).
+If the fast path fails, the world is built in full instead: a PR can get
+slower, never red, because of it.
+
+### When it is red
+
+- **Unit tests or build:** read the failing step; it is your code.
+- **Core journey:** open the job. The "Freestyle world" table says which path
+  ran and how long each step took. A failed world prints the VM's own log under
+  "builder log". A failed journey prints what was on screen when it gave up.
+- **Evidence card says "needs attention":** open the report from the card; it
+  has a screenshot of every step.
+
+### Changing CI itself
+
+After touching the world, `HOT_RULES` or the warm image, run the world check:
+`node evals/scripts/check-freestyle-world.ts` (or the manual "Freestyle world
+check" workflow). It pushes throwaway docs, UI, Den API, Den web, server and
+gateway changes, builds each world, runs the core journey on it and prints a
+pass/fail table with timings. Add `--base <sha>` to test your branch as if it
+were `dev`.
+
+## Paved path
+
+Use the skills in this order:
+
+1. `write-a-spec`
+2. `run-tests`
+3. `diagnose-a-red-run` when the run fails
+4. `open-a-pr`; CI runs the core journey and the changed specs on the PR head and publishes the evidence
+
+Demo-driven features start from a world script plus a core journey step or a proof.
+
+## Experimental verification dictionary
+
+See [Verification dictionary](./verification-dictionary.md) for closed-set Jev
+compilation, deterministic replay with zero model calls, the full 59-method
+channel inventory, privacy boundaries, and offline/live benchmark instructions.
+This opt-in compiler selects checked-in assertions; it is not an app-state judge.
+
+## Glossary
+
+| Term | Meaning |
+| --- | --- |
+| world | An executable TypeScript script that creates and holds concrete resources. |
+| receipt | PID ownership metadata for a detached script world. |
+| place | Where launched resources run: `local` or `daytona`. |
+| substrate | What runs the Den control plane: local processes or `kind`. |
+| witness | A deterministic provider stand-in that records what it saw. |
+| fault | Declared misbehavior used to reproduce a failure condition. |
+| surface | A drivable UI: `appWeb` (the app in headless Chrome), `desktop` (Electron), or `web` (Den UI in Chrome). |
+| origin | Whether a resource is launched or attached. See below. |
+| live | A spec attached to a live shared substrate; red is an incident signal about the service, not a verdict on the diff. |
+
+### Resource ownership
+
+The script's `AsyncDisposableStack` owns what the script creates and disposes it
+in reverse order. Attached or shared resources expose handles whose disposers
+release only script-owned additions, such as local port-forwards or an
+organization created for that run; they do not stop or delete the shared
+substrate. The rule is: **the stack owns what the script creates, not what it
+attaches to.**
+
+## Skills map
+
+Skills own mechanics; this README owns the map and vocabulary.
+
+| Task | Skill to load | When |
+| --- | --- | --- |
+| Author a spec | `write-a-spec` | Add a step to a core journey in `evals/core`, or a proof in `evals/proofs`. |
+| Run tests | `run-tests` | Run a selected spec; the CLI chooses and reports placement. |
+| Failing or red run | `diagnose-a-red-run` | Classify a failure before changing code. |
+| Design notes on a PR | `fix-design-notes` | Read the design notes in the Evidence preview check, fix what they found, prove the note is gone. |
+| Missing secret or environment variable | `get-env-var` | Load a required team secret into the shell. |
+| Drive the app by hand over CDP | `drive-desktop-cdp` | Check a UI change in `dev-app-web --browser` (headless) or, when the desktop shell matters, a desktop window. |
+| Drive local Electron via CDP | `browser-automation` | Explore or debug the local desktop surface. |
+| Daytona setup or sandbox debugging | `daytona` | Repair the CLI, snapshots, sandboxes, or secrets volume. |
+| Demo artifacts | `record-a-demo` | Capture supplementary screenshots or recordings. |
+
+## Install and run
+
+`evals/` is a standalone pnpm workspace so its tooling cannot affect product
+installs or image builds.
+
+```bash
+pnpm --dir evals install
+pnpm evals:pr
+pnpm evals:e2e composer-draft-reload --local   # the app in headless Chrome
+```
+
+`app-smoke` and other specs bound to the `desktop` surface open an Electron
+window when run with `--local`; run them on Daytona unless you want the window.
+
+`pnpm --dir evals typecheck` (also `pnpm evals:typecheck`) type-checks every
+spec, world, driver, script, and package under `evals/` and must exit 0 (run it
+before pushing; the CI step lands separately). It compiles with the bundler resolution Vitest
+uses and reports only diagnostics that belong to `evals/` (or to files the
+config includes explicitly), because the `apps/` and `ee/` sources a spec pulls
+in are compiled by their own projects with their own flags. Nothing inside
+`evals/` is filtered: a spec that no longer matches the testkit API is red here.
+
+### E2E CLI
+
+Run the E2E lane with `pnpm evals:e2e [test-names...]`. Naming a test
+auto-satisfies the opt-in flags declared in its source, but value-bearing
+environment variables such as `IDEXAL_EVAL_MODEL` are never auto-set. Vision
+judging is deferred by default; add `--with-llm-vision` to judge inline. Use
+`--local` to force isolated local resources, `--daytona` to require Daytona,
+`--den <url>` to reuse Den, or `--publish --pr <number>` to judge and publish
+existing evidence. Without a placement flag, the CLI probes Daytona auth and
+prints `placement: <daytona|local> (<reason>)` for the placement asserted in the
+runtime environment. `--local` and `--daytona` override inherited placement;
+transport, engine, and surface selectors are never inferred as source opt-ins.
+
+Registered cases select a concrete world and can select their engine without
+raw environment variables. `CONT-01` and `SWITCH-10` are fixed headless app-web
+worlds. Use `pnpm evals:e2e --list` to see the registered cases. The legacy
+`--surface` selector is migration validation only: it cannot change a declared
+world's implementation, and selecting Electron for either case is rejected.
+
+```bash
+pnpm evals:e2e streamed-markdown-answer --local --engine v2 --case CONT-01
+```
+
+A focused web case avoids legacy Den/Electron suite preparation, but still
+boots the real Vite app, server, engine, and Chrome; install dependencies first.
+This fast path is not a guarantee for the duration of a first cold install.
+Explicit `--local` placement cannot be overridden by source consent or inherited
+Daytona settings. `--daytona` uses provided slot environment as advanced
+configuration, runs one selected case per sandbox, and checks the immutable
+ref/source guard before launch.
+
+Under Daytona the spec files run from this checkout while the sandbox builds
+`IDEXAL_EVAL_REF` (default `dev`). The CLI resolves that ref against `origin`,
+appends `ref=<ref>` to the placement line, and warns on stderr when it differs
+from the runner `HEAD`; `--strict-ref` (or `IDEXAL_EVAL_STRICT_REF=1`) turns
+the warning into a failure before any sandbox is provisioned. Evidence records
+both commits: `gitSha` is the runner checkout and `sandboxRef` is the ref the
+sandbox built. To test a branch, push it and export
+`IDEXAL_EVAL_REF=$(git rev-parse HEAD)`.
+
+`--case` filters Vitest by the registered literal case prefix. A passing result
+means that selected case passed; other cases in the file are reported as not
+run. A selected skip, unknown result, zero matches, or missing JSON report is
+incomplete; any non-selected case that executes is a contract failure.
+Daytona slot IDs and refs remain advanced environment configuration.
+
+| Exit | Named test | Unfiltered E2E suite | Publish |
+| --- | --- | --- | --- |
+| `0` | Passed | Passed, or incomplete with expected skips | Published |
+| `1` | Failed | Failed | Failed claims published, or publish failed |
+| `2` | Incomplete because it skipped | Not used | Claims pending judgment |
+
+See `run-tests` for environment requirements and the cold-boot verdict check.
+
+Every `evals/core/*.e2e.test.ts` and `evals/proofs/*.proof.test.ts` file on disk runs in the E2E lane. To stop a
+spec from running, delete it; history keeps the removed test available.
+
+## Authoring contract
+
+Two kinds of e2e test live here:
+
+- **Core journeys** (`core/*.e2e.test.ts`): the nine journeys in `journeys.ts`.
+  If one breaks, customers notice the same day. They run on every PR and nightly,
+  and are never weakened to make a PR green. Adding one is a review decision.
+- **Proofs** (`proofs/*.proof.test.ts`): one-off evals an agent writes to prove
+  one change on one PR. They run on that PR and are not maintained; if one keeps
+  mattering, fold its steps into a core journey.
+
+`evals/specs` is retired. Unit and integration tests live next to the module
+they test; security rules are API tests in `ee/apps/den-api/test/api`.
+`pnpm --dir evals lint:specs` (`scripts/spec-lint`) enforces three rules with no
+baseline, and each error says what to do instead: `allowed-files`,
+`real-product` (no product-source imports, mocks, filesystem/database access or
+reaching into the app) and `honest` (no skips, sleeps or self-graded evidence;
+every test asserts something a person or client observes).
+
+- Import `test` from `@idexal/testkit`.
+- Name core journeys `core/<slug>.e2e.test.ts` and proofs `proofs/<slug>.proof.test.ts`; app-less unit tests live next to their module.
+- Acquire resources in dependency order with `needs()` → `server()` → `app()`.
+- Drive user-visible behavior and assert observable outcomes. Backend, file,
+  and process checks may witness side effects but do not replace the journey.
+- Bound every wait and declare external requirements in `needs()` so missing
+  dependencies skip with a named reason.
+- Assert both positive and negative sides of identity or permission boundaries.
+
+## Writing specs
+
+New app-driving specs use `spec.world()` and four capability-restricted
+channels. Import them only from `@idexal/testkit`.
+
+| Channel | Purpose | Allowed effects |
+| --- | --- | --- |
+| `seed` | Arrange the world | Create Den, desktops, browsers, data, mocks, sessions, and faults; this is the only API/state write channel. |
+| `user` | Act as a person | Trusted CDP mouse, keyboard, navigation, reload, visible assertions, screenshots, and vision checks. It cannot evaluate JS, fetch, or use app controls. |
+| `agent` | Use the product automation rail | Explicit `window.__idexalOsControl` actions, including agent sends and session actions. |
+| `probe` | Observe without changing state | Read text, composer/storage/hash/API/witness state, and poll with `eventually`. Probe API calls are GET-only. |
+
+A world is an imperative async function. Resources created through `seed` are
+owned by the fixture's `AsyncDisposableStack` and released in reverse order.
+Worlds are per-test by default; `{ scope: "file" }` shares exactly the handles
+the world returns. E2E files automatically need
+`IDEXAL_EVAL_E2E_TESTS=1`, and unmet needs skip before the world starts.
+
+```ts
+export async function emptySession(seed: Seed) {
+  const workspacePath = seed.tmpPath("empty-session");
+  const app = await seed.appWeb({ workspacePath });
+  await seed.workspace(app, workspacePath);
+  await seed.session(app);
+  return { app };
+}
+```
+
+Ordinary app UI authoring defaults to `seed.appWeb({ workspacePath })` (headless Chrome, the real
+app, server, and engine). Bind the world's resources explicitly at `spec.world`:
+
+```ts
+const test = spec.world(emptySession, {
+  resources: { surfaces: ["appWeb"], services: [] },
+});
+```
+
+Use `seed.desktop()` only for a native capability a browser cannot prove, and
+explain that capability in the binding's `nativeReason`, for example:
+
+```ts
+const nativeTest = spec.world(nativeFileDialog, {
+  resources: {
+    surfaces: ["desktop"],
+    services: [],
+    nativeReason: "Verify the operating-system file dialog opened through the Electron bridge.",
+  },
+});
+```
+
+Surfaces, services, and placement are separate: declare `den` and `mock` under
+`services` when the world creates them; choose local or Daytona with the runner's
+placement flags. `seed.web()` drives **Den UI**, not the app, and requires
+`surfaces: ["web"]` plus `services: ["den"]`. For declared worlds, the resource
+guard refuses an undeclared surface or service before launch, and a desktop
+declaration requires a non-empty `nativeReason`. Undeclared legacy worlds are
+temporarily allowed within the deferred migration scope; that compatibility is
+not the authoring default.
+
+`app` and `web` are conventional primary surface names. If the returned world
+has one of them (or exactly one surface), channel calls use it by default;
+otherwise bind explicitly with `user.on(surface)`, `agent.on(surface)`, or
+`probe.on(surface)`.
+
+Use `step(name, fn)` for a claim-sized frame. Steps may nest; failures are
+recorded and rethrown, and a later attempted step is marked `not-reached`.
+Every channel call and step automatically contributes a chronological evidence
+trace and the body wrapper records the passed, failed, or skipped outcome.
+
+The body call-order rule prevents accidental setup disguised as user behavior:
+`seed.*` before the first `user.*` or `agent.*` act throws. Put that setup in the
+world. Mid-flow seeding after an act is explicit and allowed; probes do not
+change the ordering state.
+
+`seed.evalIn()` (`[seed:raw]`) and `probe.eval()` (`[probe:raw]`) are migration
+escape hatches. Both take type-checked browser callbacks and await promises automatically.
+`probe.eval` accepts `{ timeoutMs?: number }` after either `(callback)` or
+`(surface, callback)`. Raw JavaScript strings are rejected. New specs must not use them; spec-lint rejects them in `core/` and `proofs/`.
+
+Before, composer reload coverage imported hosts, behaviors, CDP evaluation, and
+evidence APIs directly. After, the journey is only:
+
+```ts
+const test = spec.world(emptySession, {
+  resources: { surfaces: ["appWeb"], services: [] },
+});
+test("a draft survives reloads", async ({ user, probe, step }) => {
+  await user.type("composer", "Keep this draft");
+  const revision = await probe.storage("idexal-os.session-drafts.v2", pickRevision);
+  await step("draft survives three reloads", async () => {
+    for (let i = 0; i < 3; i += 1) {
+      await user.reload();
+      await user.see("composer", { editable: true, text: "Keep this draft" });
+    }
+  });
+  expect(await probe.storage("idexal-os.session-drafts.v2", pickRevision)).toBe(revision);
+});
+```
+
+`"composer"` is the documented well-known target for the Lexical
+`[contenteditable="true"][data-lexical-editor="true"]` editor. Other targets use
+accessible name, role, label, placeholder, test ID, and optional `nth`; `text`
+and `label` accept strings or regular expressions. A unique visible element
+whose inner text starts with a string is the fallback for a non-exact text/name
+match.
+
+`user.type(target, text)` appends by default. Pass `{ replace: true }` to focus
+with a real click, select all with the platform key chord, and replace the
+current value. `user.see(target, { text })` compares contenteditable inner text
+and accepts a string or regular expression. Clicks require center-point hit
+testing; `{ hitTest: false }` is a last resort for an intentionally covered
+target and still performs a trusted CDP click at that element's center.
+
+`probe.dom(selector)` reads a fixed DOM snapshot: matching elements in document
+order with text, focus and rectangles, plus viewport/document widths. It never
+returns input values or accepts executable callbacks. Use it for geometry and
+focus assertions after trusted `user.press("Tab")` actions, rather than raw eval.
+
+Worlds can arrange a shaped Den connection with `seed.denLink(den, options)`;
+the returned link is fixture-owned. `probe.connectState(app)` reads the
+testkit's normalized desktop Connect state without exposing the raw helper to a
+spec.
+
+## Layers
+
+Imports only point down: a layer may use lower layers, never a higher layer.
+This is enforced by `pnpm --dir evals run lint:layers`.
+
+| Layer | Contents | Rule |
+| --- | --- | --- |
+| L0 | `@idexal/matchers` | Turn supplied facts into pure findings; no I/O. |
+| L1 | `@idexal/cdp`, `@idexal/labs` | Provide protocol and lab primitives; do not own journeys or test lifecycle. |
+| L2 | `@idexal/behaviors` | Provide framework-free actions and observations over narrow handles. |
+| L3 | root `@idexal/world` + `@idexal/env` | The shared package owns script discovery, CLI receipts, and the headless-web surface; env provides concrete eval resources. Neither depends on Vitest. |
+| L4 | `@idexal/testkit` and `evals/bin/evals.mjs` | Adapt environments to specs, Vitest, and evidence. |
+
+## Composable packages and diagnostics
+
+The packages under [`packages/`](./packages) are independently consumable, but
+executable coverage is always assembled as a journey under `core/` or a proof under `proofs/`.
+
+| Package | Owns |
+| --- | --- |
+| root `@idexal/world` | script discovery, CLI lifecycle receipts, local state store, `hold()`, and headless-web surface |
+| `@idexal/env` | places and concrete Den, desktop, mock, LiteLLM, and kind resources |
+| `@idexal/testkit` | thin Vitest adapter: fixture, needs/skip mapping, evidence bridging, and spec-facing re-exports |
+| `@idexal/cdp` | raw CDP client, targets, `Surface`, and `attachSurface` |
+| `@idexal/labs` | egress, identity-provider, release-feed, and mock-MCP labs |
+| `@idexal/hosts` | local and Daytona hosts and `resolveHost()` |
+| `@idexal/behaviors` | framework-free actions and observations over narrow handles |
+| `@idexal/matchers` | pure findings over facts, with no I/O |
+| `@idexal/test-evidence` | screenshot capture, visual validation, and ambient test-evidence recording used by testkit |
+| `@idexal/timeline` | timing spans for long test journeys |
+| `@idexal/test-artifacts` | index, render, and PR publication for completed test runs |
+
+Because behaviors and matchers do not depend on a test context, they also power
+the standalone diagnostic script at `evals/scripts/diagnose.mts`. It imports
+only `@idexal/behaviors` and `@idexal/matchers` and can inspect a real
+endpoint without creating test evidence.
+
+## Worlds
+
+A world is a plain executable TypeScript file. Everyday ones live under
+`worlds/` (see `worlds/README.md` for the `preview-`/`dev-`/`live-` names);
+one used by a single test, doc, or example lives next to it and runs by path. Each script
+creates concrete async resources in dependency order, registers them with a
+native `AsyncDisposableStack`, and calls `hold()` after it is ready. Typical
+resources are `server`, `createAdmin`, `createOrg`, `inviteMember`, `app`,
+`mcpMock`, `liteLlm`, and `launchHeadlessWeb`.
+
+Every checked-in script is guarded by `if (import.meta.main)`. Importing one is
+therefore side-effect-free until a caller invokes an exported builder. Specs,
+docs tooling, and the script entry point use those same builders; there is no
+second lifecycle layer.
+
+Everyday scripts are `preview-desktop` (app only), `preview-den` (Den only),
+`preview-full` (Den plus desktop), `preview-app-web`, `acme-web`, `dev-app-web`,
+and `live-desktop`/`live-app-web`. `pnpm world list` shows the current set.
+Colocated scripts include `evals/docs-shots/world.ts` and `evals/worlds/infra/`.
+
+Detached scripts write PID ownership receipts to
+`evals/results/.worlds/scripts/<name>.json`. A receipt records the script path,
+PID, creation time, and non-secret outputs. It is lifecycle metadata, not a
+recipe for recreating resources.
+
+### World CLI
+
+The root `pnpm world` command requires Node 24+. Its interactive lifecycle is:
+
+```bash
+pnpm world up preview-full -- --scenario workspace   # foreground; Ctrl-C disposes its stack
+pnpm world up preview-den --detach                   # background; waits for its receipt
+pnpm world up ./evals/docs-shots/world.ts --detach --timeout 600000
+pnpm world down preview-den                          # signal it and wait for native disposal
+pnpm world list
+pnpm world forget <name>
+pnpm world help
+
+# A path or the filename-derived name selects the same script.
+pnpm world up ./worlds/dev-app-web.ts
+pnpm world up ./examples/litellm-per-member-keys/world.ts
+
+# Script-specific arguments must follow the separator.
+pnpm world up dev-app-web --detach -- --replace --keep-tokens
+pnpm world up live-app-web -- --allow-shared-state
+pnpm world up live-desktop -- --allow-shared-state
+```
+
+The generic `up` options are only `--detach` and, with detached mode,
+`--timeout <ms>`. Everything after `--` is passed unchanged to the selected
+script. `down` sends the script a termination signal and waits while its
+`AsyncDisposableStack` releases owned resources. `forget` removes receipt
+metadata only; it does not stop the process. `help` and `list` discover
+`worlds/*.ts`; old names fail with a pointer to their replacement.
+
+`live-desktop` is a deliberately dangerous local-only mode. It launches
+source Electron through `pnpm dev` with isolated Electron userData, app
+identifier, Vite/CDP ports, and protocol registration, while resolving the
+installed production `IDEXAL_DATA_DIR` and channel-aware `OPENCODE_DB` only at
+launch time. It never copies or symlinks those stores, does not boot or modify a
+Den, and does not seed a workspace, session, or sign-in. Production may remain
+running, but concurrent writes from production and dev are unsupported and may
+corrupt state. Its parser requires exactly `--allow-shared-state`, after the
+`world up` argument separator. Disposal stops only the source dev process and
+does not delete shared stores.
+
+`live-app-web` applies the same symbolic state selection to source Vite +
+`idexal-os-server` without Electron. Its production tokens, server state, config,
+idexal Os data, and OpenCode database are resolved in place and never copied into
+the receipt. It requires the same exact script argument and refuses remote
+access, public hosts, and non-loopback host bindings.
+
+`evals/worlds/den-split-origin-kind.world.ts` attaches to the shared
+`idexal-os-kube-lab` kind substrate and owns only its local port-forwards; it
+needs local Docker, kind, kubectl, and Helm (`pnpm world up den-split-origin-kind`).
+Daytona cannot host this substrate: its sandbox has no Docker binary or daemon,
+reports `CapEff: 0000000000000000`, and blocks `unshare -Urm`, so no container
+runtime can start kind there.
+
+## Recipes
+
+### Drive the app
+
+Import the script's builder, create one disposal stack, and call the builder.
+Compose journeys from `@idexal/behaviors`; executable coverage belongs in
+`evals/core` or `evals/proofs`.
+
+```ts
+import { bootAcmeDocs } from "../docs-shots/world.ts";
+
+await using stack = new AsyncDisposableStack();
+const world = await bootAcmeDocs(stack, place);
+const docs = world.app("docs");
+```
+
+### Provision a fresh setup
+
+Compose the same concrete builders directly. The stack owns each resource added
+with `use()` and disposes it in reverse order.
+
+```ts
+await using stack = new AsyncDisposableStack();
+const den = stack.use(await server({ place, provision: false, web: true }));
+await createAdmin(den, {});
+const org = stack.use(await createOrg(den, "Acme"));
+const desktop = stack.use(await app({ den, place, as: "admin" }));
+```
+
+### Reproduce a failure
+
+Run the relevant script or exact spec again with the same explicit inputs.
+Receipts cannot recreate a run; use their PID, script path, outputs, and paired
+log only to inspect or stop the existing detached process.
+
+### Docs screenshots and demos
+
+Docs tooling imports `bootAcmeDocs`; demos use `bootAcmeDemo`. Their standalone
+scripts call the same builders, so importing, CLI use, and specs share one
+implementation.
+
+## Ambient evidence and verdicts
+
+The testkit fixture opens and closes a test-evidence recorder around each test.
+Screenshots become test artifacts, visual validation records their expectations,
+and assertion evidence carries witness assertions. Do not create or pass
+recorder handles.
+
+Report `Passed` only when every claim has observable evidence in the test run.
+A failed assertion is `Failed`; missing requirements, tooling failure, or
+missing test evidence is `Incomplete` or a named skip. A green suite containing
+skips is not proof.
+
+CI publishes. `PR change proof` runs every changed spec on the PR head and
+`evidence-review` posts one sticky comment linking the report; nobody runs the
+publisher by hand. `evals:e2e --publish` remains for that trusted CI path
+only. Custom screenshots and recordings are supplementary and never determine
+the pass/fail verdict.
+
+## Standalone isolated Den
+
+For an isolated Den API without Electron or Den Web, use the development helper:
+
+```bash
+pnpm --dir evals dev:den -- up --port 8891 --database idexal_os_den_my_eval --seed
+pnpm --dir evals dev:den -- down --port 8891 --drop-database
+```
+
+The port and database are generated when omitted. The helper starts MySQL,
+pushes the current schema, and prints the eval URL exports and teardown command.
+It also adds the printed `IDEXAL_EVAL_DEN_WEB_URL` to the trusted origins;
+without that origin, Better Auth rejects eval sign-in with
+`403 INVALID_ORIGIN`.
+
+## Daytona E2E tests
+
+Run a selected test through the E2E CLI:
+
+```bash
+pnpm evals:e2e app-smoke
+```
+
+Without a placement flag, the CLI uses Daytona when `daytona snapshot list`
+succeeds and local otherwise, then prints the placement and reason. `--daytona`
+requires Daytona; `--local` forces local.
+
+Use `--engine v1|v2` for a named spec. A registered `--case` selects its concrete
+world; the migrated cases use headless app-web on either placement. Legacy cases
+in files run without `--case` retain their existing environment-driven behavior.
+The test-evidence header records the selected engine.
+
+Use direct CDP tools only to explore or debug. Convert repeatable coverage into
+a testkit test.
+
+## CDP manual-debugging tools
+
+The `opencode-chrome-devtools` plugin exposes these browser tools. Every call
+takes `browser_url`; target-specific calls also use the selected target ID.
+
+| Tool | Purpose |
+| --- | --- |
+| `browser_list` | list page targets on a CDP endpoint |
+| `browser_navigate` | navigate a target |
+| `browser_snapshot` | inspect the accessibility tree and stable UIDs |
+| `browser_click` | click a snapshot UID |
+| `browser_fill` | fill an input by UID |
+| `browser_eval` | inspect state or run debugging JavaScript |
+| `browser_screenshot` | capture a PNG checkpoint |
+
+Use these calls for exploration and debugging, not as replacement verdict
+evidence. Repeatable executable coverage belongs in a testkit test, where
+observable assertions and validated screenshots are recorded as test evidence.
+
+## Reserved names (not implemented)
+
+These names are designed but not built. Do not attempt to use them:
+
+- `attach.den({ url, tier })`
+- `attach.user({ secretRef })`
+- `attach.sandbox(...)`
+- `tier: "prod" | "staging" | "demo"`; the production tier will structurally
+  refuse organization provisioning, seeding, and database access.
+- `secretRef`; secrets will be named and resolved at start. Snapshots may carry
+  secret references, never secret values.
+
+The low-level escape hatch available today is
+`IDEXAL_EVAL_DEN_API_URL` with `IDEXAL_EVAL_DEN_WEB_URL`. It attaches an
+existing Den at the `server()` level and is called `reuse` in current code.
+Attached mode has no `apiLog()` and does not support `seedProfile`. Locally
+launched mocks are loopback-only and therefore unreachable from a remote Den.
+
+## Daytona reference
+
+### Ports
+
+| Service | Port |
+| --- | ---: |
+| noVNC | 6080 |
+| Vite HMR | 5173 |
+| Electron CDP | 9825 |
+| Den Web | 3005 |
+| Den API | 8788 |
+| Worker proxy | 8789 |
+| Artifacts | 8090 |
+| MySQL (internal) | 3306 |
+
+### Electron UI selectors
+
+| Control | Stable selector/search | Source |
+| --- | --- | --- |
+| Settings | `[data-testid="account-status-menu"]`, then `Settings` | `domains/session/sidebar/account-status-menu.tsx` |
+| Back to app | button text `Back to app` | `domains/settings/shell/settings-shell.tsx` |
+| New task | `button[aria-label="New task"]` | `domains/session/sidebar/app-sidebar.tsx` |
+| Run task | button text `Run task` | `domains/session/surface/composer/composer.tsx` |
+| Model selector | `button[aria-label="Change model"]` | `domains/session/surface/composer/composer.tsx` |
+| Composer | `[contenteditable="true"][data-lexical-editor="true"]` | `domains/session/surface/composer/editor.tsx` |
+| AI Providers | button text `AI Providers` | `domains/settings/shell/settings-page.tsx` |
+| Connect provider | button text `Connect provider` | `domains/settings/pages/ai-view.tsx` |
+| Provider search | `input[placeholder="Search providers"]` | `domains/connections/provider-auth/provider-auth-modal.tsx` |
+| Manual key | button containing `Manually enter API Key` | `provider-auth-modal.tsx` |
+| API key | `input[type="password"][placeholder="sk-..."]` | `provider-auth-modal.tsx` |
+| Save key | button text `Save key` | `provider-auth-modal.tsx` |
+
+### Lexical composer typing
+
+```js
+const editor = document.querySelector('[contenteditable="true"][data-lexical-editor="true"]')
+editor.focus()
+document.execCommand("selectAll", false, null)
+document.execCommand("insertText", false, "YOUR PROMPT HERE")
+```
+
+### Two-sandbox Den + Electron
+
+```bash
+bash .devcontainer/test-server-on-daytona.sh <ref>
+bash .devcontainer/test-on-daytona.sh <ref> \
+  --den-base-url <DEN_WEB_URL> \
+  --den-api-base-url <DEN_API_URL>
+```
+
+
+### Type-checked browser code
+
+Use the existing user/locator helpers for ordinary interaction. When an existing
+probe needs browser-only logic, author a self-contained TypeScript callback:
+
+```ts
+const fits: boolean = await probe.eval(
+  () => document.documentElement.scrollWidth <= window.innerWidth,
+);
+const count: number = await probe.eval(browserScript(
+  (selector) => document.querySelectorAll(selector).length,
+  ["[data-message-role=assistant]"],
+));
+```
+
+Import `browserScript` from `@idexal/testkit` in specs and `@idexal/cdp` in
+worlds and lower layers. It binds explicit serializable arguments; browser code
+cannot capture test variables or imported runtime helpers. Return plain data,
+not elements or functions. API JSON remains `unknown` where the contract is
+unknown; validate it before relying on a shape.
+
+For code that must run before navigation, worlds use
+`addInitScript(client, browserScript(callback, [args]))`. Its `dispose()` and
+`Symbol.asyncDispose` remove the registration for future documents; an observer
+already running in the current page still needs its own cleanup.
+
+`pnpm evals:check-browser` checks browser callback bodies, argument/result types,
+closure captures (including imported aliases), and raw CDP execution bypasses.
+It runs in the test-framework CI command. Unlike running a TypeScript test,
+this invokes the TypeScript checker, scoped to browser callback bodies and the
+CDP browser-script modules. `pnpm --dir evals typecheck` (see Install and run)
+checks everything else under `evals/`; neither claims that the unrelated `apps/`
+or `ee/` projects a spec imports compile under evals flags.

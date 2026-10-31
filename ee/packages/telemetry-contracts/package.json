@@ -1,0 +1,25 @@
+{
+  "name": "@idexal-ee/telemetry-contracts",
+  "private": true,
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/index.d.ts",
+        "default": "./src/index.ts"
+      },
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4"
+  }
+}

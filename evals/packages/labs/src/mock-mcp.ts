@@ -1,0 +1,696 @@
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import type { ChildProcess } from "node:child_process";
+
+import { trimTrailingSlashes } from "./strings.ts";
+
+export interface MockAuthorizeRequest {
+  method: string;
+  path: string;
+  url: string;
+  at: string;
+  status?: number;
+  grantType?: string;
+  /** Non-secret fingerprint, shared by token issuance and resource validation witnesses. */
+  tokenId?: string | null;
+  refreshTokenIssued?: boolean;
+  oauthError?: string;
+}
+
+/** A tool invocation the connector actually served, and which credential served it. */
+export interface MockToolCall {
+  name: string;
+  args: Record<string, unknown>;
+  /** sha256 prefix of the caller's bearer token — distinct per member credential. */
+  tokenId: string | null;
+  /** When the connector served it (the mock's clock). */
+  at: string;
+}
+
+export interface MockAgentToolStep {
+  /** Emit an unadvertised tool call to exercise the engine's rejection boundary. */
+  allowUnadvertisedTool?: boolean;
+  /** Derive the handoff from the actual model input instead of fixture arguments. */
+  argumentsFrom?: "computer-mention" | "skill-catalog" | "capability-search" | "skill-list";
+  tool: string;
+  arguments: Record<string, unknown>;
+}
+
+export interface MockAgentWorkload {
+  /** Chat Completions: return this many 429s with Retry-After before serving the workload. */
+  rateLimitAttempts?: number;
+  /** Chat Completions: return this many HTTP 500s before serving the workload. */
+  serverErrorAttempts?: number;
+  /** Chat Completions: always reject this workload with a non-retryable HTTP 400 carrying this message. */
+  terminalErrorMessage?: string;
+  /** Chat Completions: match the latest user message and count only its tool rounds. */
+  latestUserTurn?: boolean;
+  promptMarker: string;
+  /** A dedicated mock may answer every main turn without changing user prompts. */
+  matchAll?: boolean;
+  finalReply: string;
+  /** Derive the final reply from the real tool result or model system instructions. */
+  finalReplyFrom?: "last-tool-text" | "system-text";
+  /** Stream the final reply as consecutive content deltas of this many characters instead of one. */
+  finalReplyChunkSize?: number;
+  /** Exact content-delta boundaries. Their concatenation must equal finalReply. */
+  finalReplyChunks?: string[];
+  /** Initially release this many exact chunks, then wait for releaseAgentReply(). 0 holds the whole reply. */
+  finalReplyInitiallyReleasedChunks?: number;
+  /** Hold the final response before sending headers, to exercise loading transitions. */
+  finalReplyDelayMs?: number;
+  /** Chat Completions: emit a reasoning block before the final answer. */
+  finalReasoning?: string;
+  /** Tool calls the agent makes before its final reply; empty answers directly. */
+  steps: MockAgentToolStep[];
+}
+
+export interface MockAgentRequest {
+  model: string;
+  advertisedToolNames?: string[];
+  toolResultCodes?: unknown;
+  /** Whether any value registered with /admin/private-sentinels appeared anywhere in this model request. */
+  privateSentinelSeen?: boolean;
+  reasoningEffort?: string | null;
+  promptMarker: string | null;
+  matchedMarkers: string[];
+  completedTools: number;
+  kind: "utility" | "tool" | "final" | "error";
+  toolName: string | null;
+  arguments: Record<string, unknown>;
+  at: string;
+}
+
+export interface MockAgentReplyState {
+  promptMarker: string;
+  releasedChunks: number;
+  deliveredChunks: number;
+  totalChunks: number;
+  prefix: string;
+  complete: boolean;
+  waiting: number;
+  aborted: boolean;
+  timedOut: boolean;
+}
+
+export interface MockMcpHandle {
+  url: string;
+  mcpUrl: string;
+  authorizeRequestSince(iso: string, opts?: { timeoutMs?: number }): Promise<MockAuthorizeRequest & { params: URLSearchParams }>;
+  requests(): Promise<MockAuthorizeRequest[]>;
+  /**
+   * Tool calls the connector served. This is the AUTHORITY for "did a person
+   * really use it" — the app's own UI can look connected while nothing was
+   * invoked, and per-member isolation is only provable by distinct tokenIds.
+   *
+   * Pass sinceIso when the mock is long-lived (publicUrl): its request log
+   * spans runs, so an unfiltered atLeast is satisfied by a PREVIOUS run's
+   * calls and returns before this run's calls ever arrive.
+   */
+  toolCalls(opts?: { name?: string; timeoutMs?: number; atLeast?: number; sinceIso?: string }): Promise<MockToolCall[]>;
+  agentRequests(opts?: { promptMarker?: string; timeoutMs?: number; atLeast?: number; sinceIso?: string }): Promise<MockAgentRequest[]>;
+  agentReplyState(promptMarker: string): Promise<MockAgentReplyState>;
+  releaseAgentReply(promptMarker: string, count?: number): Promise<MockAgentReplyState>;
+  handshakes(opts?: { timeoutMs?: number; atLeast?: number; sinceIso?: string }): Promise<MockAuthorizeRequest[]>;
+  configureOAuthRedirectUris(redirectUris: readonly string[]): Promise<void>;
+  /** Replace callback faults; an empty object restores normal token/resource responses. */
+  configureOAuthCallback(options: {
+    issueRefreshToken?: boolean;
+    resourceStatus?: 401 | 403;
+    /** Return HTTP 400 invalid_grant after validating the authorization code and PKCE. */
+    tokenErrorDescription?: string;
+  }): Promise<void>;
+  resetOAuth(): Promise<void>;
+  /**
+   * Expire access tokens and hold refresh replies until explicitly released.
+   * `keep-latest` models providers whose every refresh, including one that
+   * presents the previous refresh token, leaves only its new token usable.
+   */
+  holdRefreshResponses(options?: { rotation?: "reject-reuse" | "keep-latest" }): Promise<void>;
+  pendingRefreshResponses(): Promise<{ id: number; status: number; tokenId: string }[]>;
+  releaseRefreshResponse(id: number): Promise<void>;
+  stop(): Promise<void>;
+  [Symbol.asyncDispose](): Promise<void>;
+}
+
+export interface MockMcpTool {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  title?: string;
+  annotations?: { readOnlyHint: boolean; destructiveHint: boolean };
+  _meta?: { ui: { resourceUri?: string; visibility?: string[] } };
+  /** Serve the HTML bound to this tool's _meta.ui.resourceUri. */
+  appHtml?: string;
+  /** Reject absent required input keys with JSON-RPC invalid params. */
+  validateRequiredArguments?: boolean;
+  /** Hold the response while the real engine exposes its running tool state. */
+  delayMs?: number;
+  /** Served verbatim as the tools/call result, so structured content and result metadata reach the host unchanged. */
+  result: { content: { type: "text"; text: string }[]; isError?: boolean; structuredContent?: Record<string, unknown>; _meta?: Record<string, unknown> };
+}
+
+export interface StartMockMcpOptions {
+  /** Replace the catalog with deterministic tools; served calls remain observable through toolCalls(). */
+  tools?: MockMcpTool[];
+  port?: number;
+  scriptPath?: string;
+  publicUrl?: string;
+  /** Advertised OAuth/resource origin when the mock sits behind a proxy; defaults to the mock's own URL. */
+  issuer?: string;
+  /** Protected resource declared in resource metadata; defaults to the issuer's /mcp URL. */
+  protectedResource?: string;
+  /** Set RFC 9207 metadata explicitly; undefined omits it. Only true includes response iss. */
+  authorizationResponseIssuerSupported?: boolean;
+  profileId?: EnterpriseMcpProfileId;
+  fault?: string;
+  oauthClientSecret?: string;
+  /** Token requests from these clients fail with invalid_client (unsupported client authentication). Entries are a client id, "id:secret" to reject only that exact presented secret, or "@dynamic" for every dynamically registered client. */
+  rejectTokenClientIds?: string[];
+  allowUnauthenticatedMcp?: boolean;
+  /** Reject dynamic client registration when the submitted OAuth redirect URI is not allowlisted. */
+  rejectDynamicRedirectUris?: "invalid_redirect_uri" | "invalid_request";
+  /** Serve this many additional synthetic mock_tool_<i> tools for scale specs. */
+  extraToolCount?: number;
+  /** Serve one app-visible MCP App launch tool (`_meta.ui.resourceUri`) under this name. */
+  appToolName?: string;
+  /** Script deterministic OpenAI-compatible agent turns through this mock. */
+  agentWorkloads?: MockAgentWorkload[];
+  /** Verify native provider requests retain this private model header. */
+  agentRequiredHeader?: { name: string; value: string };
+  /** Spawn the mock with executable-discovery variables only, excluding inherited credentials. */
+  isolatedProcessEnv?: boolean;
+}
+
+export type EnterpriseMcpProfileId =
+  | "synthetic-enterprise-oauth-mcp"
+  | "servicenow-inbound-quickstart"
+  | "microsoft-work-iq"
+  | "microsoft-enterprise"
+  | "agent-365-mail-v1-2026-07"
+  | "slack-user-mcp";
+
+const REPO_ROOT = fileURLToPath(new URL("../../../..", import.meta.url));
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseRequest(value: unknown): MockAuthorizeRequest | null {
+  if (!isRecord(value)) return null;
+  if (
+    typeof value.method !== "string"
+    || typeof value.path !== "string"
+    || typeof value.url !== "string"
+    || typeof value.at !== "string"
+  ) return null;
+  return {
+    method: value.method, path: value.path, url: value.url, at: value.at,
+    ...(typeof value.status === "number" ? { status: value.status } : {}),
+    ...(typeof value.grantType === "string" ? { grantType: value.grantType } : {}),
+    ...(typeof value.tokenId === "string" || value.tokenId === null ? { tokenId: value.tokenId } : {}),
+    ...(typeof value.refreshTokenIssued === "boolean" ? { refreshTokenIssued: value.refreshTokenIssued } : {}),
+    ...(typeof value.oauthError === "string" ? { oauthError: value.oauthError } : {}),
+  };
+}
+
+function parseRequests(value: unknown): MockAuthorizeRequest[] {
+  if (!isRecord(value) || !Array.isArray(value.requests)) return [];
+  return value.requests.flatMap((entry) => {
+    const request = parseRequest(entry);
+    return request ? [request] : [];
+  });
+}
+
+function parseAgentReplyState(value: unknown): MockAgentReplyState {
+  if (!isRecord(value)
+    || typeof value.promptMarker !== "string"
+    || typeof value.releasedChunks !== "number"
+    || typeof value.deliveredChunks !== "number"
+    || typeof value.totalChunks !== "number"
+    || typeof value.prefix !== "string"
+    || typeof value.complete !== "boolean"
+    || typeof value.waiting !== "number"
+    || typeof value.aborted !== "boolean"
+    || typeof value.timedOut !== "boolean") {
+    throw new Error("Mock agent reply state was invalid");
+  }
+  return {
+    promptMarker: value.promptMarker,
+    releasedChunks: value.releasedChunks,
+    deliveredChunks: value.deliveredChunks,
+    totalChunks: value.totalChunks,
+    prefix: value.prefix,
+    complete: value.complete,
+    waiting: value.waiting,
+    aborted: value.aborted,
+    timedOut: value.timedOut,
+  };
+}
+
+function isolatedMockEnvironment(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of ["PATH", "TMPDIR", "SYSTEMROOT", "COMSPEC", "PATHEXT", "WINDIR"]) {
+    const value = process.env[key];
+    if (value) env[key] = value;
+  }
+  return env;
+}
+
+async function waitForHealth(url: string, output: () => string, child: ChildProcess | null): Promise<void> {
+  let last = "unreachable";
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    // With an externally-managed mock there is no child at all; only a spawned
+    // child that has ALREADY exited (exitCode set) means startup failed.
+    if (child && child.exitCode !== null) {
+      throw new Error(`Mock OAuth+MCP server exited before becoming healthy. Output: ${output().slice(-1_000)}`);
+    }
+    try {
+      const response = await fetch(`${url}/health`, { signal: AbortSignal.timeout(10_000) });
+      const body: unknown = await response.json().catch(() => null);
+      if (response.ok && isRecord(body) && body.ok === true) {
+        if (Object.hasOwn(body, "autoApprove") && body.autoApprove === false) {
+          throw new Error("Mock OAuth+MCP server must report autoApprove=true.");
+        }
+        return;
+      }
+      last = response.ok ? JSON.stringify(body) : `HTTP ${response.status}`;
+    } catch (error) {
+      last = error instanceof Error ? error.message : String(error);
+    }
+    await sleep(500);
+  }
+  throw new Error(`Mock OAuth+MCP server not reachable at ${url}. Last: ${last}. Output: ${output().slice(-1_000)}`);
+}
+
+async function waitForEnterpriseHealth(url: string, output: () => string, child: ChildProcess): Promise<string> {
+  let last = "unreachable";
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null) {
+      throw new Error(`Enterprise MCP mock exited before becoming healthy. Output: ${output().slice(-1_000)}`);
+    }
+    try {
+      const response = await fetch(`${url}/health`, { signal: AbortSignal.timeout(10_000) });
+      const body: unknown = await response.json().catch(() => null);
+      if (response.ok && isRecord(body) && body.status === "ok" && typeof body.mcpUrl === "string") {
+        return body.mcpUrl;
+      }
+      last = response.ok ? JSON.stringify(body) : `HTTP ${response.status}`;
+    } catch (error) {
+      last = error instanceof Error ? error.message : String(error);
+    }
+    await sleep(500);
+  }
+  throw new Error(`Enterprise MCP mock not reachable at ${url}. Last: ${last}. Output: ${output().slice(-1_000)}`);
+}
+
+async function stopChild(child: ChildProcess | null): Promise<void> {
+  if (!child || child.exitCode !== null) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve();
+    }, 5_000);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    child.kill("SIGTERM");
+  });
+}
+
+async function stopProcessGroup(child: ChildProcess | null): Promise<void> {
+  if (!child || child.exitCode !== null || !child.pid) return;
+  const pid = child.pid;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        // The process group already exited.
+      }
+      resolve();
+    }, 5_000);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    try {
+      process.kill(-pid, "SIGTERM");
+    } catch {
+      clearTimeout(timer);
+      resolve();
+    }
+  });
+}
+
+async function startEnterpriseProfileMock(options: StartMockMcpOptions): Promise<MockMcpHandle> {
+  if (options.publicUrl) throw new Error("Enterprise MCP provider profiles must be started in the local eval process.");
+  if (!options.profileId) throw new Error("An enterprise MCP provider profile id is required.");
+  const profileId = options.profileId;
+  const port = options.port ?? 3979;
+  const url = `http://127.0.0.1:${port}`;
+  const runner = join(REPO_ROOT, "packages", "enterprise-mcp-mock-server", "src", "cli.ts");
+  let child: ChildProcess | null = null;
+  let output = "";
+  let redirectUris: readonly string[] = [];
+  let mcpUrl = `${url}/mcp`;
+  const boot = async (): Promise<void> => {
+    output = "";
+    const active = spawn("pnpm", ["--filter", "@idexal/enterprise-mcp-mock-server", "exec", "tsx", runner], {
+      cwd: REPO_ROOT,
+      detached: true,
+      env: {
+        ...(options.isolatedProcessEnv ? isolatedMockEnvironment() : process.env),
+        PORT: String(port),
+        PROFILE_ID: profileId,
+        ...(options.fault !== undefined ? { ACTIVE_FAULT_ID: options.fault } : {}),
+        OAUTH_CLIENT_SECRET: options.oauthClientSecret ?? "enterprise-mcp-eval-client-secret",
+        OAUTH_REDIRECT_URIS: redirectUris.join(","),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child = active;
+    active.stdout?.on("data", (chunk: Buffer) => {
+      output += String(chunk);
+    });
+    active.stderr?.on("data", (chunk: Buffer) => {
+      output += String(chunk);
+    });
+    mcpUrl = await waitForEnterpriseHealth(url, () => output, active);
+  };
+  await boot();
+  const stop = async (): Promise<void> => {
+    const active = child;
+    child = null;
+    await stopProcessGroup(active);
+  };
+  return {
+    url,
+    mcpUrl,
+    async requests() {
+      return [];
+    },
+    async toolCalls(opts = {}) {
+      if ((opts.atLeast ?? 0) > 0) await sleep(opts.timeoutMs ?? 120_000);
+      return [];
+    },
+    async agentRequests(opts = {}) {
+      if ((opts.atLeast ?? 0) > 0) await sleep(opts.timeoutMs ?? 120_000);
+      return [];
+    },
+    async agentReplyState() {
+      throw new Error("Enterprise MCP profile mocks do not serve agent reply gates.");
+    },
+    async releaseAgentReply() {
+      throw new Error("Enterprise MCP profile mocks do not serve agent reply gates.");
+    },
+    async handshakes(opts = {}) {
+      if ((opts.atLeast ?? 0) > 0) await sleep(opts.timeoutMs ?? 120_000);
+      return [];
+    },
+    async authorizeRequestSince(iso) {
+      throw new Error(`Enterprise profile request logs do not retain OAuth query parameters after ${iso}.`);
+    },
+    async configureOAuthRedirectUris(nextRedirectUris) {
+      await stop();
+      redirectUris = [...nextRedirectUris];
+      await boot();
+    },
+    async configureOAuthCallback() {
+      throw new Error("Callback fault controls are only supported by the legacy OAuth MCP mock.");
+    },
+    async resetOAuth() {
+      await stop();
+      await boot();
+    },
+    async holdRefreshResponses() { throw new Error("Refresh response control requires the legacy OAuth mock."); },
+    async pendingRefreshResponses() { throw new Error("Refresh response control requires the legacy OAuth mock."); },
+    async releaseRefreshResponse() { throw new Error("Refresh response control requires the legacy OAuth mock."); },
+    stop,
+    [Symbol.asyncDispose]: stop,
+  };
+}
+
+export async function startMockMcp(options: StartMockMcpOptions = {}): Promise<MockMcpHandle> {
+  if (options.profileId) return startEnterpriseProfileMock(options);
+  const port = options.port ?? 3979;
+  const externalUrl = options.publicUrl ? trimTrailingSlashes(options.publicUrl.trim()) : undefined;
+  const localUrl = `http://127.0.0.1:${port}`;
+  const url = externalUrl || localUrl;
+  let child: ChildProcess | null = null;
+  let output = "";
+
+  if (!externalUrl) {
+    child = spawn(process.execPath, [options.scriptPath ?? join(REPO_ROOT, "scripts", "mock-oauth-mcp-server.mjs")], {
+      cwd: REPO_ROOT,
+      env: {
+        ...(options.isolatedProcessEnv ? isolatedMockEnvironment() : process.env),
+        HOST: options.isolatedProcessEnv ? "127.0.0.1" : "0.0.0.0",
+        PORT: String(port),
+        ISSUER: options.issuer ?? url,
+        AUTO_APPROVE: "1",
+        ...(options.authorizationResponseIssuerSupported === undefined ? {} : { MOCK_AUTHORIZATION_RESPONSE_ISSUER: options.authorizationResponseIssuerSupported ? "1" : "0" }),
+        ...(options.allowUnauthenticatedMcp ? { MOCK_ALLOW_UNAUTHENTICATED_MCP: "1" } : {}),
+        ...(options.protectedResource ? { MOCK_PROTECTED_RESOURCE: options.protectedResource } : {}),
+        ...(options.rejectDynamicRedirectUris ? { MOCK_REJECT_DCR_REDIRECT_URIS: options.rejectDynamicRedirectUris } : {}),
+        ...(options.rejectTokenClientIds?.length ? { MOCK_REJECT_TOKEN_CLIENT_IDS: options.rejectTokenClientIds.join(",") } : {}),
+        ...(options.extraToolCount ? { MOCK_EXTRA_TOOL_COUNT: String(options.extraToolCount) } : {}),
+        ...(options.appToolName ? { MOCK_APP_TOOL_NAME: options.appToolName } : {}),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stdout?.on("data", (chunk: Buffer) => {
+      output += String(chunk);
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      output += String(chunk);
+    });
+  }
+
+  await waitForHealth(url, () => output, child);
+
+  if (options.tools) {
+    const response = await fetch(`${url}/admin/tools`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tools: options.tools }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) throw new Error(`Mock tool configuration failed: HTTP ${response.status}`);
+  }
+
+  if (options.agentWorkloads) {
+    const response = await fetch(`${url}/admin/agent-workloads`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workloads: options.agentWorkloads, requiredHeader: options.agentRequiredHeader }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) {
+      throw new Error(`Mock agent workload configuration failed: HTTP ${response.status} ${(await response.text()).slice(0, 500)}`);
+    }
+  }
+
+  const requests = async (): Promise<MockAuthorizeRequest[]> => {
+    const response = await fetch(`${url}/requests`, { signal: AbortSignal.timeout(15_000) });
+    const body: unknown = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(`Mock request log failed: HTTP ${response.status} ${JSON.stringify(body).slice(0, 500)}`);
+    return parseRequests(body);
+  };
+  const stop = async (): Promise<void> => {
+    const active = child;
+    child = null;
+    await stopChild(active);
+  };
+
+  const rawEntries = async (): Promise<Record<string, unknown>[]> => {
+    const response = await fetch(`${url}/requests`, { signal: AbortSignal.timeout(15_000) });
+    const body: unknown = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(`Mock request log failed: HTTP ${response.status}`);
+    return isRecord(body) && Array.isArray(body.requests) ? body.requests.filter(isRecord) : [];
+  };
+
+  const readToolCalls = async (name?: string, sinceIso?: string): Promise<MockToolCall[]> => {
+    const calls: MockToolCall[] = [];
+    for (const entry of await rawEntries()) {
+      if (!Array.isArray(entry.toolCalls)) continue;
+      const at = typeof entry.at === "string" ? entry.at : "";
+      if (sinceIso && at < sinceIso) continue;
+      for (const call of entry.toolCalls) {
+        if (!isRecord(call) || typeof call.name !== "string") continue;
+        if (name && call.name !== name) continue;
+        calls.push({
+          name: call.name,
+          args: isRecord(call.args) ? call.args : {},
+          tokenId: typeof call.tokenId === "string" ? call.tokenId : null,
+          at,
+        });
+      }
+    }
+    return calls;
+  };
+
+  const readAgentRequests = async (promptMarker?: string, sinceIso?: string): Promise<MockAgentRequest[]> => {
+    const completions: MockAgentRequest[] = [];
+    for (const entry of await rawEntries()) {
+      if (!isRecord(entry.agentCompletion)) continue;
+      const completion = entry.agentCompletion;
+      const at = typeof entry.at === "string" ? entry.at : "";
+      if (sinceIso && at < sinceIso) continue;
+      const kind = completion.kind;
+      if (kind !== "utility" && kind !== "tool" && kind !== "final" && kind !== "error") continue;
+      const marker = typeof completion.promptMarker === "string" ? completion.promptMarker : null;
+      if (promptMarker && marker !== promptMarker) continue;
+      if (typeof completion.model !== "string"
+        || !Array.isArray(completion.matchedMarkers)
+        || typeof completion.completedTools !== "number") continue;
+      completions.push({
+        model: completion.model,
+        toolResultCodes: completion.toolResultCodes,
+        privateSentinelSeen: completion.privateSentinelSeen === true,
+        advertisedToolNames: Array.isArray(completion.advertisedToolNames)
+          ? completion.advertisedToolNames.filter((value): value is string => typeof value === "string") : undefined,
+        reasoningEffort: typeof completion.reasoningEffort === "string" ? completion.reasoningEffort : null,
+        promptMarker: marker,
+        matchedMarkers: completion.matchedMarkers.filter((value): value is string => typeof value === "string"),
+        completedTools: completion.completedTools,
+        kind,
+        toolName: typeof completion.toolName === "string" ? completion.toolName : null,
+        arguments: isRecord(completion.arguments) ? completion.arguments : {},
+        at,
+      });
+    }
+    return completions;
+  };
+
+  const readHandshakes = async (sinceIso?: string): Promise<MockAuthorizeRequest[]> => {
+    const handshakes: MockAuthorizeRequest[] = [];
+    for (const entry of await rawEntries()) {
+      if (!Array.isArray(entry.rpcMethods) || !entry.rpcMethods.includes("initialize")) continue;
+      const request = parseRequest(entry);
+      if (!request || (sinceIso && request.at < sinceIso)) continue;
+      handshakes.push(request);
+    }
+    return handshakes;
+  };
+
+  return {
+    url,
+    mcpUrl: `${url}/mcp`,
+    requests,
+    async toolCalls(opts = {}) {
+      const wanted = opts.atLeast ?? 0;
+      if (wanted <= 0) return readToolCalls(opts.name, opts.sinceIso);
+      // The engine invokes tools asynchronously after the model decides to, so
+      // poll rather than read once.
+      const deadline = Date.now() + (opts.timeoutMs ?? 120_000);
+      let calls = await readToolCalls(opts.name, opts.sinceIso);
+      while (calls.length < wanted && Date.now() < deadline) {
+        await sleep(1_000);
+        // A slow or aborted log read is a retryable poll attempt, not the
+        // verdict; only the deadline decides.
+        calls = await readToolCalls(opts.name, opts.sinceIso).catch(() => calls);
+      }
+      return calls;
+    },
+    async agentRequests(opts = {}) {
+      const wanted = opts.atLeast ?? 0;
+      if (wanted <= 0) return readAgentRequests(opts.promptMarker, opts.sinceIso);
+      const deadline = Date.now() + (opts.timeoutMs ?? 120_000);
+      let completions = await readAgentRequests(opts.promptMarker, opts.sinceIso);
+      while (completions.length < wanted && Date.now() < deadline) {
+        await sleep(500);
+        completions = await readAgentRequests(opts.promptMarker, opts.sinceIso).catch(() => completions);
+      }
+      return completions;
+    },
+    async agentReplyState(promptMarker) {
+      const response = await fetch(`${url}/admin/agent-reply?promptMarker=${encodeURIComponent(promptMarker)}`, {
+        signal: AbortSignal.timeout(15_000),
+      });
+      const body: unknown = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(`Mock agent reply state failed: HTTP ${response.status}`);
+      return parseAgentReplyState(body);
+    },
+    async releaseAgentReply(promptMarker, count = 1) {
+      const response = await fetch(`${url}/admin/agent-reply`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ promptMarker, count }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      const body: unknown = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(`Mock agent reply release failed: HTTP ${response.status}`);
+      return parseAgentReplyState(body);
+    },
+    async handshakes(opts = {}) {
+      const wanted = opts.atLeast ?? 0;
+      if (wanted <= 0) return readHandshakes(opts.sinceIso);
+      const deadline = Date.now() + (opts.timeoutMs ?? 120_000);
+      let handshakes: MockAuthorizeRequest[] = [];
+      while (handshakes.length < wanted && Date.now() < deadline) {
+        try {
+          handshakes = await readHandshakes(opts.sinceIso);
+        } catch {
+          // A bounded request-log read can fail transiently while a remote mock recovers.
+        }
+        if (handshakes.length < wanted) await sleep(1_000);
+      }
+      return handshakes;
+    },
+    async authorizeRequestSince(iso, opts = {}) {
+      const deadline = Date.now() + (opts.timeoutMs ?? 60_000);
+      while (Date.now() < deadline) {
+        const request = (await requests()).find((entry) => entry.method === "GET" && entry.path === "/authorize" && entry.at >= iso);
+        if (request) return { ...request, params: new URL(request.url, url).searchParams };
+        await sleep(500);
+      }
+      throw new Error(`No GET /authorize reached the mock IdP after ${iso}. Output: ${output.slice(-1_000)}`);
+    },
+    async configureOAuthRedirectUris() {
+      throw new Error("The legacy mock must receive preregistered redirect URIs before startup.");
+    },
+    async configureOAuthCallback(options) {
+      const response = await fetch(`${url}/admin/oauth-callback`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(options),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) throw new Error(`Mock OAuth callback configuration failed: HTTP ${response.status}`);
+    },
+    async resetOAuth() {
+      const response = await fetch(`${url}/admin/expire-oauth-tokens`, { method: "POST" });
+      if (!response.ok) throw new Error(`Mock OAuth reset failed: HTTP ${response.status}`);
+    },
+    async holdRefreshResponses(options = {}) {
+      const response = await fetch(`${url}/admin/refresh-responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(options),
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (!response.ok) throw new Error(`Mock refresh hold failed: HTTP ${response.status}`);
+    },
+    async pendingRefreshResponses() {
+      const response = await fetch(`${url}/admin/refresh-responses`, { signal: AbortSignal.timeout(5_000) });
+      const body: unknown = await response.json();
+      if (!response.ok || !isRecord(body) || !Array.isArray(body.responses)) throw new Error("Mock refresh responses missing");
+      return body.responses.map((entry: unknown) => {
+        if (!isRecord(entry) || typeof entry.id !== "number" || typeof entry.status !== "number" || typeof entry.tokenId !== "string") throw new Error("Invalid mock refresh response");
+        return { id: entry.id, status: entry.status, tokenId: entry.tokenId };
+      });
+    },
+    async releaseRefreshResponse(id) {
+      const response = await fetch(`${url}/admin/refresh-responses/${id}/release`, { method: "POST", signal: AbortSignal.timeout(5_000) });
+      if (!response.ok) throw new Error(`Mock refresh release failed: HTTP ${response.status}`);
+    },
+    stop,
+    [Symbol.asyncDispose]: stop,
+  };
+}

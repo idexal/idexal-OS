@@ -1,0 +1,39 @@
+---
+title: "Connect Zed"
+sidebarTitle: "Zed"
+description: "Add idexal Os MCP to Zed through mcp-remote with the URL https://api.idexal.com/mcp/agent, then sign in with OAuth."
+---
+
+Give Zed your organization's idexal Os skills, plugins, and connections.
+
+<Steps>
+<Step title="Add the server">
+Add this to Zed `settings.json`:
+
+```json
+{
+  "context_servers": {
+    "idexalos": {
+      "source": "custom",
+      "command": "npx",
+      "args": ["-y", "mcp-remote@latest", "https://api.idexal.com/mcp/agent"],
+      "env": {}
+    }
+  }
+}
+```
+
+</Step>
+<Step title="Sign in">
+`mcp-remote` opens the browser. Sign in to idexal Os and pick your organization.
+</Step>
+</Steps>
+
+<AccordionGroup>
+  <Accordion title="Switch organizations">
+    Remove the stored `idexalos` token, restart the server, and pick another organization.
+  </Accordion>
+  <Accordion title="Support status">
+    Setup only: these steps follow idexal Os's OAuth profile, but native end-to-end proof is not complete. See the [MCP Gateway reference](/cloud/run-in-the-cloud/cloud-mcp#reference).
+  </Accordion>
+</AccordionGroup>

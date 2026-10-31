@@ -1,0 +1,18 @@
+extends: ./electron-builder.base.yml
+appId: com.idexal.os
+productName: idexal Os Cloud
+extraMetadata:
+  idexalOsDistribution: cloud
+protocols:
+  - name: idexal Os Cloud
+    schemes:
+      - idexalos
+publish:
+  - provider: github
+    owner: idexal
+    repo: idexalOs
+    releaseType: release
+    channel: cloud
+linux:
+  executableName: idexal-os-cloud
+artifactName: idexal-os-cloud-${os}-${arch}-${version}.${ext}

@@ -1,0 +1,352 @@
+import type { Hono } from "hono"
+import { describeRoute, resolver } from "hono-openapi"
+import { z } from "zod"
+import {
+  buildOrganizationApiKeyMetadata,
+  deleteOrganizationApiKey,
+  DEN_API_KEY_RATE_LIMIT_MAX,
+  DEN_API_KEY_RATE_LIMIT_TIME_WINDOW_MS,
+  listOrganizationApiKeys,
+} from "../../api-keys.js"
+import { ORGANIZATION_AUDIT_ACTIONS } from "../../audit-events.js"
+import { apiKeyAuditColumns, apiKeyCreatedEvent } from "../../audit/domain/api-keys.js"
+import { appendDomainChangesAfterCommit, finishLegacyAuditAction } from "../../audit/domain/legacy.js"
+import { auditChangeCapture } from "../../audit/request-capture.js"
+import { jsonValidator, orgPermissionRoute, paramValidator } from "../../middleware/index.js"
+import { denTypeIdSchema } from "../../openapi.js"
+import { auth } from "../../auth.js"
+import { AuthApiKeyTable } from "@idexal-ee/den-db/schema"
+import { eq } from "@idexal-ee/den-db/drizzle"
+import type { OrgRouteVariables } from "./shared.js"
+import { idParamSchema } from "./shared.js"
+
+const createOrganizationApiKeySchema = z.object({
+  name: z.string().trim().min(2).max(64),
+}).meta({ ref: "CreateOrganizationApiKeyRequest" })
+
+const validationIssueSchema = z.object({
+  message: z.string(),
+  path: z.array(z.union([z.string(), z.number()])).optional(),
+}).passthrough()
+
+const invalidRequestSchema = z.object({
+  error: z.literal("invalid_request"),
+  details: z.array(validationIssueSchema),
+}).meta({ ref: "InvalidRequestError" })
+
+const unauthorizedSchema = z.object({
+  error: z.literal("unauthorized"),
+}).meta({ ref: "UnauthorizedError" })
+
+const organizationNotFoundSchema = z.object({
+  error: z.literal("organization_not_found"),
+}).meta({ ref: "OrganizationNotFoundError" })
+
+const forbiddenApiKeyManagerSchema = z.object({
+  error: z.enum(["forbidden", "reauth"]),
+  reason: z.string().optional(),
+  message: z.string(),
+}).meta({ ref: "OrganizationApiKeyForbiddenError" })
+
+const apiKeyNotFoundSchema = z.object({
+  error: z.literal("api_key_not_found"),
+}).meta({ ref: "OrganizationApiKeyNotFoundError" })
+
+const apiKeyOwnerSchema = z.object({
+  userId: denTypeIdSchema("user"),
+  memberId: denTypeIdSchema("member"),
+  name: z.string(),
+  email: z.string().email(),
+  image: z.string().nullable(),
+}).meta({ ref: "OrganizationApiKeyOwner" })
+
+const organizationApiKeySchema = z.object({
+  id: z.string(),
+  configId: z.string(),
+  name: z.string().nullable(),
+  start: z.string().nullable(),
+  prefix: z.string().nullable(),
+  enabled: z.boolean(),
+  rateLimitEnabled: z.boolean(),
+  rateLimitMax: z.number().int().nullable(),
+  rateLimitTimeWindow: z.number().int().nullable(),
+  lastRequest: z.string().datetime().nullable(),
+  expiresAt: z.string().datetime().nullable(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+  owner: apiKeyOwnerSchema,
+}).meta({ ref: "OrganizationApiKey" })
+
+const organizationApiKeyListResponseSchema = z.object({
+  apiKeys: z.array(organizationApiKeySchema),
+}).meta({ ref: "OrganizationApiKeyListResponse" })
+
+const createdOrganizationApiKeySchema = z.object({
+  id: z.string(),
+  name: z.string().nullable(),
+  start: z.string().nullable(),
+  prefix: z.string().nullable(),
+  enabled: z.boolean(),
+  rateLimitEnabled: z.boolean(),
+  rateLimitMax: z.number().int().nullable(),
+  rateLimitTimeWindow: z.number().int().nullable(),
+  expiresAt: z.string().datetime().nullable(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+}).meta({ ref: "CreatedOrganizationApiKey" })
+
+const createOrganizationApiKeyResponseSchema = z.object({
+  apiKey: createdOrganizationApiKeySchema,
+  key: z.string().min(1),
+}).meta({ ref: "CreateOrganizationApiKeyResponse" })
+
+const apiKeyIdParamSchema = idParamSchema("apiKeyId")
+const hideApiKeyGenerationRoute = () => process.env.NODE_ENV === "production"
+
+export function registerOrgApiKeyRoutes<T extends { Variables: OrgRouteVariables }>(app: Hono<T>) {
+  app.get(
+    "/v1/api-keys",
+    describeRoute({
+      tags: ["API Keys"],
+      summary: "List organization API keys",
+      description: "Returns the API keys that belong to the selected organization.",
+      security: [{ bearerAuth: [] }],
+      responses: {
+        200: {
+          description: "Organization API keys",
+          content: {
+            "application/json": {
+              schema: resolver(organizationApiKeyListResponseSchema),
+            },
+          },
+        },
+        400: {
+          description: "Invalid request",
+          content: {
+            "application/json": {
+              schema: resolver(invalidRequestSchema),
+            },
+          },
+        },
+        401: {
+          description: "Unauthorized",
+          content: {
+            "application/json": {
+              schema: resolver(unauthorizedSchema),
+            },
+          },
+        },
+        403: {
+          description: "The caller needs the View API keys permission.",
+          content: {
+            "application/json": {
+              schema: resolver(forbiddenApiKeyManagerSchema),
+            },
+          },
+        },
+        404: {
+          description: "Organization not found",
+          content: {
+            "application/json": {
+              schema: resolver(organizationNotFoundSchema),
+            },
+          },
+        },
+      },
+    }),
+    orgPermissionRoute("api_keys.view"),
+    async (c) => {
+      const payload = c.get("organizationContext")
+      const apiKeys = await listOrganizationApiKeys(payload.organization.id)
+      return c.json({ apiKeys })
+    },
+  )
+
+  app.post(
+    "/v1/api-keys",
+    describeRoute({
+      tags: ["API Keys"],
+      summary: "Create an organization API key",
+      description: "Creates a new API key for the selected organization.",
+      hide: hideApiKeyGenerationRoute,
+      security: [{ bearerAuth: [] }],
+      responses: {
+        201: {
+          description: "Organization API key created",
+          content: {
+            "application/json": {
+              schema: resolver(createOrganizationApiKeyResponseSchema),
+            },
+          },
+        },
+        400: {
+          description: "Invalid request",
+          content: {
+            "application/json": {
+              schema: resolver(invalidRequestSchema),
+            },
+          },
+        },
+        401: {
+          description: "Unauthorized",
+          content: {
+            "application/json": {
+              schema: resolver(unauthorizedSchema),
+            },
+          },
+        },
+        403: {
+          description: "The caller needs the Manage API keys permission and a recent sign-in.",
+          content: {
+            "application/json": {
+              schema: resolver(forbiddenApiKeyManagerSchema),
+            },
+          },
+        },
+        404: {
+          description: "Organization not found",
+          content: {
+            "application/json": {
+              schema: resolver(organizationNotFoundSchema),
+            },
+          },
+        },
+      },
+    }),
+    orgPermissionRoute("api_keys.manage"),
+    jsonValidator(createOrganizationApiKeySchema),
+    async (c) => {
+      const payload = c.get("organizationContext")
+      const input = c.req.valid("json")
+      const created = await auth.api.createApiKey({
+        body: {
+          userId: payload.currentMember.userId,
+          name: input.name,
+          metadata: buildOrganizationApiKeyMetadata({
+            organizationId: payload.organization.id,
+            orgMembershipId: payload.currentMember.id,
+            issuedByUserId: payload.currentMember.userId,
+            issuedByOrgMembershipId: payload.currentMember.id,
+          }),
+          rateLimitEnabled: true,
+          rateLimitMax: DEN_API_KEY_RATE_LIMIT_MAX,
+          rateLimitTimeWindow: DEN_API_KEY_RATE_LIMIT_TIME_WINDOW_MS,
+        },
+      })
+
+      // better-auth wrote the key on its own adapter: append the after-snapshot
+      // (read back from the row, never the plaintext) in a fresh transaction.
+      const capture = auditChangeCapture(c)
+      const auditEventIds = await appendDomainChangesAfterCommit(capture, "api_key.created", async (tx) => {
+        const [row] = await tx.select(apiKeyAuditColumns).from(AuthApiKeyTable).where(eq(AuthApiKeyTable.id, created.id)).limit(1)
+        return row ? [apiKeyCreatedEvent(payload.organization.id, row, { userId: payload.currentMember.userId, memberId: payload.currentMember.id })] : []
+      })
+      await finishLegacyAuditAction(capture, {
+        organizationId: payload.organization.id,
+        actorUserId: payload.currentMember.userId,
+        action: ORGANIZATION_AUDIT_ACTIONS.apiKeyCreated,
+        payload: {
+          apiKeyId: created.id,
+          orgMembershipId: payload.currentMember.id,
+          name: created.name,
+          prefix: created.prefix,
+        },
+      }, auditEventIds)
+
+      return c.json({
+        apiKey: {
+          id: created.id,
+          name: created.name,
+          start: created.start,
+          prefix: created.prefix,
+          enabled: created.enabled,
+          rateLimitEnabled: created.rateLimitEnabled,
+          rateLimitMax: created.rateLimitMax,
+          rateLimitTimeWindow: created.rateLimitTimeWindow,
+          expiresAt: created.expiresAt,
+          createdAt: created.createdAt,
+          updatedAt: created.updatedAt,
+        },
+        key: created.key,
+      }, 201)
+    },
+  )
+
+  app.delete(
+    "/v1/api-keys/:apiKeyId",
+    describeRoute({
+      tags: ["API Keys"],
+      hide: true,
+      summary: "Delete an organization API key",
+      description: "Deletes an API key from the selected organization.",
+      security: [{ bearerAuth: [] }],
+      responses: {
+        204: {
+          description: "Organization API key deleted",
+        },
+        400: {
+          description: "Invalid request",
+          content: {
+            "application/json": {
+              schema: resolver(invalidRequestSchema),
+            },
+          },
+        },
+        401: {
+          description: "Unauthorized",
+          content: {
+            "application/json": {
+              schema: resolver(unauthorizedSchema),
+            },
+          },
+        },
+        403: {
+          description: "The caller needs the Manage API keys permission and a recent sign-in.",
+          content: {
+            "application/json": {
+              schema: resolver(forbiddenApiKeyManagerSchema),
+            },
+          },
+        },
+        404: {
+          description: "API key or organization not found",
+          content: {
+            "application/json": {
+              schema: resolver(z.union([organizationNotFoundSchema, apiKeyNotFoundSchema])),
+            },
+          },
+        },
+      },
+    }),
+    orgPermissionRoute("api_keys.manage"),
+    paramValidator(apiKeyIdParamSchema),
+    async (c) => {
+      const payload = c.get("organizationContext")
+      const params = c.req.valid("param")
+      const capture = auditChangeCapture(c)
+      const deleted = await deleteOrganizationApiKey({
+        organizationId: payload.organization.id,
+        apiKeyId: params.apiKeyId,
+      }, capture)
+
+      if (!deleted) {
+        return c.json({ error: "api_key_not_found" }, 404)
+      }
+
+      await finishLegacyAuditAction(capture, {
+        organizationId: payload.organization.id,
+        actorUserId: payload.currentMember.userId,
+        action: ORGANIZATION_AUDIT_ACTIONS.apiKeyDeleted,
+        payload: {
+          apiKeyId: deleted.id,
+          ownerUserId: deleted.owner.userId,
+          ownerOrgMembershipId: deleted.owner.memberId,
+          name: deleted.name,
+          prefix: deleted.prefix,
+        },
+      }, deleted.auditEventIds)
+
+      return c.body(null, 204)
+    },
+  )
+}

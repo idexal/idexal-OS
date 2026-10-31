@@ -1,0 +1,67 @@
+---
+title: "Adding a managed LLM provider"
+description: "Share one provider key with your org from idexal Os Cloud. It syncs to members' desktop apps automatically."
+keywords: ["managed provider", "legacy provider", "shared API key", "org provider", "AI Providers", "Cloud providers", "sync provider"]
+---
+
+An org admin adds a provider once in idexal Os Cloud. Members get its models in the model picker without handling the key.
+
+There are two ways to do this. Both live under **AI Gateway › AI Providers** in the Cloud dashboard.
+
+| | **AI Gateway provider** (recommended) | **Legacy provider** (bring your own key) |
+| --- | --- | --- |
+| Where the key lives | Stays on the server | Synced to each member's desktop app |
+| Usage tracking and spend limits | Yes | No |
+| Custom OpenAI-compatible endpoint (your own base URL) | No, catalog providers only | Yes, see [Adding a custom LLM provider](/cloud/share-with-your-team/custom-llm-provider) |
+| Separate key per member | Google Vertex AI sign-in only | Through the API, see [Per-member LLM credentials](/cloud/share-with-your-team/per-member-llm-credentials) |
+
+For an AI Gateway provider, follow [AI Gateway: Set it up](/ai-gateway/overview#set-it-up). The rest of this page covers legacy providers.
+
+<Frame>
+  ![The AI Providers tab in idexal Os Cloud, with the Legacy Providers section below the AI Gateway providers](/images/cloud-ai-gateway-legacy-providers.png)
+</Frame>
+
+## Add a legacy provider
+
+1. In idexal Os Cloud, open **AI Gateway › AI Providers**.
+2. Scroll to **Legacy Providers** and click **Add legacy provider**.
+3. Stay on **Catalog provider** and choose one in **Provider**. idexal Os names it for you. Click **Rename** to change the name.
+4. Paste the shared key into **API key / credential**.
+5. Under **Models**, pick the models to share.
+6. Under **Who can use it**, keep **Everyone in** *(your organization name)*, or pick specific **Teams** and **People**.
+7. Click **Create Provider**. idexal Os checks the models first. If the check fails and you still want to save, click **Save anyway**.
+
+<Frame>
+  ![The Add a new LLM provider form: Catalog provider, API key / credential, and Models](/images/cloud-managed-llm-provider-form.png)
+</Frame>
+
+If the provider isn't in the catalog, switch to **Custom provider**. See [Adding a custom LLM provider](/cloud/share-with-your-team/custom-llm-provider).
+
+## What members see
+
+Members don't need to import anything. The desktop app syncs org providers when it starts, when the member signs in, when they open the model picker, and when they open provider settings. The models then show up in the model picker.
+
+To check sync status, members open **Settings › AI Providers** and scroll to **Cloud providers**. The provider is also listed under **Providers** with your organization's name as a badge. Click **Sync now** to sync right away.
+
+<Frame>
+  ![Settings > AI Providers in the desktop app, with Acme LLM Gateway connected under Cloud providers](/images/desktop-cloud-providers.png)
+</Frame>
+
+If a provider doesn't show as **Connected**, its status tells you why:
+
+| Status | What to do |
+| --- | --- |
+| **Needs organization credential** | An admin needs to add the key to the provider in idexal Os Cloud. |
+| **Sync error** | Click **Retry**. If it keeps failing, check the provider's settings in idexal Os Cloud. |
+| **Unavailable on this desktop** | Your organization's model access settings block this provider on this device. |
+| **Needs idexal Os server** or **Imports unavailable in this workspace** | The current workspace can't store provider config. Switch to a local workspace. |
+
+## Change or remove it
+
+Open the provider from **Legacy Providers**:
+
+- **Edit Provider** changes the models, key, or who can use it. Members get the change the next time their app syncs.
+- **Delete** removes the provider and its access rules. It disappears from members' apps the next time they sync.
+- **Move to gateway** turns a catalog provider into an AI Gateway provider, which adds usage tracking and spend limits. Custom and per-member providers can't be moved.
+
+If you only need a provider on your own computer, see [Adding a custom LLM provider/model](/start-here/connect-your-stack/add-a-custom-llm) for the desktop app.

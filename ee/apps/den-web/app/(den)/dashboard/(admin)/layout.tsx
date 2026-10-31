@@ -1,0 +1,83 @@
+"use client";
+
+import { useEffect } from "react";
+import { usePathname, useRouter } from "next/navigation";
+import { Loader2, LockKeyhole, ShieldCheck } from "lucide-react";
+import { getOrgAccessFlags } from "../../_lib/den-org";
+import { DenNotice } from "../../_components/ui/notice";
+import { adminRouteLockedMessage, canOpenAdminRoute } from "../_lib/admin-route-access";
+import { useOrgDashboard } from "../_providers/org-dashboard-provider";
+
+export default function AdminDashboardLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const router = useRouter();
+  const pathname = usePathname();
+  const { orgContext, orgBusy, orgError } = useOrgDashboard();
+  const access = getOrgAccessFlags(
+    orgContext?.currentMember.role ?? "member",
+    orgContext?.currentMember.isOwner ?? false,
+    orgContext?.currentMember.permissions,
+  );
+  // Any organization permission opens the admin area; each page then needs its own.
+  const canUseAdminArea = access.canViewSettings;
+  const canUseAdminRoute = canOpenAdminRoute(pathname, access);
+
+  useEffect(() => {
+    if (!orgBusy && !orgError && orgContext && !canUseAdminArea) {
+      router.replace("/dashboard");
+    }
+  }, [canUseAdminArea, orgBusy, orgContext, orgError, router]);
+
+  if (orgError && !orgBusy) {
+    return <DenNotice tone="error" message={orgError} />;
+  }
+
+  if (orgBusy || !orgContext) {
+    return (
+      <div className="flex min-h-[420px] items-center justify-center px-6" data-testid="admin-access-state" data-access-state="checking">
+        <div className="w-full max-w-sm rounded-2xl border border-gray-200 bg-white p-6 shadow-[0_12px_40px_-28px_rgba(15,23,42,0.35)]">
+          <div className="flex items-start gap-4">
+            <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-gray-100 text-gray-600">
+              <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+            </div>
+            <div>
+              <p className="text-[15px] font-medium text-gray-950">Checking workspace access</p>
+              <p className="mt-1 text-[13px] leading-5 text-gray-500">We’re confirming which settings are available to your account.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (canUseAdminArea && !canUseAdminRoute) {
+    return (
+      <div className="mx-auto w-full max-w-[960px] px-4 py-8 sm:px-6" data-testid="admin-access-state" data-access-state="locked">
+        <DenNotice tone="neutral" icon={LockKeyhole} message={adminRouteLockedMessage(pathname)} />
+      </div>
+    );
+  }
+
+  if (!canUseAdminRoute) {
+    return (
+      <div className="flex min-h-[420px] items-center justify-center px-6" data-testid="admin-access-state" data-access-state="redirecting">
+        <div className="w-full max-w-sm rounded-2xl border border-gray-200 bg-white p-6 shadow-[0_12px_40px_-28px_rgba(15,23,42,0.35)]">
+          <div className="flex items-start gap-4">
+            <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-emerald-50 text-emerald-700">
+              <ShieldCheck className="size-5" aria-hidden="true" />
+            </div>
+            <div>
+              <p className="text-[15px] font-medium text-gray-950">Your workspace is ready</p>
+              <p className="mt-1 text-[13px] leading-5 text-gray-500">This setting is managed by workspace admins. Taking you back to your dashboard.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return children;
+}

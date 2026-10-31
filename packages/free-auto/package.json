@@ -1,0 +1,48 @@
+{
+  "name": "@idexal/free-auto",
+  "private": true,
+  "type": "module",
+  "description": "Free Auto: the contract between the idexal Os desktop app, its local relay, the Gateway and Den. Pure protocol, proof-of-work, version policy and accounting rules shared by every runtime.",
+  "exports": {
+    ".": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/index.d.ts",
+        "default": "./src/index.ts"
+      },
+      "development": "./src/index.ts",
+      "default": "./dist/index.js"
+    },
+    "./accounting": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/accounting.d.ts",
+        "default": "./src/accounting.ts"
+      },
+      "development": "./src/accounting.ts",
+      "default": "./dist/accounting.js"
+    },
+    "./node": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/node.d.ts",
+        "default": "./src/node.ts"
+      },
+      "development": "./src/node.ts",
+      "default": "./dist/node.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsup && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@idexal/types": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsup": "^8.5.0",
+    "typescript": "^5.6.3"
+  }
+}

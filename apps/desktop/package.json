@@ -1,0 +1,62 @@
+{
+  "name": "@idexal/desktop",
+  "private": true,
+  "version": "3.13.0",
+  "desktopName": "com.idexal.os",
+  "description": "idexal Os desktop shell",
+  "author": {
+    "name": "idexal Os",
+    "email": "os@idexal.com"
+  },
+  "main": "electron/main.mjs",
+  "type": "module",
+  "scripts": {
+    "dev": "node ./scripts/electron-dev.mjs",
+    "dev:electron": "node ./scripts/electron-dev.mjs",
+    "build": "node ./scripts/electron-build.mjs",
+    "build:electron": "node ./scripts/electron-build.mjs",
+    "rebuild:electron-native": "electron-rebuild --force --which-module better-sqlite3",
+    "package:electron": "pnpm run build:electron && pnpm exec electron-builder --config electron-builder.yml",
+    "package:electron:cloud": "pnpm run build:electron && pnpm exec electron-builder --config electron-builder.cloud.yml",
+    "package:electron:enterprise": "pnpm run build:electron && pnpm exec electron-builder --config electron-builder.enterprise.yml",
+    "package:electron:dir": "pnpm run build:electron && pnpm exec electron-builder --config electron-builder.yml --dir",
+    "electron": "pnpm run rebuild:electron-native && pnpm exec electron ./electron/main.mjs",
+    "check:electron": "node ./scripts/check-electron-bridge.mjs",
+    "typecheck:electron": "pnpm --filter @idexal/remote-sessions build && pnpm --dir ../server exec tsc -p ../desktop/tsconfig.electron.json --noEmit",
+    "test:session-runner": "node --test ./test/session-runner.test.mjs",
+    "prepare:sidecar": "node ./scripts/prepare-sidecar.mjs",
+    "branding": "python ./scripts/generate-installer-branding.py"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "^2.2.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "@opencode-ai/sdk": "^1.18.15",
+    "@idexal/browser-tabs": "workspace:*",
+    "@idexal/enterprise-mcp-client": "workspace:*",
+    "@idexal/headless-threads": "workspace:*",
+    "@idexal/remote-sessions": "workspace:*",
+    "@idexal/paths": "workspace:*",
+    "@idexal/free-auto": "workspace:*",
+    "@idexal/types": "workspace:*",
+    "@sentry/electron": "^7.16.0",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "better-sqlite3": "^13.0.2",
+    "drizzle-orm": "^0.45.2",
+    "electron-updater": "^6.3.9",
+    "htmlparser2": "8.0.2",
+    "jsonc-parser": "^3.2.1",
+    "minimatch": "^10.2.5",
+    "node-pty": "npm:@lydell/node-pty@1.2.0-beta.12",
+    "undici": "6.28.1",
+    "yaml": "^2.9.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@electron/asar": "^3.4.1",
+    "@electron/rebuild": "^4.2.0",
+    "electron": "^43.7.5",
+    "electron-builder": "^26.15.3"
+  },
+  "packageManager": "pnpm@10.27.0"
+}

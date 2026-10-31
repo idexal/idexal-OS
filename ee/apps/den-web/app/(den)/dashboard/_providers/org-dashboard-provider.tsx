@@ -1,0 +1,1080 @@
+"use client";
+
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { flushSync } from "react-dom";
+import { useQueryClient } from "@tanstack/react-query";
+import { permissionsQueryKeys } from "../_components/permissions-query-keys";
+import { usePathname, useRouter } from "next/navigation";
+import { useDenFlow } from "../../_providers/den-flow-provider";
+import { getErrorMessage, getOrgLimitError, getOrgPaymentRequiredError, getRequestError, isReauthRequiredError, requestJson, WORKSPACE_REAUTH_SECURITY_MESSAGE } from "../../_lib/den-flow";
+import { ReauthDialog } from "../../_components/reauth-dialog";
+import { DenSecretRevealProvider } from "../../_components/ui/secret-input";
+import {
+  type DenOrgContext,
+  type DenOrgSummary,
+  PENDING_ORG_INVITATION_STORAGE_KEY,
+  PENDING_WORKSPACE_CLAIM_STORAGE_KEY,
+  getOrgDashboardRoute,
+  getOrgAccessFlags,
+  orgFeatureEnabled,
+  parseOrgContextPayload,
+  parseOrgListPayload,
+  roleIncludesCanonicalRole,
+  permissionLockReason,
+} from "../../_lib/den-org";
+import { consumeOrgSelectionRequest, shouldOpenOrgSelection } from "../../_lib/org-selection";
+import { restoreRememberedOrganization, setActiveOrganizationAndRemember } from "../../_lib/org-memory";
+import { ORG_SCOPE_HEADER, OrganizationNotFoundError, getRequestOrgScope, setRequestOrgScope } from "../../_lib/org-scope";
+
+type OrgDashboardContextValue = {
+  orgSlug: string | null;
+  orgId: string | null;
+  orgDirectory: DenOrgSummary[];
+  activeOrg: DenOrgSummary | null;
+  orgContext: DenOrgContext | null;
+  orgSelectionOpen: boolean;
+  orgBusy: boolean;
+  orgError: string | null;
+  mutationBusy: string | null;
+  reauthDialogOpen: boolean;
+  orgSettingsCompletion: OrgSettingsCompletion | null;
+  clearOrgSettingsCompletion: () => void;
+  refreshOrgData: () => Promise<void>;
+  createOrganization: (name: string) => Promise<void>;
+  updateOrganizationName: (name: string) => Promise<void>;
+  updateOrganizationSettings: (input: { name?: string; allowedEmailDomains?: string[] | null; allowedDesktopVersions?: string[] | null; requireSso?: boolean; brandAppName?: string | null; brandLogoUrl?: string | null; brandIconUrl?: string | null; brandAccentColor?: string | null }) => Promise<void>;
+  deleteOrganization: () => Promise<void>;
+  switchOrganization: (slug: string) => void;
+  /** teamId (teamRoles): invite into a custom role by adding the pending member to its team. */
+  inviteMember: (input: { email: string; role: string; teamId?: string | null }) => Promise<void>;
+  startSeatCheckout: () => Promise<void>;
+  cancelInvitation: (invitationId: string) => Promise<void>;
+  /** The join link of a pending invitation; GET /v1/org never includes join tokens. */
+  getInvitationLink: (invitationId: string) => Promise<string>;
+  updateMemberRole: (memberId: string, role: string) => Promise<void>;
+  removeMember: (memberId: string) => Promise<void>;
+  transferOwnership: (memberId: string) => Promise<void>;
+  createTeam: (input: { name: string; memberIds: string[] }) => Promise<void>;
+  updateTeam: (teamId: string, input: { name?: string; memberIds?: string[]; grantsOrganizationAdmin?: boolean }) => Promise<void>;
+  deleteTeam: (teamId: string) => Promise<void>;
+  runReauthableAction: (label: string, action: () => Promise<void>) => Promise<void>;
+};
+
+type OrgSettingsCompletion = {
+  message: string;
+};
+
+type PendingReauthMutation = {
+  label: string;
+  action: () => Promise<void>;
+  resolve: () => void;
+  reject: (error: unknown) => void;
+};
+
+const OrgDashboardContext = createContext<OrgDashboardContextValue | null>(null);
+const ORG_SETTINGS_PATH = "/dashboard/org-settings";
+const ORG_SETTINGS_UPDATED_MESSAGE = "Workspace settings updated.";
+
+export function OrgDashboardProvider({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const router = useRouter();
+  const queryClient = useQueryClient();
+  const pathname = usePathname();
+  const { user, sessionHydrated, signOut, runtimeConfig, runtimeConfigLoaded, setupPending, setupOrganizationId } = useDenFlow();
+  const [orgDirectory, setOrgDirectory] = useState<DenOrgSummary[]>([]);
+  const [orgContext, setOrgContext] = useState<DenOrgContext | null>(null);
+  const [orgSelectionOpen, setOrgSelectionOpen] = useState(false);
+  const [orgBusy, setOrgBusy] = useState(true);
+  const [orgError, setOrgError] = useState<string | null>(null);
+  const [mutationBusy, setMutationBusy] = useState<string | null>(null);
+  const [orgSettingsCompletion, setOrgSettingsCompletion] = useState<OrgSettingsCompletion | null>(null);
+  const pendingReauthMutationsRef = useRef<PendingReauthMutation[]>([]);
+  const pathnameRef = useRef(pathname);
+  const [reauthDialogOpen, setReauthDialogOpen] = useState(false);
+  const orgLoadRef = useRef<{
+    generation: number;
+    switching: boolean;
+    organizationId: string | null;
+    userId: string | null;
+    mounted: boolean;
+  }>({
+    generation: 0, switching: false, organizationId: null, userId: user?.id ?? null, mounted: false,
+  });
+
+  const activeOrg = useMemo(
+    () =>
+      orgDirectory.find((entry) => entry.isActive) ??
+      orgDirectory[0] ??
+      null,
+    [orgDirectory],
+  );
+
+  const activeOrgId = activeOrg?.id ?? orgContext?.organization.id ?? null;
+  const isSingleOrgMode = runtimeConfigLoaded && runtimeConfig.orgMode === "single_org";
+
+  function ensureActiveOrganizationSelected() {
+    if (!activeOrgId) {
+      throw new Error("Organization not found.");
+    }
+  }
+
+  function getCurrentAccess() {
+    return getOrgAccessFlags(
+      orgContext?.currentMember.role ?? "member",
+      orgContext?.currentMember.isOwner ?? false,
+      orgContext?.currentMember.permissions,
+    );
+  }
+
+  function ensureCanManageSettings() {
+    if (!getCurrentAccess().canManageSettings) {
+      throw new Error("You don't have permission to change organization settings.");
+    }
+  }
+
+  function ensureCanDeleteOrganization() {
+    if (!getCurrentAccess().canDeleteOrganization) {
+      throw new Error("Only the workspace owner can delete this organization.");
+    }
+  }
+
+  function ensureRoleCanBeAssigned(role: string) {
+    if (roleIncludesCanonicalRole(role, "owner")) {
+      throw new Error("The owner role cannot be assigned from this action.");
+    }
+  }
+
+  function ensureTargetIsNotOwner(memberId: string) {
+    const target = orgContext?.members.find((member) => member.id === memberId) ?? null;
+    if (target?.isOwner) {
+      throw new Error("The workspace owner cannot be changed or removed from this action.");
+    }
+    return target;
+  }
+
+  async function loadOrgDirectory() {
+    const { response, payload } = await requestJson("/v1/me/orgs", { method: "GET", cache: "no-store" }, 12000);
+    if (!response.ok) {
+      throw new Error(getErrorMessage(payload, `Failed to load organizations (${response.status}).`));
+    }
+
+    return parseOrgListPayload(payload);
+  }
+
+  async function setActiveOrganization(input: { organizationId?: string | null; organizationSlug?: string | null }) {
+    const { response, payload } = await requestJson(
+      "/api/auth/organization/set-active",
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+      12000,
+    );
+
+    if (!response.ok) {
+      throw new Error(getErrorMessage(payload, `Failed to switch organization (${response.status}).`));
+    }
+  }
+
+  async function loadOrgContext(organizationId: string) {
+    const { response, payload } = await requestJson(
+      "/v1/org",
+      { method: "GET", headers: { [ORG_SCOPE_HEADER]: organizationId }, cache: "no-store" },
+      12000,
+    );
+    if (!response.ok) {
+      if (response.status === 404) {
+        throw new OrganizationNotFoundError(getErrorMessage(payload, `Failed to load organization (${response.status}).`));
+      }
+
+      throw new Error(getErrorMessage(payload, `Failed to load organization (${response.status}).`));
+    }
+
+    const parsed = parseOrgContextPayload(payload);
+    if (!parsed) {
+      throw new Error("Organization context response was incomplete.");
+    }
+    if (parsed.organization.id !== organizationId) {
+      throw new Error("Organization context did not match the requested workspace.");
+    }
+
+    return parsed;
+  }
+
+  async function restoreDisplayedOrganization() {
+    const displayedOrgId = orgContext?.organization.id;
+    const generation = orgLoadRef.current.generation;
+    if (!orgLoadRef.current.mounted || !displayedOrgId || orgBusy || orgLoadRef.current.switching || orgLoadRef.current.organizationId !== displayedOrgId) {
+      throw new Error("The active workspace changed. Retry the action in the selected workspace.");
+    }
+
+    setRequestOrgScope(displayedOrgId);
+    await setActiveOrganization({ organizationId: displayedOrgId });
+    if (generation !== orgLoadRef.current.generation) {
+      throw new Error("The active workspace changed. Retry the action in the selected workspace.");
+    }
+    setOrgDirectory((current) => current.map((entry) => ({ ...entry, isActive: entry.id === displayedOrgId })));
+  }
+
+  async function refreshOrgData() {
+    if (!orgLoadRef.current.mounted || orgLoadRef.current.userId !== (user?.id ?? null)) return;
+    // A background refresh must not restore the previous org over an explicit switch.
+    if (user && orgLoadRef.current.switching) {
+      return;
+    }
+    const generation = ++orgLoadRef.current.generation;
+    const userId = user?.id ?? null;
+    const isCurrent = () => orgLoadRef.current.mounted
+      && generation === orgLoadRef.current.generation && orgLoadRef.current.userId === userId;
+    if (!user) {
+      orgLoadRef.current.organizationId = null;
+      orgLoadRef.current.switching = false;
+      setRequestOrgScope(null);
+      setOrgDirectory([]);
+      setOrgContext(null);
+      setOrgSelectionOpen(false);
+      setOrgError(null);
+      setOrgBusy(false);
+      setMutationBusy(null);
+      return;
+    }
+
+    setOrgBusy(true);
+    setMutationBusy((current) => current === "switch-organization" ? null : current);
+    setOrgSelectionOpen(false);
+    setOrgError(null);
+    const displayedOrgId = setupOrganizationId ?? orgLoadRef.current.organizationId;
+
+    try {
+      let directoryPayload = await loadOrgDirectory();
+      if (!isCurrent()) return;
+      // Always consume the handshake, including required-picker and setup loads.
+      const selectionRequested = consumeOrgSelectionRequest();
+      // A direct dashboard visit may restore only when no explicit/session org
+      // or post-auth chooser request owns this load. Never replace a linked org.
+      if (!displayedOrgId && !directoryPayload.orgs.some((entry) => entry.isActive)
+        && !selectionRequested && !setupPending && !isSingleOrgMode
+        && !window.sessionStorage.getItem(PENDING_ORG_INVITATION_STORAGE_KEY)
+        && !window.sessionStorage.getItem(PENDING_WORKSPACE_CLAIM_STORAGE_KEY)) {
+        const remembered = await restoreRememberedOrganization({
+          userId: user.id,
+          organizations: directoryPayload.orgs,
+          loadContext: loadOrgContext,
+          setActive: (organizationId) => setActiveOrganization({ organizationId }),
+          isCurrent,
+        });
+        if (!isCurrent()) return;
+        if (remembered) {
+          directoryPayload = {
+            ...directoryPayload,
+            orgs: directoryPayload.orgs.map((entry) => ({ ...entry, isActive: entry.id === remembered.id })),
+          };
+        }
+      }
+      // A tab's unfinished setup owns its org even when another tab switches the session.
+      const displayedOrg = displayedOrgId
+        ? directoryPayload.orgs.find((entry) => entry.id === displayedOrgId) ?? null
+        : null;
+      if (setupOrganizationId && !displayedOrg) {
+        throw new Error("Your setup workspace is unavailable. Restore access before continuing setup.");
+      }
+
+      if (displayedOrg && !displayedOrg.isActive) {
+        await setActiveOrganization({ organizationId: displayedOrg.id });
+        if (!isCurrent()) return;
+        directoryPayload = await loadOrgDirectory();
+        if (!isCurrent()) return;
+        if (setupOrganizationId && !directoryPayload.orgs.some((entry) => entry.id === setupOrganizationId)) {
+          throw new Error("Your setup workspace is unavailable. Restore access before continuing setup.");
+        }
+      }
+
+      if (displayedOrgId && directoryPayload.orgs.some((entry) => entry.id === displayedOrgId)) {
+        directoryPayload = {
+          ...directoryPayload,
+          orgs: directoryPayload.orgs.map((entry) => ({ ...entry, isActive: entry.id === displayedOrgId })),
+        };
+      }
+
+      const targetOrg =
+        (displayedOrgId ? directoryPayload.orgs.find((entry) => entry.id === displayedOrgId) : null) ??
+        directoryPayload.orgs.find((entry) => entry.isActive) ??
+        directoryPayload.orgs[0] ??
+        null;
+
+      if (!targetOrg) {
+        orgLoadRef.current.organizationId = null;
+        setRequestOrgScope(null);
+        setOrgDirectory([]);
+        setOrgContext(null);
+        router.replace("/organization");
+        return;
+      }
+
+      orgLoadRef.current.organizationId = targetOrg.id;
+      if (getRequestOrgScope() !== targetOrg.id) {
+        flushSync(() => {
+          setOrgBusy(true);
+          setOrgContext(null);
+          setOrgDirectory(directoryPayload.orgs.map((entry) => ({ ...entry, isActive: entry.id === targetOrg.id })));
+        });
+        if (!isCurrent()) return;
+      }
+      setRequestOrgScope(targetOrg.id);
+
+      // Single-org deployments never surface the picker; otherwise the
+      // org-selection module decides from the directory plus any pending
+      // sign-in request.
+      if (!setupOrganizationId && !isSingleOrgMode && shouldOpenOrgSelection(directoryPayload.orgs, selectionRequested)) {
+        orgLoadRef.current.organizationId = null;
+        setRequestOrgScope(null);
+        setOrgDirectory(directoryPayload.orgs);
+        setOrgContext(null);
+        setOrgSelectionOpen(true);
+        return;
+      }
+
+      if (!targetOrg.isActive) {
+        await setActiveOrganization({ organizationId: targetOrg.id });
+        if (!isCurrent()) return;
+        directoryPayload = await loadOrgDirectory();
+        if (!isCurrent()) return;
+      }
+
+      const context = await loadOrgContext(targetOrg.id);
+      if (!isCurrent()) return;
+
+      setOrgDirectory(directoryPayload.orgs.map((entry) => ({ ...entry, isActive: entry.id === context.organization.id })));
+      setOrgContext(context);
+    } catch (error) {
+      if (!isCurrent()) return;
+      setRequestOrgScope(null);
+      setOrgContext(null);
+      if (setupOrganizationId) {
+        setOrgError(error instanceof Error ? error.message : "Could not restore your setup workspace.");
+        return;
+      }
+      if (error instanceof OrganizationNotFoundError) {
+        try {
+          await recoverFromOrganizationNotFound(generation);
+        } catch (recoveryError) {
+          if (!isCurrent()) return;
+          setOrgError(recoveryError instanceof Error ? recoveryError.message : "Failed to load organization details.");
+        }
+        return;
+      }
+
+      setOrgError(error instanceof Error ? error.message : "Failed to load organization details.");
+    } finally {
+      if (isCurrent()) setOrgBusy(false);
+    }
+  }
+
+  async function recoverFromOrganizationNotFound(generation: number) {
+    if (generation !== orgLoadRef.current.generation) return;
+    orgLoadRef.current.organizationId = null;
+    setRequestOrgScope(null);
+    setOrgContext(null);
+    const directoryPayload = await loadOrgDirectory();
+    if (generation !== orgLoadRef.current.generation) return;
+
+    if (directoryPayload.orgs.length === 0) {
+      setOrgDirectory([]);
+      setOrgContext(null);
+      setOrgSelectionOpen(false);
+      setOrgError(null);
+      router.replace("/organization");
+      return;
+    }
+
+    setOrgDirectory(directoryPayload.orgs.map((entry) => ({ ...entry, isActive: false })));
+    setOrgContext(null);
+    setOrgSelectionOpen(true);
+    setOrgError(null);
+  }
+
+  async function executeReauthableAction(label: string, action: () => Promise<void>) {
+    setMutationBusy(label);
+    setOrgError(null);
+    try {
+      await action();
+    } finally {
+      setMutationBusy(null);
+    }
+  }
+
+  async function runReauthableAction(label: string, action: () => Promise<void>) {
+    const organizationId = orgContext?.organization.id;
+    const userId = user?.id;
+    const scopedAction = async () => {
+      if (!organizationId || !userId || !orgLoadRef.current.mounted || orgLoadRef.current.switching
+        || orgLoadRef.current.organizationId !== organizationId || orgLoadRef.current.userId !== userId
+        || getRequestOrgScope() !== organizationId) {
+        throw new Error("The active workspace changed. Retry the action in the selected workspace.");
+      }
+      await action();
+    };
+    try {
+      await executeReauthableAction(label, scopedAction);
+    } catch (error) {
+      if (!isReauthRequiredError(error)) {
+        throw error;
+      }
+
+      await new Promise<void>((resolve, reject) => {
+        pendingReauthMutationsRef.current = [
+          ...pendingReauthMutationsRef.current,
+          { label, action: scopedAction, resolve, reject },
+        ];
+        setReauthDialogOpen(true);
+      });
+    }
+  }
+
+  async function runMutation(label: string, action: () => Promise<void>) {
+    await runReauthableAction(label, async () => {
+      await action();
+      await refreshOrgData();
+    });
+  }
+
+  function publishOrgSettingsCompletion() {
+    setOrgSettingsCompletion({
+      message: ORG_SETTINGS_UPDATED_MESSAGE,
+    });
+  }
+
+  function clearOrgSettingsCompletion() {
+    setOrgSettingsCompletion(null);
+  }
+
+  function cancelReauth() {
+    const pending = pendingReauthMutationsRef.current;
+    pendingReauthMutationsRef.current = [];
+    setReauthDialogOpen(false);
+    const error = new Error(WORKSPACE_REAUTH_SECURITY_MESSAGE);
+    for (const entry of pending) {
+      entry.reject(error);
+    }
+  }
+
+  async function retryReauthMutation() {
+    const pending = pendingReauthMutationsRef.current;
+    if (pending.length === 0) {
+      return;
+    }
+
+    pendingReauthMutationsRef.current = [];
+    setReauthDialogOpen(false);
+    try {
+      await restoreDisplayedOrganization();
+    } catch (error) {
+      for (const entry of pending) {
+        entry.reject(error);
+      }
+      return;
+    }
+
+    let queuedActions = pending;
+    while (queuedActions.length > 0) {
+      const retryAfterReauth: PendingReauthMutation[] = [];
+      for (const entry of queuedActions) {
+        try {
+          await executeReauthableAction(entry.label, entry.action);
+          entry.resolve();
+        } catch (error) {
+          if (isReauthRequiredError(error)) {
+            retryAfterReauth.push(entry);
+          } else {
+            entry.reject(error);
+          }
+        }
+      }
+
+      const queuedDuringRetry = pendingReauthMutationsRef.current;
+      pendingReauthMutationsRef.current = [];
+      setReauthDialogOpen(false);
+
+      if (retryAfterReauth.length > 0) {
+        pendingReauthMutationsRef.current = [
+          ...retryAfterReauth,
+          ...queuedDuringRetry,
+        ];
+        setReauthDialogOpen(true);
+        return;
+      }
+
+      queuedActions = queuedDuringRetry;
+    }
+  }
+
+  async function createOrganization(name: string) {
+    if (isSingleOrgMode) {
+      throw new Error("This deployment uses one managed organization.");
+    }
+
+    const trimmed = name.trim();
+    if (!trimmed) {
+      throw new Error("Enter an organization name.");
+    }
+
+    setMutationBusy("create-organization");
+    setOrgError(null);
+    try {
+      const { response, payload } = await requestJson(
+        "/v1/org",
+        {
+          method: "POST",
+          body: JSON.stringify({ name: trimmed }),
+        },
+        12000,
+      );
+
+      if (!response.ok) {
+        throw new Error(getErrorMessage(payload, `Failed to create organization (${response.status}).`));
+      }
+
+      const organization =
+        typeof payload === "object" && payload && "organization" in payload && payload.organization && typeof payload.organization === "object"
+          ? payload.organization as { slug?: unknown }
+          : null;
+      const nextSlug = typeof organization?.slug === "string" ? organization.slug : null;
+
+      if (!nextSlug) {
+        throw new Error("Organization was created, but no slug was returned.");
+      }
+
+      router.push(getOrgDashboardRoute(nextSlug));
+    } finally {
+      setMutationBusy(null);
+    }
+  }
+
+  function switchOrganization(nextSlug: string) {
+    if (!orgLoadRef.current.mounted || !user || orgLoadRef.current.userId !== user.id) return;
+    if (isSingleOrgMode) {
+      return;
+    }
+
+    const targetOrg = orgDirectory.find((entry) => entry.slug === nextSlug) ?? null;
+    if (!targetOrg) {
+      return;
+    }
+    if (setupOrganizationId && targetOrg.id !== setupOrganizationId) {
+      return;
+    }
+
+    const generation = ++orgLoadRef.current.generation;
+    const userId = user?.id ?? null;
+    const isCurrent = () => orgLoadRef.current.mounted
+      && generation === orgLoadRef.current.generation && orgLoadRef.current.userId === userId;
+    orgLoadRef.current.switching = true;
+    orgLoadRef.current.organizationId = targetOrg.id;
+    // Unmount scoped consumers before changing the shared request header, not
+    // merely at the end of React's event batch.
+    flushSync(() => {
+      setOrgBusy(true);
+      setMutationBusy("switch-organization");
+      setOrgContext(null);
+      setOrgDirectory((current) => current.map((entry) => ({ ...entry, isActive: entry.id === targetOrg.id })));
+      setOrgError(null);
+    });
+
+    void (async () => {
+      try {
+        if (!isCurrent()) return;
+        setRequestOrgScope(targetOrg.id);
+        // A slow/failed details request must not lose the acknowledged choice;
+        // a newer switch/account must never overwrite it with a stale response.
+        if (!await setActiveOrganizationAndRemember({
+          userId: user.id,
+          organizationId: targetOrg.id,
+          setActive: (organizationId) => setActiveOrganization({ organizationId }),
+          isCurrent,
+        })) return;
+        const context = await loadOrgContext(targetOrg.id);
+        if (!isCurrent()) return;
+        setOrgDirectory((current) => current.map((entry) => ({ ...entry, isActive: entry.id === context.organization.id })));
+        setOrgContext(context);
+        setOrgSelectionOpen(false);
+        if (!isCurrent()) return;
+
+        router.replace(getOrgDashboardRoute(context.organization.slug));
+        router.refresh();
+      } catch (error) {
+        if (!isCurrent()) return;
+        setRequestOrgScope(null);
+        setOrgContext(null);
+        if (error instanceof OrganizationNotFoundError) {
+          try {
+            await recoverFromOrganizationNotFound(generation);
+          } catch (recoveryError) {
+            if (!isCurrent()) return;
+            setOrgError(recoveryError instanceof Error ? recoveryError.message : "Failed to switch organization.");
+          }
+          return;
+        }
+
+        setOrgError(error instanceof Error ? error.message : "Failed to switch organization.");
+      } finally {
+        if (isCurrent()) {
+          orgLoadRef.current.switching = false;
+          setMutationBusy(null);
+          setOrgBusy(false);
+        }
+      }
+    })();
+  }
+
+  async function updateOrganizationName(name: string) {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      throw new Error("Enter an organization name.");
+    }
+
+    await updateOrganizationSettings({ name: trimmed });
+  }
+
+  async function updateOrganizationSettings(input: { name?: string; allowedEmailDomains?: string[] | null; allowedDesktopVersions?: string[] | null; requireSso?: boolean; brandAppName?: string | null; brandLogoUrl?: string | null; brandIconUrl?: string | null; brandAccentColor?: string | null }) {
+    ensureCanManageSettings();
+    const shouldPublishOrgSettingsCompletion = pathnameRef.current === ORG_SETTINGS_PATH;
+    const body: { name?: string; allowedEmailDomains?: string[] | null; allowedDesktopVersions?: string[] | null; requireSso?: boolean; brandAppName?: string | null; brandLogoUrl?: string | null; brandIconUrl?: string | null; brandAccentColor?: string | null } = {};
+    if (typeof input.name === "string") {
+      const trimmed = input.name.trim();
+      if (!trimmed) {
+        throw new Error("Enter an organization name.");
+      }
+      body.name = trimmed;
+    }
+    if (input.allowedEmailDomains !== undefined) {
+      body.allowedEmailDomains = input.allowedEmailDomains;
+    }
+    if (input.allowedDesktopVersions !== undefined) {
+      body.allowedDesktopVersions = input.allowedDesktopVersions;
+    }
+    if (input.requireSso !== undefined) {
+      body.requireSso = input.requireSso;
+    }
+    if (input.brandAppName !== undefined) {
+      body.brandAppName = input.brandAppName;
+    }
+    if (input.brandLogoUrl !== undefined) {
+      body.brandLogoUrl = input.brandLogoUrl;
+    }
+    if (input.brandIconUrl !== undefined) {
+      body.brandIconUrl = input.brandIconUrl;
+    }
+    if (input.brandAccentColor !== undefined) {
+      body.brandAccentColor = input.brandAccentColor;
+    }
+
+    await runMutation("update-organization-settings", async () => {
+      ensureActiveOrganizationSelected();
+      const { response, payload } = await requestJson(
+        "/v1/org",
+        {
+          method: "PATCH",
+          body: JSON.stringify(body),
+        },
+        12000,
+      );
+
+      if (!response.ok) {
+        throw getRequestError(payload, response, `Failed to update organization (${response.status}).`);
+      }
+    });
+
+    if (shouldPublishOrgSettingsCompletion && pathnameRef.current === ORG_SETTINGS_PATH) {
+      publishOrgSettingsCompletion();
+    }
+  }
+
+  async function deleteOrganization() {
+    ensureCanDeleteOrganization();
+
+    await runReauthableAction("delete-organization", async () => {
+      ensureActiveOrganizationSelected();
+      const { response, payload } = await requestJson(
+        "/v1/org",
+        { method: "DELETE" },
+        12000,
+      );
+
+      if (!response.ok) {
+        throw getRequestError(payload, response, `Failed to delete organization (${response.status}).`);
+      }
+    });
+  }
+
+  async function inviteMember(input: { email: string; role: string; teamId?: string | null }) {
+    const access = getCurrentAccess();
+    if (!access.canInviteMembers) {
+      throw new Error("You don't have permission to invite members.");
+    }
+    const invitationRole = access.canManageRoles ? input.role : "member";
+    ensureRoleCanBeAssigned(invitationRole);
+    if (input.teamId && !access.canManageTeams) {
+      throw new Error(permissionLockReason("teams.manage"));
+    }
+
+    await runMutation("invite-member", async () => {
+      ensureActiveOrganizationSelected();
+      const { response, payload } = await requestJson(
+        "/v1/invitations",
+        {
+          method: "POST",
+          body: JSON.stringify({ email: input.email, role: invitationRole, ...(input.teamId !== undefined ? { teamId: input.teamId } : {}) }),
+        },
+        12000,
+      );
+
+      if (!response.ok) {
+        const paymentRequiredError = getOrgPaymentRequiredError(payload);
+        if (paymentRequiredError) {
+          throw paymentRequiredError;
+        }
+
+        const limitError = getOrgLimitError(payload);
+        if (limitError) {
+          throw limitError;
+        }
+        throw getRequestError(payload, response, `Failed to invite member (${response.status}).`);
+      }
+
+    });
+  }
+
+  async function startSeatCheckout() {
+    if (!getCurrentAccess().canStartSeatCheckout) {
+      throw new Error(permissionLockReason("billing.manage"));
+    }
+
+    setMutationBusy("seat-checkout");
+    setOrgError(null);
+    try {
+      await runReauthableAction("seat-checkout", async () => {
+        ensureActiveOrganizationSelected();
+        const { response, payload } = await requestJson(
+          "/v1/billing/stripe/checkout",
+          {
+            method: "POST",
+            body: JSON.stringify({ type: "seat" }),
+          },
+          12000,
+        );
+
+        if (!response.ok) {
+          throw getRequestError(payload, response, `Seat billing checkout failed (${response.status}).`);
+        }
+
+        const url = payload && typeof payload === "object" && "url" in payload && typeof payload.url === "string"
+          ? payload.url
+          : null;
+        if (!url) {
+          throw new Error("Seat billing checkout response did not include a URL.");
+        }
+
+        window.location.href = url;
+      });
+    } finally {
+      setMutationBusy(null);
+    }
+  }
+
+  async function cancelInvitation(invitationId: string) {
+    if (!getCurrentAccess().canCancelInvitations) {
+      throw new Error(permissionLockReason("invitations.manage"));
+    }
+
+    await runMutation("cancel-invitation", async () => {
+      ensureActiveOrganizationSelected();
+      const { response, payload } = await requestJson(
+        `/v1/invitations/${encodeURIComponent(invitationId)}/cancel`,
+        { method: "POST", body: JSON.stringify({}) },
+        12000,
+      );
+
+      if (!response.ok) {
+        throw getRequestError(payload, response, `Failed to cancel invitation (${response.status}).`);
+      }
+    });
+  }
+
+  async function getInvitationLink(invitationId: string): Promise<string> {
+    if (!getCurrentAccess().canInviteMembers) {
+      throw new Error(permissionLockReason("invitations.manage"));
+    }
+
+    const result: { inviteLink: string | null } = { inviteLink: null };
+    await runReauthableAction("invitation-link", async () => {
+      ensureActiveOrganizationSelected();
+      const { response, payload } = await requestJson(
+        `/v1/invitations/${encodeURIComponent(invitationId)}/link`,
+        { method: "GET" },
+        12000,
+      );
+
+      if (!response.ok) {
+        throw getRequestError(payload, response, `Failed to get the invite link (${response.status}).`);
+      }
+
+      result.inviteLink = payload && typeof payload === "object" && "inviteLink" in payload && typeof payload.inviteLink === "string"
+        ? payload.inviteLink
+        : null;
+    });
+
+    if (!result.inviteLink) {
+      throw new Error("The invite link response did not include a link.");
+    }
+    return result.inviteLink;
+  }
+
+  async function updateMemberRole(memberId: string, role: string) {
+    if (!getCurrentAccess().canManageRoles) {
+      throw new Error("You don't have permission to change member roles.");
+    }
+    ensureTargetIsNotOwner(memberId);
+    ensureRoleCanBeAssigned(role);
+
+    await runMutation("update-member-role", async () => {
+      ensureActiveOrganizationSelected();
+      const { response, payload } = await requestJson(
+        `/v1/members/${encodeURIComponent(memberId)}/role`,
+        {
+          method: "POST",
+          body: JSON.stringify({ role }),
+        },
+        12000,
+      );
+
+      if (!response.ok) {
+        throw getRequestError(payload, response, `Failed to update member (${response.status}).`);
+      }
+    });
+  }
+
+  async function removeMember(memberId: string) {
+    if (!getCurrentAccess().canRemoveMembers) {
+      throw new Error(permissionLockReason("members.delete"));
+    }
+    ensureTargetIsNotOwner(memberId);
+
+    await runMutation("remove-member", async () => {
+      ensureActiveOrganizationSelected();
+      const { response, payload } = await requestJson(
+        `/v1/members/${encodeURIComponent(memberId)}`,
+        { method: "DELETE" },
+        12000,
+      );
+
+      if (response.status !== 204 && !response.ok) {
+        throw getRequestError(payload, response, `Failed to remove member (${response.status}).`);
+      }
+    });
+  }
+
+  async function transferOwnership(memberId: string) {
+    if (!getCurrentAccess().canTransferOwnership) {
+      throw new Error("Only the workspace owner can transfer ownership.");
+    }
+    const target = ensureTargetIsNotOwner(memberId);
+    const targetAccess = getOrgAccessFlags(target?.effectiveRole ?? "member", target?.isOwner ?? false);
+    if (!target || !target.joinedAt || !targetAccess.isAdmin) {
+      throw new Error("Ownership can only be transferred to an active admin.");
+    }
+
+    await runMutation("transfer-ownership", async () => {
+      ensureActiveOrganizationSelected();
+      const { response, payload } = await requestJson(
+        `/v1/members/${encodeURIComponent(memberId)}/transfer-ownership`,
+        { method: "POST", body: JSON.stringify({}) },
+        12000,
+      );
+
+      if (!response.ok) {
+        throw getRequestError(payload, response, `Failed to transfer ownership (${response.status}).`);
+      }
+    });
+  }
+
+  async function createTeam(input: { name: string; memberIds: string[] }) {
+    if (!getCurrentAccess().canManageTeams) {
+      throw new Error(permissionLockReason("teams.manage"));
+    }
+
+    await runMutation("create-team", async () => {
+      ensureActiveOrganizationSelected();
+      const { response, payload } = await requestJson(
+        "/v1/teams",
+        {
+          method: "POST",
+          body: JSON.stringify(input),
+        },
+        12000,
+      );
+
+      if (!response.ok) {
+        throw getRequestError(payload, response, `Failed to create team (${response.status}).`);
+      }
+    });
+  }
+
+  async function updateTeam(teamId: string, input: { name?: string; memberIds?: string[]; grantsOrganizationAdmin?: boolean }) {
+    if (!getCurrentAccess().canManageTeams) {
+      throw new Error(permissionLockReason("teams.manage"));
+    }
+
+    await runMutation("update-team", async () => {
+      ensureActiveOrganizationSelected();
+      const { response, payload } = await requestJson(
+        `/v1/teams/${encodeURIComponent(teamId)}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify(input),
+        },
+        12000,
+      );
+
+      if (!response.ok) {
+        throw getRequestError(payload, response, `Failed to update team (${response.status}).`);
+      }
+    });
+  }
+
+  async function deleteTeam(teamId: string) {
+    if (!getCurrentAccess().canManageTeams) {
+      throw new Error(permissionLockReason("teams.manage"));
+    }
+
+    await runMutation("delete-team", async () => {
+      ensureActiveOrganizationSelected();
+      const { response, payload } = await requestJson(
+        `/v1/teams/${encodeURIComponent(teamId)}`,
+        { method: "DELETE" },
+        12000,
+      );
+
+      if (response.status !== 204 && !response.ok) {
+        throw getRequestError(payload, response, `Failed to delete team (${response.status}).`);
+      }
+      // Deletion removes role links in Den, not reusable shared roles. Refresh the
+      // cached sets/details too, so switching tabs cannot resurrect a deleted team.
+      if (activeOrgId) await queryClient.invalidateQueries({ queryKey: permissionsQueryKeys.all(activeOrgId) });
+    });
+  }
+
+  useEffect(() => {
+    orgLoadRef.current.mounted = true;
+    return () => {
+      orgLoadRef.current.mounted = false;
+      orgLoadRef.current.generation += 1;
+      orgLoadRef.current.switching = false;
+      setRequestOrgScope(null);
+    };
+  }, []);
+
+  useEffect(() => {
+    pathnameRef.current = pathname;
+    if (pathname !== ORG_SETTINGS_PATH) {
+      setOrgSettingsCompletion(null);
+    }
+  }, [pathname]);
+
+  useEffect(() => {
+    if (!sessionHydrated) {
+      return;
+    }
+
+    if (orgLoadRef.current.userId !== (user?.id ?? null)) {
+      orgLoadRef.current.userId = user?.id ?? null;
+      orgLoadRef.current.organizationId = null;
+      setRequestOrgScope(null);
+      setOrgDirectory([]);
+      setOrgContext(null);
+    }
+
+    if (!user) {
+      void refreshOrgData();
+      void signOut();
+      router.replace("/");
+      return;
+    }
+
+    void refreshOrgData();
+    return () => {
+      orgLoadRef.current.generation += 1;
+      orgLoadRef.current.switching = false;
+    };
+  }, [router, sessionHydrated, user?.id, isSingleOrgMode, setupPending, setupOrganizationId]);
+
+  const value: OrgDashboardContextValue = {
+    orgSlug: activeOrg?.slug ?? null,
+    orgId: activeOrgId,
+    orgDirectory,
+    activeOrg,
+    orgContext,
+    orgSelectionOpen,
+    orgBusy: orgBusy || !sessionHydrated || !user || orgLoadRef.current.userId !== user.id,
+    orgError,
+    mutationBusy,
+    reauthDialogOpen,
+    orgSettingsCompletion,
+    clearOrgSettingsCompletion,
+    refreshOrgData,
+    createOrganization,
+    updateOrganizationName,
+    updateOrganizationSettings,
+    deleteOrganization,
+    switchOrganization,
+    inviteMember,
+    startSeatCheckout,
+    cancelInvitation,
+    getInvitationLink,
+    updateMemberRole,
+    removeMember,
+    transferOwnership,
+    createTeam,
+    updateTeam,
+    deleteTeam,
+    runReauthableAction,
+  };
+
+  return (
+    <OrgDashboardContext.Provider value={value}>
+      <DenSecretRevealProvider enabled={orgFeatureEnabled(orgContext, "secureSecretFields")}>
+      {setupOrganizationId && (orgContext?.organization.id !== setupOrganizationId
+        || activeOrgId !== setupOrganizationId || getRequestOrgScope() !== setupOrganizationId) ? (
+        <div className="grid min-h-[420px] place-content-center gap-3 px-6 text-sm text-gray-600" data-testid="setup-workspace-restoring">
+          <p role={orgError ? "alert" : "status"}>{orgError ?? "Restoring your setup workspace..."}</p>
+          {!orgBusy ? <button type="button" onClick={() => void refreshOrgData()} className="font-medium text-gray-900 underline underline-offset-4">Retry setup workspace</button> : null}
+        </div>
+      ) : children}
+      </DenSecretRevealProvider>
+      <ReauthDialog
+        open={reauthDialogOpen}
+        user={user}
+        orgContext={orgContext}
+        onCancel={cancelReauth}
+        onVerified={retryReauthMutation}
+      />
+    </OrgDashboardContext.Provider>
+  );
+}
+
+export function useOrgDashboard() {
+  const value = useContext(OrgDashboardContext);
+  if (!value) {
+    throw new Error("useOrgDashboard must be used within OrgDashboardProvider.");
+  }
+  return value;
+}

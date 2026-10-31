@@ -1,0 +1,83 @@
+---
+title: "Get started with idexal Os Cloud"
+description: "Connect the desktop app to your organization for shared skills and plugins, managed connections, models, policies, and hosted workspaces"
+---
+
+<div className="docs-intro">
+  <p className="docs-eyebrow">idexal Os Cloud</p>
+  <h1>Bring idexal Os to your team.</h1>
+  <p className="docs-lead">Share skills, connections, policies, and workflows while keeping access under your control.</p>
+  <div className="docs-actions">
+    <a href="https://os.idexal.com/">Open in browser</a>
+    <a href="/cloud/team-quickstart">Team quickstart</a>
+  </div>
+</div>
+
+<Note>
+The published desktop app always opens with an account: on first launch it asks you to sign in, or to start a subscription and choose a plan, and it opens once either is done. That account is on a platform — idexal Os Cloud, or your organization's own server. What the account unlocks beyond that is a choice: on the free plan your files stay on your device, and your own providers, skills, plugins and custom MCP servers keep working. Reach for Cloud when an organization needs to assign and manage those resources for a team.
+</Note>
+
+idexal Os Cloud is available at [os.idexal.com](https://os.idexal.com/). It is for teams that want shared identity, shared skills and plugins, managed connections and models, desktop policies, or hosted workspaces.
+
+First, create or join an organization and connect the desktop app to it.
+
+<Frame>
+  ![idexal Os Cloud org settings with organization identity, allowed email domains, and allowed desktop versions](/images/cloud-org-settings.png)
+</Frame>
+
+1. Open [os.idexal.com](https://os.idexal.com/) in your browser.
+2. Follow the setup steps to name your organization and choose a starting point.
+3. Finish checkout if idexal Os Cloud asks for billing.
+4. Continue to the desktop sign-in steps below.
+
+Once you're there, you can configure the settings for the organization.
+
+## Configure org settings
+
+<Note>Only the organization owner can change these settings.</Note>
+
+1. In the cloud app, open **Settings › General** (the [Org settings page](https://os.idexal.com/dashboard/org-settings)).
+2. Set the name for your organization.
+3. Optional: enable **Restrict allowed email domains** and add the approved domains.
+4. Optional: under **Allowed Desktop Versions**, choose which desktop app versions can sign in to the organization.
+
+These settings apply across the organization. You can also create teams, share plugins and skills, configure Connectors and shared models, and deploy hosted workspaces.
+
+Next, you want to make sure you can sign in the desktop app.
+
+## Sign in from the desktop app
+
+1. Open **Settings › Account**.
+2. Click **Sign in**.
+3. Finish sign-in in your browser.
+4. If the browser does not return to idexal Os automatically, click **Paste sign-in code**, paste the `idexalos://den-auth?...` link or one-time code from idexal Os Cloud, then click **Finish sign-in**.
+
+## Cloud URL used by the desktop app
+
+The desktop app uses a single Cloud URL: the Den web `baseUrl`. The hosted
+default is `https://os.idexal.com`.
+
+All Cloud API and MCP traffic is derived from that one URL through the web app
+proxy:
+
+- Cloud API requests go to `<baseUrl>/api/den/v1/...`.
+- idexal Os Cloud MCP requests go to `<baseUrl>/api/den/mcp/...`.
+
+The desktop app does not store or read a separate API URL. On startup it reads
+the Cloud URL from `desktop-bootstrap.json`; if that file is missing, it falls
+back to `https://os.idexal.com`. When you change the Cloud URL in
+**Settings › Account**, idexal Os writes the new `baseUrl` back to the bootstrap
+file so the next launch uses the same source of truth.
+
+## Choose your organization
+
+After sign-in, pick your organization in **Settings › Account**. Plugins and skills shared with you appear in **Settings › Library**, under **From idexal Os**.
+
+## What to do next
+
+- Send members to [Connect your services](/start-here/connect-your-stack/connect-services) to sign in to team-approved accounts from the desktop app.
+- Use [Connectors](/cloud/share-with-your-team/shared-mcp-connections) to publish a managed service and grant member or team access.
+- Use [Publish and copy a skill](/start-here/do-work-with-it/publish-and-copy-a-skill) to share a skill or plugin with people or teams, or [Collections](/cloud/share-with-your-team/collections) to group several plugins for the same audience.
+- Use [idexal Os Web](/cloud/run-in-the-cloud/shared-workspace) to give members a hosted idexal Os workspace in the browser, with nothing to install.
+- Use [LLM providers](/cloud/share-with-your-team/managed-llm-provider) or [custom LLM providers](/cloud/share-with-your-team/custom-llm-provider) to manage shared model access.
+- Use [Members and RBAC](/cloud/members-and-rbac) to invite people, create teams, and control access.

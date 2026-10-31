@@ -1,0 +1,156 @@
+---
+title: "MCP Gateway"
+sidebarTitle: "MCP Gateway overview"
+description: "One hosted MCP server that brings your org's skills, plugins, and connections into Claude Code, Codex, Cursor, or any MCP client."
+---
+
+import { IdexalOsConnectInstaller } from "/snippets/idexal-os-connect-installer.jsx";
+
+Add one URL to your MCP client, sign in to idexal Os in the browser, and pick your organization:
+
+```text
+https://api.idexal.com/mcp/agent
+```
+
+<IdexalOsConnectInstaller />
+
+## Guides by client
+
+<CardGroup cols={3}>
+  <Card title="OpenCode" href="/model-context-protocol/opencode" />
+  <Card title="Claude Code" href="/model-context-protocol/claude-code" />
+  <Card title="Codex" href="/model-context-protocol/codex" />
+  <Card title="Claude Desktop" href="/model-context-protocol/claude-desktop" />
+  <Card title="ChatGPT" href="/model-context-protocol/chatgpt" />
+  <Card title="Cursor" href="/model-context-protocol/cursor" />
+  <Card title="VS Code" href="/model-context-protocol/vs-code" />
+  <Card title="Windsurf" href="/model-context-protocol/windsurf" />
+  <Card title="Zed" href="/model-context-protocol/zed" />
+  <Card title="Gemini CLI" href="/model-context-protocol/gemini-cli" />
+</CardGroup>
+
+## How it works
+
+The gateway exposes two tools, so your client's tool list stays small:
+
+- `search_capabilities` finds the skills, plugins, workflows, and connections shared with you.
+- `execute_capability` runs an exact capability name that search returned.
+
+Access follows your organization membership, role, policies, and exposure allowlists. The idexal Os desktop app connects automatically when you sign in; there is nothing to configure.
+
+## Reference
+
+<AccordionGroup>
+<Accordion title="Client support status">
+
+| Client | Status | Notes |
+| --- | --- | --- |
+| OpenCode | Verified | Native remote MCP OAuth passed end-to-end testing. |
+| Codex | Setup only | Native OAuth not yet re-verified. |
+| Cursor | Setup only | Desktop callback `cursor://anysphere.cursor-mcp/oauth/callback` is accepted through an exact allowlist with PKCE S256 enforced. Web/Agents use HTTPS callbacks. |
+| ChatGPT Desktop | Setup only | Add it in ChatGPT `Settings > MCP servers`. |
+| Claude Code | Setup only | Native proof not complete. |
+| Claude Desktop | Setup only | Native proof not complete. |
+| VS Code | Setup only | Native proof not complete. |
+| Windsurf | Setup only | Through `mcp-remote`. |
+| Zed | Setup only | Through `mcp-remote`. |
+| Gemini CLI | Setup only | Native proof not complete. |
+| Any client | Setup only | Needs remote Streamable HTTP MCP with OAuth. |
+
+</Accordion>
+<Accordion title="Reconnect or switch organizations">
+
+The organization you pick in the browser is pinned into the token. To use another one, log out and sign in again.
+
+OpenCode:
+
+```sh
+opencode mcp logout idexalos
+opencode mcp auth idexalos
+```
+
+Codex (first setup, then reconnect):
+
+```sh
+codex mcp add idexalos --url https://api.idexal.com/mcp/agent
+codex mcp login idexalos
+```
+
+```sh
+codex mcp logout idexalos
+codex mcp login idexalos
+```
+
+Other clients: remove the stored `idexalos` token, then connect again. For a remote machine, see [Connect idexal Os MCP from a remote machine](/cloud/run-in-the-cloud/connect-idexal-os-mcp-remote-machine).
+
+</Accordion>
+<Accordion title="Troubleshooting">
+
+- **401 missing or invalid token**: run the client's auth/login command again and confirm the URL is `https://api.idexal.com/mcp/agent`.
+- **403 membership or scope error**: check you picked the right organization and still have access there.
+- **`invalid_grant`**: the refresh grant expired, was revoked, or was replayed after the rotation overlap. Log out, then sign in again.
+- **429 rate limit**: wait for the `Retry-After` value.
+- **Support requests**: include the `X-Request-Id` response header and any MCP `referenceId` or OAuth `reference_id` from the JSON body.
+- **Wrong URL**: `os.idexal.com/api/den` is an internal same-origin desktop proxy used by idexal Os first-party flows. Do not paste it into external MCP clients.
+
+</Accordion>
+<Accordion title="OAuth and tokens">
+
+idexal Os Connect is a remote Streamable HTTP MCP server with OAuth.
+
+- The protected resource is exactly `https://api.idexal.com/mcp/agent`, discovered through RFC9728 protected-resource metadata.
+- The authorization server and sign-in origin is `https://os.idexal.com/api/auth`.
+- OAuth authorize and token requests must include exactly one `resource` value: `https://api.idexal.com/mcp/agent`.
+- Clients can identify with a Client ID Metadata Document (`client_id_metadata_document_supported: true`) whose `client_id` equals its HTTPS URL, with `client_name`, `redirect_uris`, and `token_endpoint_auth_method: "none"`. Listed loopback redirects are accepted on any port (RFC 8252). Other clients fall back to dynamic client registration.
+- PKCE is required for public clients; only `S256` is supported.
+- Redirect URIs must be HTTPS or HTTP loopback callbacks. Private-use schemes are rejected, except exact allowlisted native callbacks such as Cursor Desktop's, with PKCE S256 enforced.
+- Access tokens are JWTs signed and validated with EdDSA. The issuer is exactly `https://os.idexal.com/api/auth`, the audience is exactly `https://api.idexal.com/mcp/agent`, and they expire after 45 minutes.
+- Refresh tokens are opaque rotating grants with a 30-day inactivity window and a 30-second rotation overlap. idexal Os stores only token hashes, so a replay during the overlap can issue another successor. A replay after the overlap returns `invalid_grant` and revokes the token family.
+- Access is rechecked against your session and membership, so removing a member or revoking the session cuts off MCP access.
+
+</Accordion>
+<Accordion title="Token scopes">
+
+`mcp:read` allows discovery, connection-status probes, and read-only native API operations. **Every external MCP provider tool call requires `mcp:write`, including tools that advertise `readOnlyHint: true`**, because provider hints are not trusted authorization.
+
+This applies to generic execution, direct connections, Code Mode, and MCP App helper calls. The desktop app requests both scopes. Existing read-only tokens are not upgraded: reauthorize the client for `mcp:write` to call provider tools.
+
+The gateway never exposes authentication internals, admin-only system routes, webhooks, API-key management, or credential-returning endpoints.
+
+</Accordion>
+<Accordion title="MCP Apps">
+
+Some results return as [MCP Apps](https://modelcontextprotocol.io/docs/extensions/apps): interactive `ui://` views such as a connection sign-in request or a workflow result. Clients without App support get readable fallback content.
+
+idexal Os supports a [documented subset of the host protocol](/dashboards/build-an-mcp-app#supported-host-protocol). Provider `structuredContent` is preserved; idexal Os additions live in namespaced `_meta` keys. To render a third-party App in another client, use the connection's own URL from **Your Connections → Use in another app** ([details](/cloud/share-with-your-team/shared-mcp-connections#use-a-connection-in-another-mcp-client)). To build your own, see [Build an MCP App](/dashboards/build-an-mcp-app).
+
+</Accordion>
+<Accordion title="Apps you build are their own MCP servers">
+
+Ask the agent for an app, dashboard, or interactive view and it follows the built-in `build-an-app` skill: it finds the tools the App needs, calls `prepare_app` for a starter already wired to them, and publishes the App with `create_app`, passing React source, a text fallback, and those tools. No Workflow is required.
+
+`prepare_app` picks one of three starters from the tools: **lookup** when every tool only reads (loads its data when the App opens), **action** when a tool changes data (one call per click, then shows the outcome), and **standalone** when there are no tools (calculators and planners). Each one applies the host's theme and handles loading, empty, failure, approval, and blocked states. Any MCP client can read them as resources at `idexalos://apps/starters/lookup.json`, `action.json`, and `standalone.json`, and the skill as `skill://build-an-app/SKILL.md`.
+
+Each App is saved in a Plugin and served as its own standard MCP server at `/mcp/agent/connections/<appId>` on your idexal Os API. That server exposes only:
+
+- `open_app`, bound to the App's current immutable `ui://` revision;
+- the tools the App declared;
+- the App's revision resources.
+
+Each declared tool has a clear name and runs one exact capability from `search_capabilities`. For example, an order calculator can declare:
+
+| Tool | Runs | Read-only |
+| --- | --- | --- |
+| `todays_date` | a saved Workflow with `mode: "live"`, which gets today's date from idexal Os | Yes, so the App can load it on open |
+| `lookup_unit_price` | a tool on a connected MCP server that its provider marks read-only | Yes, so the App can load it on open |
+| `reserve_stock` | a tool on a connected MCP server that isn't marked read-only | No, so it runs after a click in the App |
+| `price_total` | a saved Workflow with inputs | No, so it runs after a click in the App |
+
+The App calls them by those names with `app.callServerTool`. They run as the person using the App, with that person's own access and connections, so sharing an App never shares credentials. Read-only tools are idexal Os actions that read, live Workflows, which run read-only, and tools on a connected MCP server that their provider marks read-only (`readOnlyHint: true` and not destructive). idexal Os checks that label again on every call, in the caller's own tool list, and blocks the call once the provider stops marking the tool read-only; an editor then needs to update the App's tools. Calling a connection tool still needs the `mcp:write` scope. idexal Os actions that change data can't be App tools; to change something, bind a saved Workflow that makes the change. In the idexal Os app, read-only tools run without a click as soon as the App opens and is on screen, once per open, and one click in the App allows exactly one other tool call, so give each other connection tool or Workflow run its own button. `create_app` refuses a tool whose capability you can't use, and publishes nothing.
+
+Share an App by sharing its Plugin. `create_app` adds the Workflows the App's tools run to that Plugin, so they are shared with it; you need to manage each of those Workflows. People with access can open the App in the idexal Os app, which opens new revisions right after `create_app` or `update_app`. They can also copy the App's MCP URL from its Plugin page into Cursor, Claude, or another MCP client and sign in with idexal Os. In a chat, the agent opens an existing App by executing its `search_capabilities` match; an optional `body` object becomes the App's launch input. The idexal Os app lists at most 100 connections and Apps for each person; an App past that limit can't open inside idexal Os, but its MCP URL still works in other MCP clients.
+
+`read_app` returns source to editors, and `update_app` publishes a new revision at the same MCP URL, which the App's earlier chat cards open too; omit `cssSource`, `description`, or `tools` to keep the current ones. Building your own Apps is on for every organization. Apps made earlier from a Workflow with `save_artifact_view` are read-only: they still open and refresh, but they can't be created, edited, or re-activated. MCP Apps from connected MCP servers work either way. Self-hosted deployments can set `DEN_APP_MCP_SERVERS_ENABLED=false` to turn it off for every organization.
+
+</Accordion>
+</AccordionGroup>
