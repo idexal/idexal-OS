@@ -1,0 +1,366 @@
+import { browserScript } from "@idexal/cdp";
+import { createAndSelectWorkspace, signInDesktopAs } from "@idexal/behaviors";
+import { attachSurface, evaluateOnSurface, isInteractive, probeAppStateOnSurface } from "@idexal/cdp";
+import type { Surface } from "@idexal/cdp";
+import { desktop, retainedDesktop } from "@idexal/hosts";
+import { liveSharedProductionStateEnv } from "@idexal/hosts";
+import { progress, trackResource } from "@idexal/world";
+import type { AppReadiness, DesktopHandle, DesktopRelease, Host, InstalledProductionDesktopState, RetainedDesktopHandle } from "@idexal/hosts";
+import type { Den } from "./den.ts";
+import type { Place } from "./place.ts";
+
+const steps = progress();
+
+interface SharedAppOptions {
+  den: Den;
+  place: Place;
+  host?: Host;
+  model?: string;
+  /** Extra environment for this isolated Electron process. */
+  env?: Record<string, string>;
+  workspacePath?: string;
+  /** Arrange a previously activated private-Den installation; does not test activation. */
+  enterpriseActivated?: boolean;
+  /** Reuse this caller-owned local Electron profile root instead of creating one. */
+  profileDir?: string;
+  /** Eval-only delay before the desktop starts its embedded idexal Os server. */
+  localServerDelayMs?: number;
+  /** Observe a fresh profile after workspace setup but before Cloud sign-in. */
+  beforeSignIn?: (surface: Surface) => Promise<void>;
+}
+
+export interface SignedInAppOptions extends SharedAppOptions {
+  as: string;
+  signIn?: true;
+  /**
+   * `false` signs the member in without creating a workspace: an organization
+   * member who has not made one yet. `workspaceId` is then "".
+   */
+  workspace?: false;
+}
+
+export interface FreshAppOptions extends SharedAppOptions {
+  as?: never;
+  signIn: false;
+  /**
+   * `false` leaves the first launch exactly as a person sees it: no harness
+   * workspace is added next to whatever the app arranges itself, and
+   * `workspacePath` is ignored. `workspaceId` is then "".
+   */
+  workspace?: false;
+}
+
+export type AppOptions = SignedInAppOptions | FreshAppOptions;
+
+/** A desktop; its Electron profile root is available at handle.profileDir. */
+export interface App extends DesktopHandle {
+  workspaceId: string;
+  /** Live-state launches may have no selected workspace; snapshots preserve that as null. */
+  snapshotWorkspaceId?: string | null;
+}
+
+/** A published desktop with an isolated empty profile; no bootstrap, workspace, activation, or sign-in is seeded. */
+export async function blankReleaseApp(options: {
+  place: Place;
+  release: DesktopRelease;
+  startupTimeoutMs?: number;
+}): Promise<RetainedDesktopHandle> {
+  const host = options.place.host();
+  if (!host) throw new Error("Published desktop previews require a host.");
+  const electronStep = steps.step("electron-release-blank", "Electron (published blank release)");
+  try {
+    const stage = process.env.IDEXAL_WORLD_STAGE?.trim();
+    const surface = await retainedDesktop({
+      name: `release-${options.release.distribution}-${options.release.version}${stage ? `-${stage}` : ""}`,
+      host,
+      release: options.release,
+      ...(options.startupTimeoutMs === undefined ? {} : { startupTimeoutMs: options.startupTimeoutMs }),
+    });
+    await electronStep.note(`startup ${surface.startup.state}`);
+    await electronStep.note(`log ${surface.handle.meta?.log}`);
+    await electronStep.ok(surface.startup.state);
+    return surface;
+  } catch (error) {
+    await electronStep.fail(error instanceof Error ? error.message : String(error));
+    throw error;
+  }
+}
+
+/**
+ * The desktop app alone, built from source: an isolated profile with no
+ * bootstrap, Den, workspace, or sign-in, so it starts exactly like a fresh
+ * install pointed at its built-in defaults.
+ */
+export async function standaloneApp(options: { place: Place; env?: Record<string, string> }): Promise<App> {
+  const electronStep = steps.step("electron-standalone", "Electron (app only)");
+  let surface: Awaited<ReturnType<typeof desktop>>;
+  try {
+    surface = await desktop({ name: "preview-desktop", host: options.place.host(), ...(options.env ? { env: options.env } : {}) });
+  } catch (error) {
+    await electronStep.fail(error instanceof Error ? error.message : String(error));
+    throw error;
+  }
+  await electronStep.note(`log ${surface.handle.meta?.log}`);
+  await electronStep.ok(surface.handle.cdpUrl);
+  if (surface.handle.pid !== undefined) {
+    await trackResource({ kind: "process", id: String(surface.handle.pid), label: "electron", match: process.env.IDEXAL_EVAL_ELECTRON_BINARY?.trim() || "dev:electron" });
+  }
+  if (surface.handle.meta?.profileOwner !== "caller" && typeof surface.handle.profileDir === "string") {
+    await trackResource({ kind: "tmpdir", id: surface.handle.profileDir, label: "electron-profile" });
+  }
+  return {
+    handle: surface.handle,
+    client: surface.client,
+    readiness: surface.readiness,
+    workspaceRoot: surface.workspaceRoot,
+    workspaceId: "",
+    stop: () => surface.stop(),
+    [Symbol.asyncDispose]: () => surface[Symbol.asyncDispose](),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+
+async function mirrorInstalledProductionRendererState(target: Surface): Promise<AppReadiness> {
+  const cdpUrl = process.env.IDEXAL_EVAL_INSTALLED_PRODUCTION_CDP_URL?.trim() || "http://127.0.0.1:9223";
+  await using source = await attachSurface({
+    name: "installed-production-source",
+    kind: "electron",
+    hostKind: "local",
+    cdpUrl,
+  });
+  const raw = await evaluateOnSurface(source, () => (({
+    route: location.hash,
+    entries: Object.entries(localStorage).filter(([key]) => key.startsWith("idexal-os.")),
+  })));
+  if (!isRecord(raw) || typeof raw.route !== "string" || !Array.isArray(raw.entries)) {
+    throw new Error(`Installed production desktop at ${cdpUrl} returned invalid renderer state.`);
+  }
+  const entries: [string, string][] = [];
+  for (const entry of raw.entries) {
+    if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== "string" || typeof entry[1] !== "string") {
+      throw new Error(`Installed production desktop at ${cdpUrl} returned an invalid localStorage entry.`);
+    }
+    entries.push([entry[0], entry[1]]);
+  }
+  try {
+    await evaluateOnSurface(target, browserScript((inputValue) => {
+      const state = inputValue;
+      for (const [key, value] of state.entries) localStorage.setItem(key, value);
+      location.hash = state.route;
+      location.reload();
+      return true;
+    }, [{ route: raw.route, entries }]));
+  } catch {
+    // The CDP evaluator includes expression prefixes in timeout errors. Never
+    // propagate the expression because it contains production localStorage.
+    throw new Error("Dev desktop could not adopt installed production renderer state.");
+  }
+
+  const deadline = Date.now() + 60_000;
+  let lastRoute = "";
+  while (Date.now() < deadline) {
+    try {
+      const probe = await probeAppStateOnSurface(target, { timeoutMs: 5_000 });
+      lastRoute = probe.route;
+      if (isInteractive(probe) && probe.surface && !probe.route.endsWith("/signin")) {
+        return { state: probe.surface, workspaceId: probe.workspaceId, route: probe.route };
+      }
+    } catch {
+      // Reload briefly destroys the renderer execution context.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`Dev desktop did not adopt installed production renderer state within 60 seconds; last route ${JSON.stringify(lastRoute)}.`);
+}
+
+export async function liveSharedProductionApp(options: {
+  host: Host;
+  name: string;
+  state: InstalledProductionDesktopState;
+}): Promise<App> {
+  const surface = await desktop({
+    name: options.name,
+    host: options.host,
+    devCommand: "dev",
+    prepareSharedResources: false,
+    env: liveSharedProductionStateEnv(options.state),
+  });
+  try {
+    const readiness = await mirrorInstalledProductionRendererState(surface);
+    const selectedWorkspaceId = readiness.workspaceId;
+    return {
+      handle: surface.handle,
+      client: surface.client,
+      readiness,
+      workspaceRoot: surface.workspaceRoot,
+      workspaceId: selectedWorkspaceId === null ? "" : selectedWorkspaceId,
+      snapshotWorkspaceId: selectedWorkspaceId,
+      stop: () => surface.stop(),
+      [Symbol.asyncDispose]: () => surface[Symbol.asyncDispose](),
+    };
+  } catch (error) {
+    await surface[Symbol.asyncDispose]();
+    throw error;
+  }
+}
+
+export async function app(options: AppOptions): Promise<App> {
+  if (options.signIn === false) {
+    const env: Record<string, string> = { ...options.env };
+    if (options.model) env.IDEXAL_EVAL_MODEL = options.model;
+    if (options.localServerDelayMs !== undefined) {
+      env.IDEXAL_EVAL_LOCAL_SERVER_DELAY_MS = String(options.localServerDelayMs);
+    }
+    const electronStep = steps.step("electron-fresh", "Electron (fresh)");
+    let surface: Awaited<ReturnType<typeof desktop>>;
+    try {
+      surface = await desktop({
+        name: "testkit-fresh",
+        host: options.host ?? options.place.host(),
+        profileDir: options.profileDir,
+        bootstrap: {
+          baseUrl: options.den.ref.webUrl,
+          requireSignin: false,
+          ...(options.enterpriseActivated ? { enterpriseActivation: {
+            activatedAt: new Date().toISOString(), denBaseUrl: options.den.ref.apiUrl,
+          } } : {}),
+        },
+        env: Object.keys(env).length > 0 ? env : undefined,
+      });
+    } catch (error) {
+      await electronStep.fail(error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+    await electronStep.note(`log ${surface.handle.meta?.log}`);
+    await electronStep.ok(surface.handle.cdpUrl);
+    if (surface.handle.pid !== undefined) {
+      await trackResource({ kind: "process", id: String(surface.handle.pid), label: "electron", match: process.env.IDEXAL_EVAL_ELECTRON_BINARY?.trim() || "dev:electron" });
+    }
+    if (surface.handle.meta?.profileOwner !== "caller" && typeof surface.handle.profileDir === "string") {
+      await trackResource({ kind: "tmpdir", id: surface.handle.profileDir, label: "electron-profile" });
+    }
+    if (options.workspace === false) {
+      try {
+        await options.beforeSignIn?.(surface);
+        return {
+          handle: surface.handle,
+          client: surface.client,
+          readiness: surface.readiness,
+          workspaceRoot: surface.workspaceRoot,
+          workspaceId: "",
+          stop: () => surface.stop(),
+          [Symbol.asyncDispose]: () => surface[Symbol.asyncDispose](),
+        };
+      } catch (error) {
+        await surface[Symbol.asyncDispose]();
+        throw error;
+      }
+    }
+    try {
+      const path = options.workspacePath ?? `/tmp/idexal-os-fresh-${Date.now()}`;
+      const workspaceStep = steps.step("workspace-fresh", "Create workspace");
+      const { workspaceId } = await createAndSelectWorkspace(surface, { path });
+      await workspaceStep.ok(workspaceId);
+      await options.beforeSignIn?.(surface);
+      return {
+        handle: surface.handle,
+        client: surface.client,
+        readiness: surface.readiness,
+        workspaceRoot: surface.workspaceRoot,
+        workspaceId,
+        stop: () => surface.stop(),
+        [Symbol.asyncDispose]: () => surface[Symbol.asyncDispose](),
+      };
+    } catch (error) {
+      await surface[Symbol.asyncDispose]();
+      throw error;
+    }
+  }
+  const member = options.as === "admin" ? options.den.admin : options.den.members[options.as];
+  if (!member) {
+    const available = ["admin", ...Object.keys(options.den.members)].join(", ");
+    throw new Error(`Unknown Den member ${JSON.stringify(options.as)}. Available: ${available}`);
+  }
+  const env: Record<string, string> = { ...options.env };
+  if (options.model) env.IDEXAL_EVAL_MODEL = options.model;
+  if (options.localServerDelayMs !== undefined) {
+    env.IDEXAL_EVAL_LOCAL_SERVER_DELAY_MS = String(options.localServerDelayMs);
+  }
+  const electronStep = steps.step(`electron-${options.as}`, `Electron (${options.as})`);
+  let surface: Awaited<ReturnType<typeof desktop>>;
+  try {
+    surface = await desktop({
+      name: `testkit-${options.as}`,
+      host: options.host ?? options.place.host(),
+      profileDir: options.profileDir,
+      bootstrap: {
+        baseUrl: options.den.ref.webUrl,
+        requireSignin: false,
+        ...(options.enterpriseActivated ? { enterpriseActivation: {
+          activatedAt: new Date().toISOString(), denBaseUrl: options.den.ref.apiUrl,
+        } } : {}),
+      },
+      env: Object.keys(env).length > 0 ? env : undefined,
+    });
+  } catch (error) {
+    await electronStep.fail(error instanceof Error ? error.message : String(error));
+    throw error;
+  }
+  await electronStep.note(`log ${surface.handle.meta?.log}`);
+  await electronStep.ok(surface.handle.cdpUrl);
+  if (surface.handle.pid !== undefined) {
+    await trackResource({ kind: "process", id: String(surface.handle.pid), label: "electron", match: process.env.IDEXAL_EVAL_ELECTRON_BINARY?.trim() || "dev:electron" });
+  }
+  if (surface.handle.meta?.profileOwner !== "caller" && typeof surface.handle.profileDir === "string") {
+    await trackResource({ kind: "tmpdir", id: surface.handle.profileDir, label: "electron-profile" });
+  }
+  if (options.workspace === false) {
+    try {
+      await options.beforeSignIn?.(surface);
+      const signInStep = steps.step(`signin-${options.as}`, `Sign in as ${options.as} (no workspace)`);
+      await signInDesktopAs(surface, options.den.ref, member);
+      await signInStep.ok();
+      return {
+        handle: surface.handle,
+        client: surface.client,
+        readiness: surface.readiness,
+        workspaceRoot: surface.workspaceRoot,
+        workspaceId: "",
+        stop: () => surface.stop(),
+        [Symbol.asyncDispose]: () => surface[Symbol.asyncDispose](),
+      };
+    } catch (error) {
+      await surface[Symbol.asyncDispose]();
+      throw error;
+    }
+  }
+  try {
+    // Workspace first, then the org sign-in: the signed-in org shell offers no
+    // Add workspace entry, so a member's workspace exists before they connect.
+    const path = options.workspacePath ?? `/tmp/idexal-os-${options.as}-${Date.now()}`;
+    const workspaceStep = steps.step(`workspace-${options.as}`, "Create workspace");
+    const { workspaceId: initialWorkspaceId } = await createAndSelectWorkspace(surface, { path });
+    await workspaceStep.ok(initialWorkspaceId);
+    await options.beforeSignIn?.(surface);
+    const signInStep = steps.step(`signin-${options.as}`, `Sign in as ${options.as}`);
+    await signInDesktopAs(surface, options.den.ref, member);
+    await signInStep.ok();
+    const { workspaceId } = await createAndSelectWorkspace(surface, { path });
+    return {
+      handle: surface.handle,
+      client: surface.client,
+      readiness: surface.readiness,
+      workspaceRoot: surface.workspaceRoot,
+      workspaceId,
+      stop: () => surface.stop(),
+      [Symbol.asyncDispose]: () => surface[Symbol.asyncDispose](),
+    };
+  } catch (error) {
+    await surface[Symbol.asyncDispose]();
+    throw error;
+  }
+}

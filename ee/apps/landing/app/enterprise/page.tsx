@@ -1,0 +1,28 @@
+import { LandingEnterprise } from "../../components/landing-enterprise";
+import { getGithubData } from "../../lib/github";
+import { baseOpenGraph, withSocialMetadata } from "../../lib/seo";
+
+export const metadata = withSocialMetadata({
+  title: "idexal Os Enterprise — Self-hosted AI agents for teams",
+  description:
+    "Deploy shared skills, MCPs, and agent workflows across your org. Self-hosted or managed, 50+ LLM providers, SOC 2 Type II audit complete.",
+  alternates: {
+    canonical: "/enterprise"
+  },
+  openGraph: {
+    ...baseOpenGraph,
+    url: "https://os.idexal.com/enterprise"
+  }
+});
+
+export default async function Enterprise() {
+  const github = await getGithubData();
+  const cal = process.env.NEXT_PUBLIC_CAL_URL ?? "";
+
+  return (
+    <LandingEnterprise
+      stars={github.stars}
+      calUrl={cal}
+    />
+  );
+}

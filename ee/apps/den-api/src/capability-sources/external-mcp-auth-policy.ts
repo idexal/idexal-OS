@@ -1,0 +1,95 @@
+import { EXTERNAL_MCP_PRESETS, type ExternalMcpPreset } from "./external-mcp-presets.js"
+
+export type PluginMcpAuthType = "apikey" | "none" | "oauth"
+
+function normalizedRemoteMcpUrl(value: string) {
+  try {
+    const url = new URL(value)
+    const pathname = url.pathname.length > 1 ? url.pathname.replace(/\/+$/, "") : url.pathname
+    return `${url.origin}${pathname}`
+  } catch {
+    return null
+  }
+}
+
+export function matchExternalMcpPresetForUrl(
+  url: string,
+  presets: readonly ExternalMcpPreset[] = EXTERNAL_MCP_PRESETS,
+): ExternalMcpPreset | null {
+  const normalizedUrl = normalizedRemoteMcpUrl(url)
+  if (normalizedUrl === null) return null
+  return presets.find((candidate) => normalizedRemoteMcpUrl(candidate.url) === normalizedUrl) ?? null
+}
+
+/** Public, pre-registered app identifiers only; never preset client secrets. */
+export function externalMcpPresetOAuthClient(url: string): { clientId: string; tokenEndpointAuthMethod: "none" } | undefined {
+  const clientId = matchExternalMcpPresetForUrl(url)?.defaultOAuthClientId
+  return clientId ? { clientId, tokenEndpointAuthMethod: "none" } : undefined
+}
+
+export function externalMcpOAuthConfigurationDefaults(input: {
+  url: string
+  authorizationServerIssuer?: string | null
+  requestedScopes?: readonly string[]
+}): { authorizationServerIssuer: string | null; requestedScopes: string[] } {
+  const preset = matchExternalMcpPresetForUrl(input.url)
+  return {
+    authorizationServerIssuer: input.authorizationServerIssuer !== undefined
+      ? input.authorizationServerIssuer
+      : preset?.authorizationServerIssuer ?? null,
+    requestedScopes: [...new Set(input.requestedScopes ?? preset?.defaultOAuthScopes ?? [])],
+  }
+}
+
+export function declaredPluginMcpAuthType(config: Record<string, unknown>): "oauth" | null {
+  const oauth = config.oauth
+  return oauth !== undefined && oauth !== null && oauth !== false ? "oauth" : null
+}
+
+export function requiredPluginMcpAuthType(input: {
+  declaredAuthType: "oauth" | null
+  url: string
+}): PluginMcpAuthType | null {
+  if (input.declaredAuthType) return input.declaredAuthType
+  const preset = matchExternalMcpPresetForUrl(input.url)
+  if (preset?.supportedAuthTypes && preset.supportedAuthTypes.length > 1) return null
+  return preset?.authType ?? null
+}
+
+// Stored connections predate preset setup allowlists; only a required auth type
+// can disqualify them. New configuration must also pass the preset allowlist.
+export function existingPluginMcpAuthTypeCompatible(input: {
+  authType: PluginMcpAuthType
+  requiredAuthType: PluginMcpAuthType | null
+}): boolean {
+  return input.requiredAuthType === null || input.authType === input.requiredAuthType
+}
+
+export function pluginMcpAuthTypeCompatible(input: {
+  authType: PluginMcpAuthType
+  requiredAuthType: PluginMcpAuthType | null
+  url: string
+}): boolean {
+  if (!existingPluginMcpAuthTypeCompatible(input)) return false
+  const preset = matchExternalMcpPresetForUrl(input.url)
+  return !preset || (preset.supportedAuthTypes ?? [preset.authType]).includes(input.authType)
+}
+
+export function pluginMcpRequiresPreRegisteredOAuthClient(url: string): boolean {
+  return matchExternalMcpPresetForUrl(url)?.requiresOAuthClient === true
+}
+
+export function resolveGithubPluginMcpImportAuthType(input: {
+  declaredAuthType: "oauth" | null
+  existingAuthType?: PluginMcpAuthType
+  requestedAuthType: PluginMcpAuthType
+  url: string
+}): PluginMcpAuthType {
+  if (input.declaredAuthType) return input.declaredAuthType
+  const preset = matchExternalMcpPresetForUrl(input.url)
+  if (input.existingAuthType && preset?.supportedAuthTypes && existingPluginMcpAuthTypeCompatible({
+    authType: input.existingAuthType,
+    requiredAuthType: requiredPluginMcpAuthType(input),
+  })) return input.existingAuthType
+  return preset?.authType ?? input.requestedAuthType
+}

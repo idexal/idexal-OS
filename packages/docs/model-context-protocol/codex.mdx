@@ -1,0 +1,45 @@
+---
+title: "Connect Codex"
+sidebarTitle: "Codex"
+description: "Add idexal Os MCP to Codex with one command: codex mcp add idexalos --url https://api.idexal.com/mcp/agent, then codex mcp login idexal-os."
+---
+
+Give Codex your organization's idexal Os skills, plugins, and connections.
+
+<Steps>
+<Step title="Add the server">
+
+```sh
+codex mcp add idexalos --url https://api.idexal.com/mcp/agent
+```
+
+In the Codex desktop app, paste the URL in `codex://settings/connections` instead.
+
+</Step>
+<Step title="Sign in">
+
+```sh
+codex mcp login idexalos
+```
+
+Sign in to idexal Os in the browser and pick your organization.
+
+</Step>
+<Step title="Try it">
+Ask: "Which idexal Os organization am I connected to?"
+</Step>
+</Steps>
+
+<AccordionGroup>
+  <Accordion title="Switch organizations">
+
+```sh
+codex mcp logout idexalos
+codex mcp login idexalos
+```
+
+  </Accordion>
+  <Accordion title="Support status">
+    Setup only: these steps follow idexal Os's OAuth profile, but native end-to-end proof is not complete. See the [MCP Gateway reference](/cloud/run-in-the-cloud/cloud-mcp#reference).
+  </Accordion>
+</AccordionGroup>

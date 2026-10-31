@@ -1,0 +1,103 @@
+name: Evidence review
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Completed PR change proof run (nonproof runs are skipped)"
+        required: true
+        type: string
+  workflow_run:
+    workflows: [PR change proof]
+    types: [requested, in_progress, completed]
+
+permissions:
+  contents: read
+  actions: read
+  checks: read
+  pull-requests: read
+
+concurrency:
+  group: evidence-review-${{ github.event.workflow_run.id || inputs.run_id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  progress:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.action != 'completed' &&
+      github.event.workflow_run.name == 'PR change proof' &&
+      github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+      statuses: write
+      checks: write
+      deployments: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+      - name: Update the commit-bound evidence check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVIEW_RUN_ID: ${{ github.event.workflow_run.id }}
+          REVIEW_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: node .github/scripts/evidence-presentation.mjs progress
+
+  publish:
+    concurrency:
+      group: evidence-review-publish-${{ github.repository }}-${{ github.event.workflow_run.pull_requests[0].number || inputs.run_id || github.run_id }}
+      cancel-in-progress: false
+    if: >-
+      always() &&
+      ((github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||
+      (github.event_name == 'workflow_run' && github.event.action == 'completed' && github.event.workflow_run.name == 'PR change proof' && github.event.workflow_run.event == 'pull_request'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+      statuses: write
+      checks: write
+      deployments: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REVIEW_RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+      REVIEW_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+      IDEXAL_REVIEW_URL: ${{ vars.IDEXAL_REVIEW_URL }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+      - name: Install trusted publisher dependencies
+        run: |
+          pnpm --filter @idexal/review... install --frozen-lockfile --ignore-scripts
+          pnpm --dir evals --filter @idexal/test-artifacts install --frozen-lockfile --ignore-scripts
+      - name: Publish only live PR proof evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE_RECEIPT_PATH: ${{ runner.temp }}/evidence-publication.json
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.IDEXAL_REVIEW_BLOB_TOKEN }}
+          IDEXAL_REVIEW_URL: ${{ vars.IDEXAL_REVIEW_URL }}
+          REVIEW_RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+          REVIEW_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: node evals/scripts/publish-review.mjs
+      - name: Publish native check and deployment result
+        if: always()
+        env:
+          EVIDENCE_RECEIPT_PATH: ${{ runner.temp }}/evidence-publication.json
+        run: node .github/scripts/evidence-presentation.mjs complete

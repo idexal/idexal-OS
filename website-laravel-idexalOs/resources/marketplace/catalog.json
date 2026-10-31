@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "marketplace": {
+    "id": "mkt_idexal_official",
+    "name": "idexal Os Marketplace",
+    "description": "Curated connectors, skills, and plugins maintained by the idexal Os team. Installed in one click and delivered to every desktop in the organization."
+  },
+  "items": [
+    {
+      "slug": "idexal-gateway-cookbook",
+      "type": "skill",
+      "name": "Gateway API Cookbook",
+      "description": "Working recipes for the idexal Os gateway: chat completions, Anthropic messages, streaming, tool calls, and usage limits.",
+      "version": "1.0.0",
+      "source": "https://github.com/idexal/extensions-catalog",
+      "tags": ["api", "gateway", "docs"]
+    },
+    {
+      "slug": "idexal-release-notes",
+      "type": "skill",
+      "name": "Release Notes Writer",
+      "description": "Turns a list of merged changes into a professional, customer-ready release note with headline, highlights, and upgrade steps.",
+      "version": "1.0.0",
+      "source": "https://github.com/idexal/extensions-catalog",
+      "tags": ["writing", "release"]
+    },
+    {
+      "slug": "idexal-arabic-quality",
+      "type": "skill",
+      "name": "Arabic UI Quality Review",
+      "description": "Reviews Arabic interfaces for global quality: Western digits (123456789), correct separators, mixed-direction text, and tone.",
+      "version": "1.0.0",
+      "source": "https://github.com/idexal/extensions-catalog",
+      "tags": ["arabic", "i18n", "review"]
+    },
+    {
+      "slug": "idexal-git-cleanup",
+      "type": "skill",
+      "name": "Git History Cleanup",
+      "description": "Safe recipes to squash messy branches, split a stalled commit, and prepare a clean pull request without losing work.",
+      "version": "1.0.0",
+      "source": "https://github.com/idexal/extensions-catalog",
+      "tags": ["git", "workflow"]
+    },
+    {
+      "slug": "github-mcp",
+      "type": "connector",
+      "name": "GitHub",
+      "description": "Repositories, issues, pull requests, and actions through the official GitHub MCP server.",
+      "version": "1.0.0",
+      "source": "https://github.com/github/github-mcp-server",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "authType": "oauth",
+      "permissions": ["net:egress:api.githubcopilot.com", "tools:invoke"],
+      "tags": ["mcp", "github"]
+    },
+    {
+      "slug": "vercel-mcp",
+      "type": "connector",
+      "name": "Vercel",
+      "description": "Deployments, projects, and logs from Vercel through its hosted MCP endpoint.",
+      "version": "1.0.0",
+      "source": "https://github.com/vercel/vercel-mcp",
+      "url": "https://mcp.vercel.com",
+      "authType": "oauth",
+      "permissions": ["net:egress:mcp.vercel.com", "tools:invoke"],
+      "tags": ["mcp", "deploy"]
+    },
+    {
+      "slug": "notion-mcp",
+      "type": "connector",
+      "name": "Notion",
+      "description": "Search, read, and update Notion pages and databases through the official Notion MCP server.",
+      "version": "1.0.0",
+      "source": "https://github.com/makenotion/notion-mcp-server",
+      "url": "https://mcp.notion.com/mcp",
+      "authType": "oauth",
+      "permissions": ["net:egress:mcp.notion.com", "tools:invoke"],
+      "tags": ["mcp", "docs"]
+    },
+    {
+      "slug": "idexal-starter-pack",
+      "type": "plugin",
+      "name": "idexal Os Starter Pack",
+      "description": "The four official idexal Os skills bundled as one plugin, ready for every workspace in the organization.",
+      "version": "1.0.0",
+      "source": "https://github.com/idexal/extensions-catalog",
+      "includes": [
+        "idexal-gateway-cookbook",
+        "idexal-release-notes",
+        "idexal-arabic-quality",
+        "idexal-git-cleanup"
+      ],
+      "tags": ["starter", "official"]
+    }
+  ]
+}

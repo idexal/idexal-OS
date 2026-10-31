@@ -1,0 +1,1 @@
+# Specify files and folders to ignore during indexing. Uses the same matching rules as .gitignore and supports wildcard patterns such as my-security/ and *.log.

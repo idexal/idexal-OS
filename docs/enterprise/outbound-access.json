@@ -1,0 +1,328 @@
+{
+  "hosts": [
+    {
+      "host": "accounts.google.com",
+      "kind": "link-only",
+      "components": ["renderer"],
+      "purpose": "Google authorization page opened in the user's browser by the idexal Os Cloud connection flow.",
+      "requirement": "opt-in",
+      "blockedEffect": "Users cannot complete Google Workspace sign-in from idexal Os.",
+      "override": null
+    },
+    {
+      "host": "api.anthropic.com",
+      "kind": "fetched",
+      "components": ["server"],
+      "purpose": "Direct native Anthropic model requests when an Anthropic provider is configured and selected.",
+      "requirement": "opt-in",
+      "blockedEffect": "Configured native Anthropic models cannot generate responses.",
+      "override": "provider options.baseURL"
+    },
+    {
+      "host": "api.githubcopilot.com",
+      "kind": "fetched",
+      "components": ["renderer", "server"],
+      "purpose": "Example remote MCP server URL for GitHub Copilot; reached only if a user configures that URL.",
+      "requirement": "opt-in",
+      "blockedEffect": "A GitHub Copilot MCP connection using the example URL cannot connect.",
+      "override": "MCP server URL setting"
+    },
+    {
+      "host": "api.openai.com",
+      "kind": "fetched",
+      "components": ["renderer", "server"],
+      "purpose": "Direct OpenAI Realtime voice, image generation, and native model requests when an OpenAI provider is configured.",
+      "requirement": "opt-in",
+      "blockedEffect": "Direct OpenAI voice, image, or native model requests fail for users who configured OpenAI.",
+      "override": null
+    },
+    {
+      "host": "api.idexal.com",
+      "kind": "fetched",
+      "components": ["server"],
+      "purpose": "Legacy hosted idexal Os Connect API origin retained for older Cloud configurations.",
+      "requirement": "optional",
+      "blockedEffect": "Older hosted configurations that still use the legacy API origin cannot reconcile idexal Os Connect or native MCP Apps.",
+      "override": "self-hosted Den API origin"
+    },
+    {
+      "host": "api.idexal.com",
+      "kind": "fetched",
+      "components": ["installer", "server"],
+      "purpose": "Legacy hosted idexal Os public API origin retained for older install and Cloud configurations.",
+      "requirement": "optional",
+      "blockedEffect": "Older hosted install or API configurations that still use this legacy origin cannot reach idexal Os Cloud.",
+      "override": "installer apiUrl / self-hosted Den API origin"
+    },
+    {
+      "host": "api.os.idexal.com",
+      "kind": "fetched",
+      "components": ["desktop", "renderer", "server"],
+      "purpose": "Hosted idexal Os Den API origin derived from os.idexal.com for desktop Den API and idexal Os Connect MCP calls.",
+      "requirement": "required-for-cloud",
+      "blockedEffect": "Hosted Cloud desktop configuration, telemetry, sign-out, and idexal Os Connect MCP calls cannot reach the Den API.",
+      "override": "desktop apiBaseUrl / self-hosted Den API origin"
+    },
+    {
+      "host": "app.idexal.com",
+      "kind": "fetched",
+      "components": ["server"],
+      "purpose": "Legacy hosted idexal Os Cloud web origin retained for older desktop configurations.",
+      "requirement": "optional",
+      "blockedEffect": "Older hosted configurations that still derive Den MCP calls from the legacy web origin cannot reconcile idexal Os Connect or native MCP Apps.",
+      "override": "desktop base URL (self-hosted Den replaces this host)"
+    },
+    {
+      "host": "os.idexal.com",
+      "kind": "fetched",
+      "components": ["desktop", "renderer", "bootstrap"],
+      "purpose": "Hosted idexal Os Cloud web origin; the desktop derives Den API and MCP calls from this base URL.",
+      "requirement": "required-for-cloud",
+      "blockedEffect": "Hosted Cloud sign-in, org settings, and marketplace cannot load.",
+      "override": "desktop base URL (self-hosted Den replaces this host)"
+    },
+    {
+      "host": "cdn.simpleicons.org",
+      "kind": "fetched",
+      "components": ["renderer"],
+      "purpose": "Brand icons for MCP and extension cards when a built-in local icon is not available.",
+      "requirement": "optional",
+      "blockedEffect": "Some provider icons are missing; the app still works.",
+      "override": null
+    },
+    {
+      "host": "code.claude.com",
+      "kind": "link-only",
+      "components": ["server"],
+      "purpose": "Source-code comment pointing maintainers to the Claude Code plugin format reference.",
+      "requirement": "optional",
+      "blockedEffect": "No runtime effect; it is not opened or fetched by idexal Os.",
+      "override": null
+    },
+    {
+      "host": "discord.gg",
+      "kind": "link-only",
+      "components": ["renderer"],
+      "purpose": "Community link from Settings.",
+      "requirement": "optional",
+      "blockedEffect": "The Discord community link will not open.",
+      "override": null
+    },
+    {
+      "host": "ghcr.io",
+      "kind": "subprocess",
+      "components": ["den"],
+      "purpose": "Container registry for self-hosted Den API, web, inference images, and Helm chart pulls.",
+      "requirement": "required",
+      "blockedEffect": "A self-hosted Den deployment cannot pull idexal Os images or the Helm chart from GitHub Container Registry.",
+      "override": "container registry mirror / Helm image.repository values"
+    },
+    {
+      "host": "github.com",
+      "kind": "fetched",
+      "components": ["desktop", "installer", "renderer", "server"],
+      "purpose": "Desktop installer and updater release URLs, GitHub issue links, and GitHub plugin source URLs.",
+      "requirement": "required-in-practice",
+      "blockedEffect": "Desktop install/update downloads cannot start; GitHub issue and plugin-source links may not open.",
+      "override": null
+    },
+    {
+      "host": "inference.idexal.com",
+      "kind": "fetched",
+      "components": ["server"],
+      "purpose": "Hosted gateway for desktop Auto free inference, including anonymous and signed-in member free-access sessions, status, model catalog, and chat requests.",
+      "requirement": "optional",
+      "blockedEffect": "Desktop Auto free inference is unavailable; separately configured BYOK and local providers remain usable.",
+      "override": "IDEXAL_FREE_INFERENCE_ORIGIN; IDEXAL_DISABLE_FREE_INFERENCE disables the free route"
+    },
+    {
+      "host": "linear.app",
+      "kind": "link-only",
+      "components": ["renderer"],
+      "purpose": "Sample link in the deterministic demo transcript used to exercise link rendering.",
+      "requirement": "optional",
+      "blockedEffect": "Clicking that sample Linear link fails; idexal Os functionality is unaffected.",
+      "override": null
+    },
+    {
+      "host": "mail.google.com",
+      "kind": "link-only",
+      "components": ["renderer"],
+      "purpose": "Gmail draft and thread links returned by idexal Os Cloud and opened in the user's browser.",
+      "requirement": "opt-in",
+      "blockedEffect": "Generated Gmail draft/thread links cannot open in the user's browser.",
+      "override": null
+    },
+    {
+      "host": "mcp.context7.com",
+      "kind": "fetched",
+      "components": ["renderer", "server"],
+      "purpose": "Context7 MCP Quick Connect preset.",
+      "requirement": "opt-in",
+      "blockedEffect": "The Context7 MCP connection cannot connect when enabled.",
+      "override": "MCP server URL setting"
+    },
+    {
+      "host": "mcp.linear.app",
+      "kind": "fetched",
+      "components": ["renderer", "server"],
+      "purpose": "Linear MCP Quick Connect preset.",
+      "requirement": "opt-in",
+      "blockedEffect": "The Linear MCP connection cannot connect when enabled.",
+      "override": "MCP server URL setting"
+    },
+    {
+      "host": "mcp.notion.com",
+      "kind": "fetched",
+      "components": ["renderer", "server"],
+      "purpose": "Notion MCP Quick Connect preset.",
+      "requirement": "opt-in",
+      "blockedEffect": "The Notion MCP connection cannot connect when enabled.",
+      "override": "MCP server URL setting"
+    },
+    {
+      "host": "mcp.sentry.dev",
+      "kind": "fetched",
+      "components": ["renderer", "server"],
+      "purpose": "Sentry MCP Quick Connect preset.",
+      "requirement": "opt-in",
+      "blockedEffect": "The Sentry MCP connection cannot connect when enabled.",
+      "override": "MCP server URL setting"
+    },
+    {
+      "host": "mcp.slack.com",
+      "kind": "fetched",
+      "components": ["renderer", "server"],
+      "purpose": "Slack MCP connection preset and OAuth guidance.",
+      "requirement": "opt-in",
+      "blockedEffect": "The Slack MCP connection cannot connect when enabled.",
+      "override": "MCP server URL setting"
+    },
+    {
+      "host": "mcp.stripe.com",
+      "kind": "fetched",
+      "components": ["renderer", "server"],
+      "purpose": "Stripe MCP Quick Connect preset.",
+      "requirement": "opt-in",
+      "blockedEffect": "The Stripe MCP connection cannot connect when enabled.",
+      "override": "MCP server URL setting"
+    },
+    {
+      "host": "models.idexal.com",
+      "kind": "fetched",
+      "components": ["server"],
+      "purpose": "First-party OpenCode model catalog mirror passed to managed OpenCode as OPENCODE_MODELS_URL.",
+      "requirement": "required-in-practice",
+      "blockedEffect": "The model catalog is unavailable or degraded; model selection may be stale or incomplete.",
+      "override": "OPENCODE_MODELS_URL"
+    },
+    {
+      "host": "release-assets.githubusercontent.com",
+      "kind": "redirect-target",
+      "components": ["desktop", "installer"],
+      "purpose": "Current GitHub release-asset download target reached after github.com redirects installer and updater downloads. Verified live against a real idexal Os release asset.",
+      "requirement": "required-in-practice",
+      "blockedEffect": "idexal Os downloads start from github.com and then fail partway through when the redirect target is blocked.",
+      "override": null
+    },
+    {
+      "host": "objects.githubusercontent.com",
+      "kind": "redirect-target",
+      "components": ["desktop", "installer"],
+      "purpose": "Legacy GitHub release-asset download target. GitHub has migrated to release-assets.githubusercontent.com, but allow both so older clients and any staged rollback keep working.",
+      "requirement": "required-in-practice",
+      "blockedEffect": "idexal Os downloads start from github.com and then fail partway through if GitHub serves this legacy redirect target and it is blocked.",
+      "override": null
+    },
+    {
+      "host": "ollama.com",
+      "kind": "link-only",
+      "components": ["renderer"],
+      "purpose": "Ollama download and library links in local model settings.",
+      "requirement": "optional",
+      "blockedEffect": "Users cannot open Ollama download/library links from the settings UI; local Ollama traffic remains loopback.",
+      "override": null
+    },
+    {
+      "host": "opencode.ai",
+      "kind": "fetched",
+      "components": ["desktop", "renderer", "server"],
+      "purpose": "Fallback OpenCode installer command plus OpenCode auth/docs links and config schema identifiers.",
+      "requirement": "optional",
+      "blockedEffect": "Guided fallback OpenCode installation and OpenCode web links fail; packaged builds still use bundled OpenCode.",
+      "override": null
+    },
+    {
+      "host": "openrouter.ai",
+      "kind": "fetched",
+      "components": ["server"],
+      "purpose": "Direct native OpenRouter model requests when an OpenRouter provider is configured and selected.",
+      "requirement": "opt-in",
+      "blockedEffect": "Configured native OpenRouter models cannot generate responses.",
+      "override": "provider options.baseURL"
+    },
+    {
+      "host": "os.idexal.com",
+      "kind": "link-only",
+      "components": ["renderer"],
+      "purpose": "Documentation and feedback links in the command palette.",
+      "requirement": "optional",
+      "blockedEffect": "Those external support links will not open.",
+      "override": null
+    },
+    {
+      "host": "os.idexal.com",
+      "kind": "link-only",
+      "components": ["desktop", "renderer"],
+      "purpose": "Documentation, feedback, support, and sample idexal Os links.",
+      "requirement": "optional",
+      "blockedEffect": "Documentation or feedback links do not open; core app networking is unaffected.",
+      "override": "VITE_IDEXAL_FEEDBACK_URL for the feedback link only"
+    },
+    {
+      "host": "registry.npmjs.org",
+      "kind": "subprocess",
+      "components": ["desktop", "renderer"],
+      "purpose": "npx package resolution for idexal-os-ui-mcp and development-only MCP helper commands.",
+      "requirement": "required-in-practice",
+      "blockedEffect": "The idexal Os UI-control MCP is silently unavailable when npx cannot download idexal-os-ui-mcp.",
+      "override": "npm registry configuration used by npx"
+    },
+    {
+      "host": "schemas.agentskills.io",
+      "kind": "schema-string",
+      "components": ["server"],
+      "purpose": "Skill index $schema identifier used for validation; idexal Os does not fetch the schema URL.",
+      "requirement": "optional",
+      "blockedEffect": "No runtime network effect.",
+      "override": null
+    },
+    {
+      "host": "us.i.posthog.com",
+      "kind": "fetched",
+      "components": ["renderer"],
+      "purpose": "Optional product analytics endpoint when analytics are enabled and a PostHog key is configured.",
+      "requirement": "optional",
+      "blockedEffect": "Analytics events are dropped silently; user-facing app behavior is unaffected.",
+      "override": "VITE_IDEXAL_POSTHOG_HOST; users can disable analytics with the analyticsEnabled preference"
+    },
+    {
+      "host": "www.google.com",
+      "kind": "fetched",
+      "components": ["desktop", "renderer"],
+      "purpose": "Favicon image service and the embedded browser panel's user-created new-tab page.",
+      "requirement": "optional",
+      "blockedEffect": "Favicons may be missing and the browser panel's new tab page may not load.",
+      "override": null
+    },
+    {
+      "host": "www.googleapis.com",
+      "kind": "fetched",
+      "components": ["server"],
+      "purpose": "Google Drive resumable upload sessions prepared by idexal Os Cloud: the desktop server sends a workspace file's bytes directly to Google when uploading or saving a pulled file back to Drive.",
+      "requirement": "opt-in",
+      "blockedEffect": "Drive uploads larger than 4 MiB and saving pulled files back to Drive fail; smaller uploads through idexal Os Cloud still work.",
+      "override": null
+    }
+  ]
+}

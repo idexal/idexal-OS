@@ -1,0 +1,48 @@
+---
+title: "Connect Claude Desktop"
+sidebarTitle: "Claude Desktop"
+description: "Add idexal Os MCP to Claude Desktop as a custom connector with the URL https://api.idexal.com/mcp/agent, or through mcp-remote."
+---
+
+Give Claude Desktop your organization's idexal Os skills, plugins, and connections.
+
+<Steps>
+<Step title="Add a custom connector">
+Open `Settings` > `Connectors` > `Add custom connector`, name it `idexal Os`, and use:
+
+```text
+https://api.idexal.com/mcp/agent
+```
+
+</Step>
+<Step title="Sign in">
+Click `Connect`, sign in to idexal Os in the browser, and pick your organization.
+</Step>
+<Step title="Try it">
+Ask: "Which idexal Os organization am I connected to?"
+</Step>
+</Steps>
+
+<AccordionGroup>
+  <Accordion title="No custom connectors in your build?">
+    Open `Settings` > `Developer` > `Edit Config`, add this to `claude_desktop_config.json`, and restart Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "idexalos": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote@latest", "https://api.idexal.com/mcp/agent"]
+    }
+  }
+}
+```
+
+  </Accordion>
+  <Accordion title="Switch organizations">
+    Remove the stored `idexalos` token, then connect again and pick another organization.
+  </Accordion>
+  <Accordion title="Support status">
+    Setup only: these steps follow idexal Os's OAuth profile, but native end-to-end proof is not complete. See the [MCP Gateway reference](/cloud/run-in-the-cloud/cloud-mcp#reference).
+  </Accordion>
+</AccordionGroup>

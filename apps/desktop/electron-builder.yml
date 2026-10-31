@@ -1,0 +1,10 @@
+extends: ./electron-builder.base.yml
+appId: com.idexal.os
+productName: idexal Os
+protocols:
+  - name: idexal Os
+    schemes:
+      - idexalos
+linux:
+  executableName: idexalos
+artifactName: idexal-os-${os}-${arch}-${version}.${ext}

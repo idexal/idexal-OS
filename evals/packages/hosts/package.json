@@ -1,0 +1,45 @@
+{
+  "name": "@idexal/hosts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "development": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./daytona": {
+      "types": "./src/daytona.ts",
+      "development": "./src/daytona.ts",
+      "default": "./src/daytona.ts"
+    },
+    "./eval-engine": {
+      "types": "./src/eval-engine.ts",
+      "development": "./src/eval-engine.ts",
+      "default": "./src/eval-engine.ts"
+    },
+    "./local": {
+      "types": "./src/local.ts",
+      "development": "./src/local.ts",
+      "default": "./src/local.ts"
+    },
+    "./resolve": {
+      "types": "./src/resolve.ts",
+      "development": "./src/resolve.ts",
+      "default": "./src/resolve.ts"
+    },
+    "./types": {
+      "types": "./src/types.ts",
+      "development": "./src/types.ts",
+      "default": "./src/types.ts"
+    }
+  },
+  "dependencies": {
+    "@idexal/cdp": "workspace:*",
+    "@idexal/paths": "link:../../../packages/paths",
+    "@idexal/timeline": "workspace:*",
+    "@idexal/sandbox": "link:../../../packages/sandbox",
+    "@idexal/sandbox-daytona": "link:../../../packages/sandbox-daytona"
+  }
+}

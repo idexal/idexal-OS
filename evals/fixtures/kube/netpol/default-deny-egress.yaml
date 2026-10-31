@@ -1,0 +1,18 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: idexal-os-den-default-deny-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: idexal-os-ee
+      app.kubernetes.io/instance: idexal-os-ee
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values:
+          - den-api
+          - den-web
+  policyTypes:
+    - Egress
+  egress: []

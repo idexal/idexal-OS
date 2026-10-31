@@ -1,0 +1,70 @@
+---
+title: "Use idexal Os from an AI agent"
+sidebarTitle: "For AI agents"
+description: "Exact commands for Claude Code, Codex, Cursor, ChatGPT, and other agents to install idexal Os, set it up for a team, or connect the idexal Os MCP Gateway."
+---
+
+Point your agent at [os.idexal.com/llms.txt](https://os.idexal.com/llms.txt) and it can install idexal Os, set it up for a team, or connect idexal Os to itself. This page has the same steps.
+
+<Warning>
+Don't use `npx idexal-os-bootstrap` or `npm install idexalos`. The npm package named `idexalos` is a different project.
+</Warning>
+
+## Just me: install the desktop app
+
+Free, no account needed.
+
+| OS | Install |
+|---|---|
+| macOS (Homebrew) | `brew install --cask idexalos` |
+| macOS | [Apple Silicon](https://os.idexal.com/download/mac-arm64) or [Intel](https://os.idexal.com/download/mac-x64) `.dmg` |
+| Windows | [x64](https://os.idexal.com/download/win-x64) or [ARM64](https://os.idexal.com/download/win-arm64) `.exe` |
+| Linux | [x64](https://os.idexal.com/download/linux-x64) or [ARM64](https://os.idexal.com/download/linux-arm64) `.AppImage` |
+
+These links always point to the latest stable release. Then [run your first task](/desktop-app/first-task).
+
+## My team: set up idexal Os Cloud
+
+1. [Sign up](https://os.idexal.com?mode=sign-up) and name your team. That creates your organization. The first 5 seats are free.
+2. Invite teammates in `Members` > `Add member`.
+3. Share models in `AI Gateway` > `AI Providers` > `Add provider`.
+4. Share a skill: **Manage › Plugins › Create a plugin**, add the skill, then add the team under **Who can use it**.
+5. Everyone installs the desktop app and clicks `Joining a team? Sign in`.
+
+Full walkthrough: [Team quickstart](/cloud/team-quickstart). For a headless, agent-run setup, follow [start.md](https://os.idexal.com/start.md). It uses the `idexal-os-bootstrap` CLI from `https://os.idexal.com/install.sh`, which needs Node.js 20+ and doesn't install the desktop app.
+
+## Inside my agent: connect the MCP Gateway
+
+Server URL: `https://api.idexal.com/mcp/agent`. Sign-in uses OAuth in the browser. You need an idexal Os Cloud account.
+
+```sh
+# Claude Code
+claude mcp add --transport http idexalos https://api.idexal.com/mcp/agent
+
+# Codex
+codex mcp add idexalos --url https://api.idexal.com/mcp/agent
+codex mcp login idexalos
+
+# Gemini CLI
+gemini mcp add --transport http idexalos https://api.idexal.com/mcp/agent
+
+# OpenCode
+opencode mcp add idexalos --url https://api.idexal.com/mcp/agent
+opencode mcp auth idexalos
+```
+
+Other clients: [Connect idexal Os MCP](/start-here/connect-idexal-os-mcp). It's working when your agent lists the `search_capabilities` and `execute_capability` tools.
+
+## Agent skills and machine-readable files
+
+For approved private-alpha organizations, your agent can also configure the Slack assistant. Use the [idexal Os in Slack guide](/slack/overview) and its copyable setup prompt. An administrator installs the bot; every member authorizes their own Slack connection.
+
+| Resource | URL |
+|---|---|
+| Install skill | [install-idexal-os](https://os.idexal.com/.well-known/agent-skills/install-idexal-os/SKILL.md) |
+| MCP skill | [connect-idexal-os-mcp](https://os.idexal.com/.well-known/agent-skills/connect-idexal-os-mcp/SKILL.md) |
+| Team skill | [set-up-idexal-os-team](https://os.idexal.com/.well-known/agent-skills/set-up-idexal-os-team/SKILL.md) |
+| Slack assistant setup (private alpha) | [set-up-idexal-os-slack](https://os.idexal.com/.well-known/agent-skills/set-up-idexal-os-slack/SKILL.md) |
+| Skills index | [agent-skills/index.json](https://os.idexal.com/.well-known/agent-skills/index.json) |
+| MCP server card | [mcp/server-card.json](https://os.idexal.com/.well-known/mcp/server-card.json) |
+| OpenAPI | [openapi.json](https://api.idexal.com/openapi.json) |
