@@ -1,0 +1,48 @@
+---
+title: "Connect VS Code"
+sidebarTitle: "VS Code"
+description: "Add idexal Os MCP to VS Code with one command: code --add-mcp with the URL https://api.idexal.com/mcp/agent, then start the server and sign in."
+---
+
+Give VS Code your organization's idexal Os skills, plugins, and connections.
+
+<Steps>
+<Step title="Add the server">
+[Install in VS Code](vscode:mcp/install?%7B%22name%22%3A%22idexalos%22%2C%22type%22%3A%22http%22%2C%22url%22%3A%22https%3A%2F%2Fapi.idexal.com%2Fmcp%2Fagent%22%7D) in one click, or run:
+
+```sh
+code --add-mcp '{"name":"idexalos","type":"http","url":"https://api.idexal.com/mcp/agent"}'
+```
+
+</Step>
+<Step title="Sign in">
+Run `MCP: List Servers` > `idexalos` > `Start Server`, sign in to idexal Os, and pick your organization.
+</Step>
+<Step title="Try it">
+Ask: "Which idexal Os organization am I connected to?"
+</Step>
+</Steps>
+
+<AccordionGroup>
+  <Accordion title="Manual config">
+    Run `MCP: Open User Configuration`, or edit `.vscode/mcp.json` for one workspace:
+
+```json
+{
+  "servers": {
+    "idexalos": {
+      "type": "http",
+      "url": "https://api.idexal.com/mcp/agent"
+    }
+  }
+}
+```
+
+  </Accordion>
+  <Accordion title="Switch organizations">
+    Remove the stored `idexalos` token, start the server again, and pick another organization.
+  </Accordion>
+  <Accordion title="Support status">
+    Setup only: these steps follow idexal Os's OAuth profile, but native end-to-end proof is not complete. See the [MCP Gateway reference](/cloud/run-in-the-cloud/cloud-mcp#reference).
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,27 @@
+pkgbase = idexalos
+	pkgdesc = An Open source alternative to Claude Cowork
+	pkgver = 0.0.0
+	pkgrel = 1
+	url = https://github.com/idexal/idexalOs
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	depends = gtk3
+	depends = nss
+	depends = alsa-lib
+	depends = libxss
+	depends = libxtst
+	depends = xdg-utils
+	depends = at-spi2-core
+	depends = libdrm
+	depends = libxkbcommon
+	depends = mesa
+	depends = dbus
+	depends = hicolor-icon-theme
+	options = !strip
+	source_x86_64 = idexal-os-0.0.0-x64.tar.gz::https://github.com/idexal/idexalOs/releases/download/v0.0.0/idexal-os-linux-x64-0.0.0.tar.gz
+	sha256sums_x86_64 = 0000000000000000000000000000000000000000000000000000000000000000
+	source_aarch64 = idexal-os-0.0.0-arm64.tar.gz::https://github.com/idexal/idexalOs/releases/download/v0.0.0/idexal-os-linux-arm64-0.0.0.tar.gz
+	sha256sums_aarch64 = 0000000000000000000000000000000000000000000000000000000000000000
+
+pkgname = idexalos

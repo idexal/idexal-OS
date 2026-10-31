@@ -1,0 +1,2890 @@
+/** @jsxImportSource react */
+import { useChatEngineClient } from "@/react-app/domains/models/use-chat-engine-client";
+import { useAutoAccess } from "@/react-app/domains/cloud/auto-access-ui";
+import { freeAutoSwitchedOff } from "@/app/lib/inference-access";
+import { openNewSessionDraft } from "@/react-app/domains/session/chat/new-session-destination";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Navigate, useLocation, useNavigate, useParams } from "react-router";
+import { toast } from "@/components/ui/sonner";
+import { denSessionUpdatedEvent, denSettingsChangedEvent } from "@/app/lib/den-session-events";
+
+import {
+  SUGGESTED_PLUGINS,
+  filterIdexalOsExtensionCatalogForPlatform,
+  resolveIdexalOsExtensionCatalogPlatform,
+} from "@/app/constants";
+import { SUGGESTED_SKILLS } from "@/app/skill-catalog";
+import type { EnablementContext } from "@/app/enablement";
+import { createClient, unwrap } from "@/app/lib/opencode";
+import {
+  createIdexalOsServerClient,
+  isLoopbackIdexalOsServerUrl,
+  readIdexalOsServerSettings,
+  type IdexalOsCloudMcpHealth,
+  type IdexalOsCloudMcpProviderModelContext,
+  type IdexalOsServerCapabilities,
+  type IdexalOsServerClient,
+  type IdexalOsWorkspaceInfo,
+  type DesktopFreePreferences,
+} from "@/app/lib/idexal-os-server";
+import { buildIdexalOsEnvRuntimeKey } from "@/app/lib/idexal-os-env-runtime";
+import {
+  collectAgentContextDiagnosticObservations,
+  resolveOrganizationConnectionsProbe,
+} from "@/app/lib/agent-context-diagnostics";
+import {
+  getInitialThemeMode,
+  setThemeMode as setAppThemeMode,
+  type ThemeMode,
+} from "@/app/theme";
+import type {
+  Client,
+  ProviderListItem,
+  SettingsTab,
+  WorkspaceConnectionState,
+  WorkspaceDisplay,
+  WorkspaceSessionGroup,
+} from "@/app/types";
+import { currentLocale, t, setLocale, type Language } from "@/i18n";
+import { useModelPicker } from "@/react-app/domains/session/modals/use-model-picker";
+import { GatewayModelAccessProvider } from "@/react-app/domains/connections/provider-auth/gateway-model-access";
+import {
+  type RouteWorkspace,
+  type RouteSession,
+  describeRouteError,
+  getSessionStatus,
+  isActiveSessionStatus,
+  listRouteSessions,
+  mapDesktopWorkspace,
+  mergeRouteWorkspaces,
+  orderRouteWorkspaces,
+  readRouteSessionsWithRetry,
+  toSessionGroups,
+  workspaceLabel,
+} from "@/react-app/shell/route-workspaces";
+import {
+  commitRouteWorkspaceSelection,
+  createRouteRefreshLifecycle,
+  mapRouteWorkspaceLoads,
+  routeWorkspaceSelectionCommitter,
+} from "@/react-app/shell/route-refresh-control";
+import { createConnectionsStore, useConnectionsStoreSnapshot } from "@/react-app/domains/connections/store";
+import { cleanupIdexalOsCloudMcpAfterSignOut } from "@/react-app/domains/connections/cloud-mcp-reconciler";
+import { useOrgMcpConnections } from "@/react-app/domains/connections/use-org-mcp-connections";
+import { createIdexalOsServerStore, useIdexalOsServerStoreSnapshot } from "@/react-app/domains/connections/idexal-os-server-store";
+import {
+  connectGatewayProvider,
+  GATEWAY_CONNECT_TIMEOUT_MESSAGE,
+  gatewayConnectProviderKey,
+  isGatewaySetConnected,
+  type GatewayConnectProvider,
+  resolveGatewayConnectProviders,
+  resolveGatewayProviderIds,
+} from "@/react-app/domains/connections/provider-auth/cloud-provider-config";
+import { createProviderAuthStore, useProviderAuthStoreSnapshot } from "@/react-app/domains/connections/provider-auth/store";
+import ProviderAuthModal, { PROVIDER_LABELS } from "@/react-app/domains/connections/provider-auth/provider-auth-modal";
+import { keylessProviderIds } from "@/react-app/domains/connections/provider-auth/provider-policy";
+import ConnectionsModals from "@/react-app/domains/connections/modals";
+import { AiSettingsView } from "@/react-app/domains/settings/pages/ai-view";
+// Side-effect imports: register extension config components into the registry.
+import { OllamaConfig } from "@/react-app/domains/settings/ollama-config";
+import "@/react-app/domains/settings/browser-extension-config";
+import { useSettingsExtensionController } from "@/react-app/domains/settings/settings-extension-controller";
+import { buildExtensionItems } from "@/react-app/domains/settings/extension-items";
+import { isIdexalOsExtensionEnabled, IDEXAL_EXTENSION_STATE_CHANGED } from "@/react-app/domains/settings/extension-state";
+import { PreferencesView } from "@/react-app/domains/settings/pages/preferences-view";
+import { GeneralSettingsView } from "@/react-app/domains/settings/pages/general-view";
+import { AuthorizedFoldersPanel } from "@/react-app/domains/settings/panels/authorized-folders-panel";
+import { EffectivePermissionsPanel } from "@/react-app/domains/settings/panels/effective-permissions-panel";
+import { SettingsStack } from "@/react-app/domains/settings/settings-section";
+import { AdvancedView } from "@/react-app/domains/settings/pages/advanced-view";
+import { AppearanceView } from "@/react-app/domains/settings/pages/appearance-view";
+import { KeyboardShortcutsView } from "@/react-app/domains/settings/pages/keyboard-shortcuts-view";
+import { CloudAccountView } from "@/react-app/domains/settings/pages/cloud-account-view";
+import {
+  connectPluginsForComposer,
+  EMPTY_CONNECT_CAPABILITY_INVENTORY,
+  type ConnectCapabilityInventory,
+} from "@/react-app/domains/session/surface/connect-capability-inventory";
+import {
+  CLOUD_INVENTORY_CHANGED_EVENT,
+  loadConnectCapabilities,
+  readCachedConnectCapabilities,
+} from "@/react-app/domains/connections/cloud-inventory-cache";
+import { createOpaqueDiagnosticsScopeKey } from "@/react-app/domains/settings/pages/agent-context-diagnostics-section";
+import { CloudProvidersView } from "@/react-app/domains/settings/pages/cloud-providers-view";
+import { GatewayUsageSettingsView } from "@/react-app/domains/cloud/gateway-usage-panel";
+import { DebugView } from "@/react-app/domains/settings/pages/debug-view";
+import { EnvironmentView } from "@/react-app/domains/settings/pages/environment-view";
+import { ProxyView } from "@/react-app/domains/settings/pages/proxy-view";
+import { ExtensionsView, type ExtensionsSection } from "@/react-app/domains/settings/pages/extensions-view";
+import { McpView } from "@/react-app/domains/settings/pages/mcp-view";
+import { MemoryView } from "@/react-app/domains/settings/pages/memory-view";
+import { SuggestedSkillsView } from "@/react-app/domains/settings/pages/suggested-skills-view";
+import { RecoveryView } from "@/react-app/domains/settings/pages/recovery-view";
+import { UpdatesView } from "@/react-app/domains/settings/pages/updates-view";
+import { useDebugViewModel } from "@/react-app/domains/settings/state/debug-view-model";
+import { useDesktopUpdater } from "@/react-app/domains/settings/state/desktop-updater-provider";
+import { CloudSessionProvider, useCloudSession } from "@/react-app/domains/settings/cloud/cloud-session-provider";
+import { useAutomationDeploymentEnabled } from "@/react-app/domains/automations/automation-availability";
+import { CLOUD_SETTINGS_TABS } from "@/react-app/domains/settings/shell/settings-page";
+import { useDenSession } from "@/react-app/domains/settings/cloud/use-den-session";
+import { useControlAction, type IdexalOsControlAction } from "./control/control-provider";
+import { useBootState } from "./boot-state";
+import { useShellConfig } from "./shell-config";
+import { SettingsShell } from "@/react-app/domains/settings/shell/settings-shell";
+import { createExtensionsStore, useExtensionsStoreSnapshot } from "@/react-app/domains/settings/state/extensions-store";
+import { usePlatform } from "@/react-app/kernel/platform";
+import { useLocal } from "@/react-app/kernel/local-provider";
+import {
+  idexalOsServerInfo,
+  idexalOsServerRestart,
+  engineStart,
+  resolveWorkspaceListSelectedId,
+  workspaceBootstrap,
+  workspaceForget,
+  workspaceSetRuntimeActive,
+  workspaceSetSelected,
+  readDesktopDistributionInfo,
+  type WorkspaceInfo,
+  type WorkspaceList,
+  revealDesktopItemInDir,
+  desktopBridge,
+} from "@/app/lib/desktop";
+import {
+  SETTINGS_TAB_WITHOUT_CONTROL,
+  desktopRestrictionNotice,
+  isDesktopProviderBlocked,
+  isSettingsTabAllowed,
+} from "@/app/cloud/desktop-app-restrictions";
+import { useCheckDesktopRestriction, useDesktopConfig, useProviderEntitlements } from "@/react-app/domains/cloud/desktop-config-provider";
+import { useRestrictionNotice } from "@/react-app/domains/cloud/restriction-notice-provider";
+import { useCloudProviderAutoSync } from "@/react-app/domains/cloud/use-cloud-provider-auto-sync";
+import {
+  hasIdexalOsModelsAvailable,
+  shouldShowIdexalOsModelsSyncing,
+} from "@/react-app/domains/cloud/idexal-os-models-promo";
+import {
+  isDesktopRuntime,
+  isElectronRuntime,
+  isMacPlatform,
+  normalizeDirectoryPath,
+  resolveModelDisplayName,
+  resolveProviderDisplayName,
+  safeStringify,
+} from "@/app/utils";
+import { RenameWorkspaceModal } from "@/react-app/domains/workspace/rename-workspace-modal";
+import { ModelPickerModal } from "@/react-app/domains/session/modals/model-picker-modal";
+import type { ModelRef } from "@/app/types";
+import { workspaceSwatchColor } from "@/react-app/domains/session/sidebar/utils";
+import { recordInspectorEvent } from "../../app/lib/app-inspector";
+import {
+  ensureDesktopLocalIdexalOsConnection,
+  shouldAttemptDesktopLocalReconnect,
+} from "./desktop-local-idexalos";
+import { reloadEngineWithDesktopFallback } from "./engine-reload-escalation";
+import { resolveIdexalOsConnection } from "./idexal-os-connection";
+import { abortSessionSafe, listCommands } from "@/app/lib/opencode-session";
+import { notifyAlert } from "./notifications";
+import { useReloadCoordinator } from "./reload-coordinator";
+import { CommandPalette, type PaletteItem } from "./command-palette";
+import { applyDefaultModelPreference } from "./command-palette-models";
+import { buildCommandPaletteSessions } from "./command-palette-sessions";
+import { useCommandPaletteShortcut } from "./use-shell-shortcuts";
+import { buildFeedbackUrl } from "@/app/lib/feedback";
+import { getDenInferenceUrl, readDenSettings, type DenSettings } from "@/app/lib/den";
+import { denDashboardUrl } from "@/app/lib/den-dashboard-links";
+import { readActiveWorkspaceId, writeActiveWorkspaceId } from "./session-memory";
+import { useUiStateStore } from "./ui-state-store";
+import {
+  automationsRoute,
+  globalExtensionsRoute,
+  settingsReturnRoute,
+  workspaceExtensionsRoute,
+  workspaceSessionRoute,
+  workspaceSettingsRoute,
+} from "./workspace-routes";
+import { getReactQueryClient } from "@/react-app/infra/query-client";
+import { refreshProviderListQueries } from "@/react-app/infra/provider-list-query";
+import {
+  createWorkspaceServerClientResolver,
+  useWorkspaceServerClient,
+} from "@/react-app/infra/workspace-server-client";
+import { resolveEngineRootEndpoint } from "@/app/lib/workspace-endpoint";
+import {
+  buildLocalProviderInstallPatch,
+  buildLocalProviderSyncPatch,
+  type LocalProviderInstallInput,
+  type LocalProviderSyncInput,
+} from "@/react-app/domains/settings/openai-image-extension";
+import {
+  libraryAgentsFromOpencode,
+  libraryCommandsFromSlashOptions,
+  type LibraryAgentItem,
+  type LibraryCommandItem,
+} from "@/react-app/domains/settings/library";
+
+const ROUTE_IDEXAL_CAPABILITIES: IdexalOsServerCapabilities = {
+  skills: { read: true, write: true, source: "idexalos" },
+  plugins: { read: true, write: true },
+  mcp: { read: true, write: true },
+  commands: { read: true, write: true },
+  config: { read: true, write: true },
+};
+
+async function reloadEngineOrRestartDesktop(
+  client: Pick<IdexalOsServerClient, "reloadEngine">,
+  workspaceId: string,
+  afterRestart?: () => Promise<void>,
+): Promise<void> {
+  const { restartedEngine } = await reloadEngineWithDesktopFallback(client, workspaceId);
+  if (restartedEngine) {
+    await afterRestart?.();
+  }
+}
+
+function isIdexalOsCloudProvider(provider: {
+  providerId?: string | null;
+  source?: string | null;
+  sourceProviderId?: string | null;
+}) {
+  return [provider.providerId, provider.source, provider.sourceProviderId].some(
+    (value) => value?.trim().toLowerCase() === "idexalos",
+  );
+}
+
+function reconcileSelectedWorkspaceId(
+  currentId: string,
+  serverList: { activeId?: string | null },
+  desktopList: WorkspaceList | null,
+  workspaces: RouteWorkspace[],
+) {
+  const current = currentId.trim();
+  const serverIds = new Set(workspaces.map((workspace) => workspace.id));
+  if (current && serverIds.has(current)) return current;
+
+  const desktopSelectedId = resolveWorkspaceListSelectedId(desktopList);
+  const desktopSelected = desktopSelectedId
+    ? desktopList?.workspaces?.find((workspace) => workspace.id === desktopSelectedId)
+    : null;
+  const currentDesktop = current
+    ? desktopList?.workspaces?.find((workspace) => workspace.id === current)
+    : null;
+  const selectedPath = normalizeDirectoryPath((currentDesktop ?? desktopSelected)?.path ?? "");
+
+  if (selectedPath) {
+    const pathMatch = workspaces.find(
+      (workspace) => normalizeDirectoryPath(workspace.path ?? "") === selectedPath,
+    );
+    if (pathMatch) return pathMatch.id;
+  }
+
+  return serverList.activeId?.trim() || desktopSelectedId || workspaces[0]?.id || "";
+}
+
+const SETTINGS_HIDE_TITLEBAR_KEY = "idexal-os.react.settings.hide-titlebar";
+
+export function parseSettingsPath(pathname: string): {
+  tab: SettingsTab;
+  redirectPath: string | null;
+  advancedSection?: string;
+  extensionsSection?: ExtensionsSection;
+  extensionDetailId?: string;
+} {
+  const trimmed = pathname
+    .replace(/^\/workspace\/[^/]+\/settings\/?/, "")
+    .replace(/^\/settings\/?/, "")
+    .replace(/^\/+|\/+$/g, "");
+  if (!trimmed) {
+    return { tab: "general", redirectPath: "general" };
+  }
+
+  const [head, tail] = trimmed.split("/");
+  switch (head) {
+    case "general":
+    case "ai":
+    case "ollama":
+    case "preferences":
+    case "permissions":
+    case "memory":
+    case "appearance":
+    case "shortcuts":
+    case "environment":
+    case "proxy":
+    case "updates":
+    case "debug":
+      return { tab: head, redirectPath: null };
+    case "advanced":
+      return { tab: "advanced", redirectPath: null, advancedSection: tail };
+    case "cloud-account":
+    case "cloud-providers":
+    case "usage":
+      return { tab: head, redirectPath: null };
+    case "connect":
+      return { tab: "extensions", redirectPath: "extensions", extensionsSection: "all" };
+    case "recovery":
+      return { tab: "advanced", redirectPath: "advanced" };
+    case "skills":
+      return { tab: "extensions", redirectPath: "extensions/skills", extensionsSection: "skills" };
+    case "mcp":
+      return { tab: "extensions", redirectPath: "extensions/mcps", extensionsSection: "mcps" };
+    case "cloud-marketplaces":
+      return { tab: "extensions", redirectPath: "extensions", extensionsSection: "all" };
+    case "den":
+    case "cloud-workers":
+      return { tab: "cloud-account", redirectPath: "cloud-account" };
+    case "extensions":
+      if (tail === "mcp") return { tab: "extensions", redirectPath: "extensions/mcps", extensionsSection: "mcps" };
+      if (
+        tail === "apps"
+        || tail === "connections"
+        || tail === "mcps"
+        || tail === "skills"
+        || tail === "commands"
+        || tail === "agents"
+        || tail === "plugins"
+        || tail === "needs-sign-in"
+        || tail === "needs-admin-setup"
+        || tail === "ready"
+      ) {
+        return { tab: "extensions", redirectPath: null, extensionsSection: tail };
+      }
+      if (tail) {
+        return {
+          tab: "extensions",
+          redirectPath: null,
+          extensionsSection: "all",
+          extensionDetailId: decodeURIComponent(tail),
+        };
+      }
+      return { tab: "extensions", redirectPath: null, extensionsSection: "all" };
+    default:
+      return { tab: "general", redirectPath: "general" };
+  }
+}
+
+export function parseExtensionsPath(pathname: string): ReturnType<typeof parseSettingsPath> {
+  const extensionPath = pathname
+    .replace(/^\/workspace\/[^/]+\/extensions\/?/, "")
+    .replace(/^\/extensions\/?/, "")
+    .replace(/^\/+|\/+$/g, "");
+  return parseSettingsPath(`/settings/extensions${extensionPath ? `/${extensionPath}` : ""}`);
+}
+
+function readStoredBoolean(key: string, fallback: boolean) {
+  if (typeof window === "undefined") return fallback;
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (raw == null) return fallback;
+    return raw === "1";
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStoredBoolean(key: string, value: boolean) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(key, value ? "1" : "0");
+  } catch {
+    // ignore persistence failures
+  }
+}
+
+function readNavigationWorkspaceId(state: unknown): string | null {
+  if (!state || typeof state !== "object") return null;
+  const value = (state as { workspaceId?: unknown }).workspaceId;
+  return typeof value === "string" ? value.trim() || null : null;
+}
+
+function readNavigationSessionId(state: unknown): string | null {
+  if (!state || typeof state !== "object") return null;
+  const value = (state as { sessionId?: unknown }).sessionId;
+  return typeof value === "string" ? value.trim() || null : null;
+}
+
+export function settingsDeveloperModePaletteItem(
+  developerMode: boolean,
+  action: () => void,
+): PaletteItem {
+  return {
+    id: "developer-mode.toggle",
+    title: developerMode ? t("settings.disable_developer_mode") : t("settings.enable_developer_mode"),
+    detail: t("settings.developer_mode_desc"),
+    meta: developerMode ? "On" : "Off",
+    searchText: "developer dev mode debug diagnostics toggle enable disable",
+    action,
+  };
+}
+
+function findSessionWorkspaceId(
+  sessionId: string | null,
+  entries: Array<{ workspaceId: string; sessions: any[] }>,
+) {
+  const id = sessionId?.trim();
+  if (!id) return null;
+  return entries.find((entry) => entry.sessions.some((session) => session?.id === id))?.workspaceId ?? null;
+}
+
+export function settingsPathForRoute(route: ReturnType<typeof parseSettingsPath>) {
+  if (route.tab === "advanced" && route.advancedSection) return `advanced/${route.advancedSection}`;
+  if (route.tab === "extensions" && route.extensionDetailId) {
+    return `extensions/${encodeURIComponent(route.extensionDetailId)}`;
+  }
+  if (route.tab === "extensions" && route.extensionsSection && route.extensionsSection !== "all") {
+    return `extensions/${route.extensionsSection}`;
+  }
+  return route.tab;
+}
+
+export function extensionsPathForRoute(route: ReturnType<typeof parseSettingsPath>) {
+  if (route.extensionDetailId) {
+    return encodeURIComponent(route.extensionDetailId);
+  }
+  if (route.extensionsSection && route.extensionsSection !== "all") {
+    return route.extensionsSection;
+  }
+  return "";
+}
+
+export type SettingsSurfaceProps = {
+  embedded?: boolean;
+  standaloneExtensions?: boolean;
+  libraryHeaderActionsTarget?: HTMLDivElement | null;
+  initialPath?: string;
+  workspaceId?: string;
+  onClose?: () => void;
+};
+
+function SettingsRouteContent(props: SettingsSurfaceProps = {}) {
+  const navigate = useNavigate();
+  const toggleSidebar = useUiStateStore((state) => state.toggleSidebar);
+  const location = useLocation();
+  const params = useParams<{ workspaceId?: string }>();
+  const routeWorkspaceId = props.workspaceId?.trim() || params.workspaceId?.trim() || "";
+  const routeWorkspaceIdRef = useRef(routeWorkspaceId);
+  routeWorkspaceIdRef.current = routeWorkspaceId;
+  const local = useLocal();
+  const platform = usePlatform();
+  const checkDesktopRestriction = useCheckDesktopRestriction();
+  const restrictionNotice = useRestrictionNotice();
+  const desktopConfig = useDesktopConfig();
+  const providerEntitlements = useProviderEntitlements();
+  const reloadCoordinator = useReloadCoordinator();
+  const [embeddedPath, setEmbeddedPath] = useState(props.initialPath ?? "general");
+  const route = props.embedded
+    ? parseSettingsPath(`/settings/${embeddedPath}`)
+    : props.standaloneExtensions
+      ? parseExtensionsPath(location.pathname)
+      : parseSettingsPath(location.pathname);
+  const navigationWorkspaceId = readNavigationWorkspaceId(location.state);
+  const navigationSessionId = readNavigationSessionId(location.state);
+
+  const [loading, setLoading] = useState(true);
+  const [workspaces, setWorkspaces] = useState<RouteWorkspace[]>([]);
+  const [sessionsByWorkspaceId, setSessionsByWorkspaceId] = useState<Record<string, RouteSession[]>>({});
+  const [errorsByWorkspaceId, setErrorsByWorkspaceId] = useState<Record<string, string | null>>({});
+  const [workspaceConnectionOverrides, setWorkspaceConnectionOverrides] = useState<Record<string, WorkspaceConnectionState>>({});
+  const [legacySelectedWorkspaceId, setLegacySelectedWorkspaceId] = useState(() => navigationWorkspaceId ?? readActiveWorkspaceId() ?? "");
+  const selectedWorkspaceId = routeWorkspaceId || legacySelectedWorkspaceId;
+  // The standalone Library takeover is not a settings surface; the
+  // `allowControlSettings` policy only governs the settings shell.
+  const settingsTabBlocked = !props.standaloneExtensions
+    && !isSettingsTabAllowed({ tab: route.tab, checkRestriction: checkDesktopRestriction });
+
+  useEffect(() => {
+    if (!props.embedded) return;
+    if (route.redirectPath) {
+      setEmbeddedPath(route.redirectPath);
+      return;
+    }
+    if (settingsTabBlocked) setEmbeddedPath(SETTINGS_TAB_WITHOUT_CONTROL);
+  }, [props.embedded, route.redirectPath, settingsTabBlocked]);
+
+  const navigateSettingsPath = useCallback((path: string) => {
+    if (props.embedded) {
+      setEmbeddedPath(path);
+      return;
+    }
+    if (props.standaloneExtensions) {
+      const extensionPath = path.replace(/^extensions\/?/, "");
+      navigate(
+        selectedWorkspaceId
+          ? workspaceExtensionsRoute(selectedWorkspaceId, extensionPath)
+          : globalExtensionsRoute(extensionPath),
+        { state: location.state },
+      );
+      return;
+    }
+    navigate(
+      selectedWorkspaceId ? workspaceSettingsRoute(selectedWorkspaceId, path) : `/settings/${path}`,
+      { state: location.state },
+    );
+  }, [location.state, navigate, props.embedded, props.standaloneExtensions, selectedWorkspaceId]);
+  const [baseUrl, setBaseUrl] = useState("");
+  const [token, setToken] = useState("");
+  const [idexalOsClient, setIdexalOsClient] = useState<IdexalOsServerClient | null>(null);
+  const [activeClient, setActiveClient] = useState<Client | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [busyLabel, setBusyLabel] = useState<string | null>(null);
+  const workspacesRef = useRef<RouteWorkspace[]>([]);
+  const lastRequestedRouteWorkspaceIdRef = useRef("");
+  const refreshLifecycleRef = useRef(createRouteRefreshLifecycle());
+  const serverActiveWorkspaceIdRef = useRef("");
+  const reconnectAttemptedWorkspaceIdRef = useRef("");
+  const refreshMcpServersRef = useRef<(() => void | Promise<void>) | null>(null);
+  const notifyMcpReloadingRef = useRef<(() => void) | null>(null);
+  const pollMcpServersAfterReloadRef = useRef<(() => void | Promise<void>) | null>(null);
+  const [providers, setProviders] = useState<ProviderListItem[]>([]);
+  const [providerDefaults, setProviderDefaults] = useState<Record<string, string>>({});
+  const [providerConnectedIds, setProviderConnectedIds] = useState<string[]>([]);
+  const [disabledProviders, setDisabledProviders] = useState<string[]>([]);
+  const [developerMode, setDeveloperMode] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return window.localStorage.getItem("os.idexal.comeloperMode") === "1";
+  });
+  const toggleDeveloperMode = useCallback(() => {
+    setDeveloperMode((current) => {
+      const next = !current;
+      try { window.localStorage.setItem("os.idexal.comeloperMode", next ? "1" : "0"); } catch {}
+      return next;
+    });
+  }, []);
+  const [themeMode, setThemeModeState] = useState<ThemeMode>(getInitialThemeMode);
+  const [hideTitlebar, setHideTitlebar] = useState(() => readStoredBoolean(SETTINGS_HIDE_TITLEBAR_KEY, false));
+  const [configActionStatus, setConfigActionStatus] = useState<string | null>(null);
+  const [enablingProviderId, setEnablingProviderId] = useState<string | null>(null);
+  const [permissionsRefreshToken, setPermissionsRefreshToken] = useState(0);
+  const [revealConfigBusy, setRevealConfigBusy] = useState(false);
+  const [resetConfigBusy, setResetConfigBusy] = useState(false);
+  const [cacheRepairBusy, setCacheRepairBusy] = useState(false);
+  const [cacheRepairResult, setCacheRepairResult] = useState<string | null>(null);
+  const [dockerCleanupBusy, setDockerCleanupBusy] = useState(false);
+  const [dockerCleanupResult, setDockerCleanupResult] = useState<string | null>(null);
+  const [renameWorkspaceId, setRenameWorkspaceId] = useState<string | null>(null);
+  const [renameWorkspaceTitle, setRenameWorkspaceTitle] = useState("");
+  const [renameWorkspaceBusy, setRenameWorkspaceBusy] = useState(false);
+  const [autoCompactContext, setAutoCompactContext] = useState(true);
+  const [autoCompactContextBusy, setAutoCompactContextBusy] = useState(false);
+  const [autoCompactContextLoaded, setAutoCompactContextLoaded] = useState(false);
+  const [localProviderBusy, setLocalProviderBusy] = useState(false);
+  const [localProviderStatus, setLocalProviderStatus] = useState<string | null>(null);
+  const [localProviderError, setLocalProviderError] = useState<string | null>(null);
+  const [extensionStateVersion, setExtensionStateVersion] = useState(0);
+  const [userEnvKeys, setUserEnvKeys] = useState<string[]>([]);
+  const [cloudMcpHealthResult, setCloudMcpHealthResult] = useState<{
+    workspaceId: string;
+    health: IdexalOsCloudMcpHealth;
+  } | null>(null);
+  const emptyWorkspaceDisplay = useMemo<WorkspaceDisplay>(
+    () => ({
+      id: "",
+      name: t("session.workspace_fallback"),
+      path: "",
+      preset: "starter",
+      workspaceType: "local",
+    }),
+    [],
+  );
+
+  const routeStateRef = useRef({
+    checkDesktopRestriction,
+    activeClient: null as Client | null,
+    providerBaseUrl: "",
+    selectedWorkspaceId: "",
+    selectedWorkspaceRoot: "",
+    selectedWorkspaceType: "local" as const,
+    runtimeWorkspaceId: null as string | null,
+    idexalOsServerClient: null as IdexalOsServerClient | null,
+    selectedWorkspaceIdexalOsClient: null as IdexalOsServerClient | null,
+    idexalOsServerStatus: "disconnected" as "connected" | "disconnected",
+    idexalOsServerCapabilities: null as IdexalOsServerCapabilities | null,
+    selectedWorkspaceDisplay: emptyWorkspaceDisplay as WorkspaceDisplay,
+    providerItems: [] as ProviderListItem[],
+    providerDefaults: {} as Record<string, string>,
+    providerConnectedIds: [] as string[],
+    disabledProviders: [] as string[],
+    developerMode: false,
+  });
+
+  const selectedWorkspace = useMemo(
+    () => workspaces.find((workspace) => workspace.id === selectedWorkspaceId) ?? (selectedWorkspaceId ? null : workspaces[0] ?? null),
+    [selectedWorkspaceId, workspaces],
+  );
+  const workspaceConnectionStateById: Record<string, WorkspaceConnectionState> = workspaceConnectionOverrides;
+  const selectedWorkspaceRoot = selectedWorkspace?.path?.trim() || "";
+  useEffect(() => {
+    if (!isDesktopRuntime() || route.tab !== "advanced" || !selectedWorkspaceRoot) return;
+    // Recovery prints this file's path and offers to reveal it. Reading heals
+    // workspaces created before the file existed, so Reveal never answers
+    // "Could not find .../idexal-os.json on disk."
+    void desktopBridge.workspaceIdexalOsRead({ workspacePath: selectedWorkspaceRoot }).catch(() => undefined);
+  }, [route.tab, selectedWorkspaceRoot]);
+  const resetWorkspaceConfig = useCallback(async () => {
+    if (!selectedWorkspaceRoot) return;
+    setResetConfigBusy(true);
+    setConfigActionStatus(null);
+    try {
+      await desktopBridge.workspaceIdexalOsReset({ workspacePath: selectedWorkspaceRoot });
+      setConfigActionStatus(t("settings.config_reset_done"));
+    } catch (error) {
+      setConfigActionStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setResetConfigBusy(false);
+    }
+  }, [selectedWorkspaceRoot]);
+  const repairLocalCache = useCallback(async () => {
+    setCacheRepairBusy(true);
+    setCacheRepairResult(null);
+    try {
+      await desktopBridge.repairLocalCache();
+      setCacheRepairResult(t("settings.cache_repaired"));
+    } catch (error) {
+      setCacheRepairResult(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCacheRepairBusy(false);
+    }
+  }, []);
+  const cleanupDockerContainers = useCallback(async () => {
+    setDockerCleanupBusy(true);
+    setDockerCleanupResult(null);
+    try {
+      const result = await desktopBridge.idexalOsDockerCleanup();
+      setDockerCleanupResult(result.errors.length > 0
+        ? t("settings.docker_cleanup_partial", {
+            removed: String(result.removed.length),
+            errors: String(result.errors.length),
+          })
+        : t("settings.docker_cleanup_done", { removed: String(result.removed.length) }));
+    } catch (error) {
+      setDockerCleanupResult(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDockerCleanupBusy(false);
+    }
+  }, []);
+  const selectedWorkspaceDisplay = useMemo<WorkspaceDisplay>(
+    () =>
+      selectedWorkspace
+        ? {
+            id: selectedWorkspace.id,
+            name: selectedWorkspace.name ?? selectedWorkspace.displayNameResolved,
+            path: selectedWorkspace.path ?? "",
+            preset: "starter",
+            workspaceType: selectedWorkspace.workspaceType ?? "local",
+            displayName: selectedWorkspace.displayNameResolved,
+          }
+        : emptyWorkspaceDisplay,
+    [emptyWorkspaceDisplay, selectedWorkspace],
+  );
+  const workspaceServerClientResolver = useMemo(
+    () => createWorkspaceServerClientResolver({ baseUrl, token }),
+    [baseUrl, token],
+  );
+  const workspaceSelectionCommitRef = useRef<(workspaceId: string) => Promise<void>>(async () => undefined);
+  workspaceSelectionCommitRef.current = async (workspaceId) => {
+    await commitRouteWorkspaceSelection({
+      workspaceId,
+      desktopRuntime: isDesktopRuntime(),
+      setDesktopSelected: workspaceSetSelected,
+      setDesktopRuntimeActive: workspaceSetRuntimeActive,
+      activateWorkspace: async (selectedId) => {
+        const workspace = workspacesRef.current.find((item) => item.id === selectedId) ?? null;
+        const endpoint = workspaceServerClientResolver(workspace);
+        if (!endpoint) throw new Error(`Workspace endpoint unavailable for ${selectedId}.`);
+        if (workspace?.workspaceType === "local" && serverActiveWorkspaceIdRef.current === selectedId) return;
+        await endpoint.client.activateWorkspace(endpoint.workspaceId, { persist: true });
+        if (workspace?.workspaceType === "local") serverActiveWorkspaceIdRef.current = selectedId;
+      },
+    });
+  };
+  const selectedWorkspaceEndpoint = useWorkspaceServerClient(selectedWorkspace, { baseUrl, token });
+  // A member who signed in before creating a workspace still has the local
+  // server's managed engine; reach it directly so AI providers work.
+  const engineRootEndpoint = useMemo(
+    () => (isDesktopRuntime() && !loading && workspaces.length === 0
+      ? resolveEngineRootEndpoint({ baseUrl, token })
+      : null),
+    [baseUrl, loading, token, workspaces.length],
+  );
+  const opencodeBaseUrl = selectedWorkspaceEndpoint?.opencodeBaseUrl ?? engineRootEndpoint?.opencodeBaseUrl ?? "";
+
+  routeStateRef.current = {
+    checkDesktopRestriction,
+    activeClient,
+    providerBaseUrl: opencodeBaseUrl,
+    selectedWorkspaceId,
+    selectedWorkspaceRoot,
+    selectedWorkspaceType: selectedWorkspace?.workspaceType ?? "local",
+    runtimeWorkspaceId: selectedWorkspace?.id ?? null,
+    idexalOsServerClient: idexalOsClient,
+    selectedWorkspaceIdexalOsClient: idexalOsClient,
+    idexalOsServerStatus: idexalOsClient ? "connected" : "disconnected",
+    idexalOsServerCapabilities: idexalOsClient ? ROUTE_IDEXAL_CAPABILITIES : null,
+    selectedWorkspaceDisplay,
+    providerItems: providers,
+    providerDefaults,
+    providerConnectedIds,
+    disabledProviders,
+    developerMode,
+  };
+
+  const activeReloadBlockingSessions = useMemo(
+    () =>
+      Object.values(sessionsByWorkspaceId)
+        .flat()
+        .flatMap((session) => {
+          if (!isActiveSessionStatus(getSessionStatus(session))) return [];
+          const id = String(session?.id ?? "");
+          if (!id) return [];
+          return [{
+            id,
+            title:
+              String(session?.title ?? session?.slug ?? session?.id ?? "").trim() ||
+              t("session.untitled"),
+          }];
+        }),
+    [sessionsByWorkspaceId],
+  );
+
+  const idexalOsServerStore = useMemo(
+    () =>
+      createIdexalOsServerStore({
+        startupPreference: () => {
+          // In desktop mode, loopback URLs are ephemeral local runtime details.
+          // Only non-loopback stored URLs indicate an explicit manual server
+          // connection preference.
+          if (!isDesktopRuntime()) return "server";
+          const stored = readIdexalOsServerSettings();
+          const storedUrl = stored.urlOverride?.trim() ?? "";
+          return storedUrl && !isLoopbackIdexalOsServerUrl(storedUrl) ? "server" : "local";
+        },
+        documentVisible: () => typeof document === "undefined" || document.visibilityState === "visible",
+        developerMode: () => routeStateRef.current.developerMode,
+        runtimeWorkspaceId: () => routeStateRef.current.runtimeWorkspaceId,
+      }),
+    [],
+  );
+  const connectionsStore = useMemo(
+    () =>
+      createConnectionsStore({
+        checkDesktopAppRestriction: (input) => routeStateRef.current.checkDesktopRestriction(input),
+        client: () => routeStateRef.current.activeClient,
+        setClient: setActiveClient,
+        projectDir: () => routeStateRef.current.selectedWorkspaceRoot,
+        selectedWorkspaceId: () => routeStateRef.current.selectedWorkspaceId,
+        selectedWorkspaceRoot: () => routeStateRef.current.selectedWorkspaceRoot,
+        workspaceType: () => routeStateRef.current.selectedWorkspaceType,
+        idexalOsServer: idexalOsServerStore,
+        runtimeWorkspaceId: () => routeStateRef.current.runtimeWorkspaceId,
+        ensureRuntimeWorkspaceId: async () =>
+          routeStateRef.current.runtimeWorkspaceId?.trim() ||
+          routeStateRef.current.selectedWorkspaceId.trim() ||
+          null,
+        developerMode: () => routeStateRef.current.developerMode,
+        markReloadRequired: reloadCoordinator.markReloadRequired,
+      }),
+    [idexalOsServerStore, reloadCoordinator.markReloadRequired],
+  );
+  refreshMcpServersRef.current = connectionsStore.refreshMcpServers;
+  notifyMcpReloadingRef.current = connectionsStore.notifyMcpReloading;
+  pollMcpServersAfterReloadRef.current = connectionsStore.pollMcpServersAfterReload;
+  // Stable identity: McpView reloads opencode.json whenever this prop changes,
+  // so an inline lambda would refetch the config on every settings re-render
+  // (store snapshots tick every few seconds while idle on the Library page).
+  const readMcpConfigFile = useCallback(
+    (scope: "project" | "global") => connectionsStore.readMcpConfigFile(scope),
+    [connectionsStore],
+  );
+  const providerAuthStore = useMemo(
+    () =>
+      createProviderAuthStore({
+        client: () => routeStateRef.current.activeClient,
+        providers: () => routeStateRef.current.providerItems,
+        providerDefaults: () => routeStateRef.current.providerDefaults,
+        providerConnectedIds: () => routeStateRef.current.providerConnectedIds,
+        disabledProviders: () => routeStateRef.current.disabledProviders,
+        checkDesktopAppRestriction: checkDesktopRestriction,
+        providerBaseUrl: () => routeStateRef.current.providerBaseUrl,
+        selectedWorkspaceDisplay: () => routeStateRef.current.selectedWorkspaceDisplay,
+        selectedWorkspaceRoot: () => routeStateRef.current.selectedWorkspaceRoot,
+        runtimeWorkspaceId: () => routeStateRef.current.runtimeWorkspaceId,
+        ensureRuntimeWorkspaceId: async () =>
+          routeStateRef.current.runtimeWorkspaceId?.trim() ||
+          routeStateRef.current.selectedWorkspaceId.trim() ||
+          null,
+        idexalOsServer: idexalOsServerStore,
+        setProviders,
+        setProviderDefaults,
+        setProviderConnectedIds,
+        setDisabledProviders,
+        markOpencodeConfigReloadRequired: () => {
+          setConfigActionStatus(t("settings.config_updated"));
+          reloadCoordinator.markReloadRequired("config", {
+            type: "config",
+            name: "opencode.json",
+            action: "updated",
+          });
+        },
+      }),
+    [checkDesktopRestriction, idexalOsServerStore, reloadCoordinator.markReloadRequired],
+  );
+  const extensionsStore = useMemo(
+    () =>
+      createExtensionsStore({
+        checkDesktopAppRestriction: (input) => routeStateRef.current.checkDesktopRestriction(input),
+        client: () => routeStateRef.current.activeClient,
+        projectDir: () => routeStateRef.current.selectedWorkspaceRoot,
+        selectedWorkspaceId: () => routeStateRef.current.selectedWorkspaceId,
+        selectedWorkspaceRoot: () => routeStateRef.current.selectedWorkspaceRoot,
+        workspaceType: () => routeStateRef.current.selectedWorkspaceType,
+        idexalOsServer: idexalOsServerStore,
+        idexalOsServerConnection: () => ({
+          idexalOsServerClient: routeStateRef.current.idexalOsServerClient,
+          idexalOsServerStatus: routeStateRef.current.idexalOsServerStatus,
+          idexalOsServerCapabilities: routeStateRef.current.idexalOsServerCapabilities,
+        }),
+        runtimeWorkspaceId: () => routeStateRef.current.runtimeWorkspaceId,
+        ensureRuntimeWorkspaceId: async () =>
+          routeStateRef.current.runtimeWorkspaceId?.trim() ||
+          routeStateRef.current.selectedWorkspaceId.trim() ||
+          null,
+        setBusy,
+        setBusyLabel,
+        setBusyStartedAt: () => {},
+        setError: (message) => {
+          if (message) {
+            toast.error(message);
+          }
+        },
+        markReloadRequired: reloadCoordinator.markReloadRequired,
+      }),
+    [idexalOsServerStore, reloadCoordinator.markReloadRequired],
+  );
+  const idexalOsServerSnapshot = useIdexalOsServerStoreSnapshot(idexalOsServerStore);
+  const connectionsSnapshot = useConnectionsStoreSnapshot(connectionsStore);
+  const providerAuthSnapshot = useProviderAuthStoreSnapshot(providerAuthStore);
+  const cloudSession = useCloudSession();
+  const { config: shellConfig } = useShellConfig();
+  // The embedded Cloud providers section (and its "Sign in to idexal Os"
+  // prompt) is part of the Cloud surfaces: hidden on a desktop install that
+  // never signs in, present wherever sign-in is part of the product.
+  const showCloudProviders = cloudSession.isSignedIn || shellConfig.cloudSignin;
+  // Same rule as SessionRoute: without Cloud sign-in on offer, a signed-out
+  // desktop does not keep the Automations surface (or its palette command).
+  const automationsPaletteAvailable = useAutomationDeploymentEnabled()
+    || (shellConfig.cloudSignin && isDesktopRuntime() && !cloudSession.isSignedIn);
+  // Cloud settings destinations exist only where Cloud sign-in is offered; a
+  // direct URL to one on a no-sign-in desktop lands on General instead.
+  const cloudSettingsTabBlocked = !shellConfig.cloudSignin
+    && !cloudSession.isSignedIn
+    && CLOUD_SETTINGS_TABS.includes(route.tab);
+  const gatewayProviderIds = useMemo(
+    () => resolveGatewayProviderIds(providerAuthSnapshot.importedCloudProviders),
+    [providerAuthSnapshot.importedCloudProviders],
+  );
+  const gatewayConnectProviders = useMemo(
+    () => cloudSession.isSignedIn ? resolveGatewayConnectProviders(providerAuthSnapshot.cloudProviderServerSync?.skippedProviders) : [],
+    [cloudSession.isSignedIn, providerAuthSnapshot.cloudProviderServerSync?.skippedProviders],
+  );
+  const [connectingGatewayProviderId, setConnectingGatewayProviderId] = useState<string | null>(null);
+  const gatewayConnectAbort = useRef<AbortController | null>(null);
+  useEffect(() => {
+    const cancel = () => {
+      gatewayConnectAbort.current?.abort();
+      setConnectingGatewayProviderId(null);
+    };
+    window.addEventListener(denSessionUpdatedEvent, cancel);
+    window.addEventListener(denSettingsChangedEvent, cancel);
+    return () => {
+      gatewayConnectAbort.current?.abort();
+      window.removeEventListener(denSessionUpdatedEvent, cancel);
+      window.removeEventListener(denSettingsChangedEvent, cancel);
+    };
+  }, []);
+  const handleConnectGatewayProvider = useCallback(async function connect(provider: GatewayConnectProvider, request?: { signal: AbortSignal; model: ModelRef }) {
+    gatewayConnectAbort.current?.abort();
+    const controller = new AbortController();
+    gatewayConnectAbort.current = controller;
+    const signal = request ? AbortSignal.any([controller.signal, request.signal]) : controller.signal;
+    let synced = false;
+    setConnectingGatewayProviderId(gatewayConnectProviderKey(provider));
+    try {
+      const connected = await connectGatewayProvider({
+        provider,
+        signal,
+        startOAuth: providerAuthStore.startGatewayProviderOAuth,
+        openUrl: (url) => platform.openLink(url),
+        resync: async () => {
+          synced = false;
+          const result = await providerAuthStore.runCloudProviderSync("manual");
+          synced = result?.outcome === "handled_server_side";
+        },
+        isConnected: () => synced && (request
+          ? providerAuthStore.isGatewayModelAvailable(provider, request.model)
+          : isGatewaySetConnected(provider, providerAuthStore.getSnapshot().importedCloudProviders)),
+      });
+      if (!connected && !signal.aborted && !request) {
+        toast.error(GATEWAY_CONNECT_TIMEOUT_MESSAGE, { action: { label: "Retry sign-in", onClick: () => {
+          if (!signal.aborted) void connect(provider);
+        } } });
+      }
+      return connected && !signal.aborted;
+    } catch (error) {
+      if (!signal.aborted && !request) toast.error(describeRouteError(error));
+      return false;
+    } finally {
+      if (gatewayConnectAbort.current === controller) setConnectingGatewayProviderId(null);
+    }
+  }, [platform, providerAuthStore]);
+  const extensionsSnapshot = useExtensionsStoreSnapshot(extensionsStore);
+  const orgMcpConnections = useOrgMcpConnections();
+
+  const idexalOsServerStatusForMcp = idexalOsServerSnapshot.idexalOsServerStatus;
+  useEffect(() => {
+    if (idexalOsServerStatusForMcp !== "connected") return;
+    // The first MCP read races the idexal-os-server store's initial health
+    // check (a fresh store always starts "disconnected"), so it falls back
+    // to config files where server-runtime (config.remote) entries — notably
+    // the cloud control MCP — don't exist. Without this re-read the built-in
+    // cards show "Tap to connect" until the next full remount even though
+    // the entries are configured and healthy.
+    void connectionsStore.refreshMcpServers();
+  }, [connectionsStore, idexalOsServerStatusForMcp]);
+
+  useEffect(() => {
+    if (idexalOsServerStatusForMcp !== "connected") return;
+    // Same race for the Cloud Providers rows: the provider-auth store's
+    // start() read fires while this store still reports "disconnected", so
+    // it takes the legacy (empty) config read and the rows sit on "Syncing"
+    // even though the server's /cloud-provider-sync/status already lists the
+    // providers as synced. Re-derive from the server once it is reachable.
+    void providerAuthStore.refreshImportedCloudProviders();
+  }, [idexalOsServerStatusForMcp, providerAuthStore]);
+
+  const cleanupCloudMcpForSignOut = useCallback(async (settings: DenSettings) => {
+    const client = routeStateRef.current.selectedWorkspaceIdexalOsClient;
+    const workspaceId = routeStateRef.current.runtimeWorkspaceId?.trim() ?? "";
+    const orgId = settings.activeOrgId?.trim() ?? "";
+    if (!client || !workspaceId || !orgId) return;
+    // Settings only has a safe, exact OpenCode client/directory for the active
+    // workspace here, so sign-out cleanup is intentionally scoped to that
+    // workspace instead of guessing across every configured worker.
+    await cleanupIdexalOsCloudMcpAfterSignOut({
+      context: {
+        denBaseUrl: settings.baseUrl,
+        serverBaseUrl: client.baseUrl,
+        workspaceId,
+        orgId,
+      },
+      idexalOsClient: client,
+      opencodeClient: routeStateRef.current.activeClient,
+      directory: routeStateRef.current.selectedWorkspaceRoot,
+    });
+    setCloudMcpHealthResult(null);
+    await refreshMcpServersRef.current?.();
+  }, []);
+  const denSession = useDenSession({
+    developerMode,
+    onBeforeSignedOut: cleanupCloudMcpForSignOut,
+    openLink: (url) => platform.openLink(url),
+  });
+  const connectScope = useMemo(
+    () => ({
+      baseUrl: cloudSession.baseUrl,
+      organizationId: cloudSession.activeOrganization?.id?.trim() ?? "",
+    }),
+    [cloudSession.activeOrganization?.id, cloudSession.baseUrl],
+  );
+  const [connectCapabilities, setConnectCapabilities] = useState<ConnectCapabilityInventory>(
+    () => readCachedConnectCapabilities(connectScope) ?? EMPTY_CONNECT_CAPABILITY_INVENTORY,
+  );
+  const [connectCapabilitiesLoading, setConnectCapabilitiesLoading] = useState(false);
+  const [connectCapabilitiesError, setConnectCapabilitiesError] = useState<string | null>(null);
+  const connectCapabilitiesRequestRef = useRef(0);
+  const refreshConnectCapabilities = useCallback(async (options?: { force?: boolean }) => {
+    const requestId = connectCapabilitiesRequestRef.current + 1;
+    connectCapabilitiesRequestRef.current = requestId;
+    if (!cloudSession.isSignedIn || !connectScope.organizationId) {
+      setConnectCapabilities(EMPTY_CONNECT_CAPABILITY_INVENTORY);
+      setConnectCapabilitiesLoading(false);
+      setConnectCapabilitiesError(null);
+      return;
+    }
+    // Paint what the app already fetched, then revalidate behind it.
+    const cached = readCachedConnectCapabilities(connectScope);
+    if (cached) setConnectCapabilities(cached);
+    setConnectCapabilitiesLoading(!cached);
+    setConnectCapabilitiesError(null);
+    try {
+      const inventory = await loadConnectCapabilities({
+        client: cloudSession.client,
+        scope: connectScope,
+        maxAgeMs: options?.force ? 0 : undefined,
+      });
+      if (connectCapabilitiesRequestRef.current === requestId) {
+        setConnectCapabilities(inventory);
+      }
+    } catch {
+      if (connectCapabilitiesRequestRef.current === requestId) {
+        if (!cached) setConnectCapabilities(EMPTY_CONNECT_CAPABILITY_INVENTORY);
+        setConnectCapabilitiesError(t("extensions.cloud_unavailable"));
+      }
+    } finally {
+      if (connectCapabilitiesRequestRef.current === requestId) setConnectCapabilitiesLoading(false);
+    }
+  }, [cloudSession.client, cloudSession.isSignedIn, connectScope]);
+
+  // Not gated on the Extensions tab: the inventory should be warm before the
+  // user gets there, and the fetch is deduped by the shared cloud cache.
+  useEffect(() => {
+    void refreshConnectCapabilities({ force: true });
+  }, [refreshConnectCapabilities]);
+  // Deleting or restoring a Library plugin can retire the connections it owns;
+  // re-read them so a deleted plugin's connector does not linger as its own row.
+  const refreshOrgMcpConnections = orgMcpConnections.refresh;
+  useEffect(() => {
+    const refresh = () => {
+      void refreshConnectCapabilities({ force: true });
+      void refreshOrgMcpConnections();
+    };
+    window.addEventListener(CLOUD_INVENTORY_CHANGED_EVENT, refresh);
+    return () => window.removeEventListener(CLOUD_INVENTORY_CHANGED_EVENT, refresh);
+  }, [refreshConnectCapabilities, refreshOrgMcpConnections]);
+
+  const hasIdexalOsCloudProvider = useMemo(
+    () =>
+      providerAuthSnapshot.cloudOrgProviders.some(isIdexalOsCloudProvider) ||
+      Object.values(providerAuthSnapshot.importedCloudProviders ?? {}).some(isIdexalOsCloudProvider),
+    [providerAuthSnapshot.cloudOrgProviders, providerAuthSnapshot.importedCloudProviders],
+  );
+  // Entitled = Den/import says idexal Os Models is included. Available = local
+  // engine actually exposes selectable idexalos models.
+  const idexalOsModelsEntitled = cloudSession.isSignedIn && hasIdexalOsCloudProvider;
+  const idexalOsModelsAvailable = hasIdexalOsModelsAvailable({
+    providerConnectedIds,
+    providers,
+  });
+  const showIdexalOsModelsSyncing = shouldShowIdexalOsModelsSyncing({
+    entitled: idexalOsModelsEntitled,
+    available: idexalOsModelsAvailable,
+    workspaceReady: Boolean(selectedWorkspaceId && activeClient),
+    reloadPending: providerAuthSnapshot.cloudProviderServerSync?.reloadPending === true,
+  });
+  const openProvidersInDen = useCallback(() => {
+    platform.openLink(denDashboardUrl(cloudSession.baseUrl, "gatewayProviders"));
+  }, [cloudSession.baseUrl, platform]);
+  const autoClient = isDesktopRuntime() && idexalOsServerSnapshot.idexalOsServerClient && isLoopbackIdexalOsServerUrl(idexalOsServerSnapshot.idexalOsServerClient.baseUrl) ? idexalOsServerSnapshot.idexalOsServerClient : null;
+  const [autoPreferences, setAutoPreferences] = useState<DesktopFreePreferences | null>(null);
+  // Until an operator switches free Auto on, Settings shows no idexal Os Models row for it.
+  // Settings has no workspace context: read status from the same local client as preferences.
+  const { query: autoAccessQuery } = useAutoAccess(Boolean(autoPreferences), {
+    idexalOsServerClient: autoClient, workspaceId: selectedWorkspaceId ?? "",
+  });
+  const autoSwitchedOff = (autoAccessQuery.isPending && autoAccessQuery.fetchStatus !== "idle") || freeAutoSwitchedOff(autoAccessQuery.data);
+  const visibleAutoPreferences = autoSwitchedOff ? null : autoPreferences;
+  const [autoBusy, setAutoBusy] = useState(false);
+  const [autoError, setAutoError] = useState<string | null>(null);
+  const autoGeneration = useRef(0);
+  useEffect(() => {
+    const generation = ++autoGeneration.current;
+    setAutoPreferences(null);
+    setAutoBusy(false);
+    setAutoError(null);
+    if (autoClient) void autoClient.desktopFreePreferences().then((value) => {
+      if (generation === autoGeneration.current) setAutoPreferences(value);
+    }).catch(() => {
+      if (generation === autoGeneration.current) setAutoError("Could not verify Auto on this device. Reopen settings to retry.");
+    });
+    return () => { autoGeneration.current++; };
+  }, [autoClient]);
+  const setAutoEnabled = useCallback(async (enabled: boolean) => {
+    if (!autoClient || autoBusy) return;
+    const generation = autoGeneration.current;
+    setAutoBusy(true);
+    setAutoError(null);
+    try {
+      const value = await autoClient.setDesktopFreeEnabled(enabled);
+      if (generation !== autoGeneration.current) return;
+      setAutoPreferences(value);
+      setDisabledProviders((current) => [...current.filter((id) => id !== "idexal-os-free"), ...(value.enabled ? [] : ["idexal-os-free"])]);
+      await providerAuthStore.refreshProviders({ force: true });
+      if (generation === autoGeneration.current && value.refresh === "deferred") setAutoError("Preference saved. Models will refresh when the current work finishes.");
+    } catch {
+      if (generation !== autoGeneration.current) return;
+      setAutoPreferences(null);
+      setAutoError("Could not verify the change to Auto. Check its state before retrying.");
+      try { const value = await autoClient.desktopFreePreferences(); if (generation === autoGeneration.current) setAutoPreferences(value); } catch {}
+    } finally {
+      if (generation === autoGeneration.current) setAutoBusy(false);
+    }
+  }, [autoClient, autoBusy, providerAuthStore]);
+  const organizationProviderIds = useMemo(() => new Set([
+    ...Object.values(providerAuthSnapshot.importedCloudProviders).map((provider) => provider.sourceProviderId),
+    ...providerAuthSnapshot.cloudOrgProviders.map((provider) => provider.providerId),
+  ]), [providerAuthSnapshot.importedCloudProviders, providerAuthSnapshot.cloudOrgProviders]);
+
+  const handleOpenProviderAuth = useCallback(() => {
+    if (providerAuthStore.isProviderAddRestricted()) {
+      restrictionNotice.show({
+        title: t("restrictions.add_custom_providers_disabled_title"),
+        message: t("restrictions.add_custom_providers_disabled_message"),
+      });
+      return;
+    }
+
+    void providerAuthStore.openProviderAuthModal();
+  }, [providerAuthStore, restrictionNotice]);
+
+  useEffect(() => {
+    if (!activeClient || !selectedWorkspaceId) return;
+    // Org policy may force Zen off. Never force it back on — that races user Disconnect.
+    if (!checkDesktopRestriction({ restriction: "allowZenModel" })) return;
+
+    void providerAuthStore
+      .ensureProjectProviderDisabledState("opencode", true)
+      .catch((error) => {
+        console.warn("[desktop-app-restrictions] failed to sync Zen restriction", error);
+      });
+  }, [activeClient, checkDesktopRestriction, providerAuthStore, selectedWorkspaceId, selectedWorkspaceRoot]);
+
+  const debugViewProps = useDebugViewModel({
+    developerMode,
+    idexalOsServerStore,
+    idexalOsServerSnapshot,
+    runtimeWorkspaceId: selectedWorkspace?.id ?? null,
+    selectedWorkspaceRoot,
+    setRouteError: (message) => {
+      if (message) {
+        toast.error(message);
+      }
+    },
+  });
+  const electronUpdaterState = useDesktopUpdater();
+  const { updateAutoCheck, setUpdateAutoCheck, updateAutoDownload, setUpdateAutoDownload } = electronUpdaterState;
+
+  const workspaceSessionGroups = useMemo(
+    // Settings has no per-workspace loading state; the empty set keeps the
+    // previous behavior (error -> "error", otherwise "ready").
+    () => toSessionGroups(workspaces, sessionsByWorkspaceId, errorsByWorkspaceId, new Set()),
+    [errorsByWorkspaceId, sessionsByWorkspaceId, workspaces],
+  );
+
+  const runtimeWorkspaceId = selectedWorkspaceEndpoint?.workspaceId ?? selectedWorkspace?.id ?? null;
+  routeStateRef.current.runtimeWorkspaceId = runtimeWorkspaceId;
+  routeStateRef.current.selectedWorkspaceIdexalOsClient = selectedWorkspaceEndpoint?.client ?? idexalOsClient;
+  const cloudMcpHealth = cloudMcpHealthResult?.workspaceId === runtimeWorkspaceId
+    ? cloudMcpHealthResult.health
+    : null;
+  const handleCloudMcpHealthChange = useCallback((health: IdexalOsCloudMcpHealth | null) => {
+    const workspaceId = runtimeWorkspaceId?.trim() ?? "";
+    if ((routeStateRef.current.runtimeWorkspaceId?.trim() ?? "") !== workspaceId) return;
+    setCloudMcpHealthResult(health && workspaceId ? { workspaceId, health } : null);
+  }, [runtimeWorkspaceId]);
+
+  const opencodeClient = useMemo(() => {
+    if (!selectedWorkspaceEndpoint) {
+      return engineRootEndpoint
+        ? createClient(engineRootEndpoint.opencodeBaseUrl, undefined, { token: engineRootEndpoint.token, mode: "idexalos" })
+        : null;
+    }
+    if (!selectedWorkspaceEndpoint.token) return null;
+    return createClient(
+      selectedWorkspaceEndpoint.opencodeBaseUrl,
+      selectedWorkspaceRoot || undefined,
+      {
+        token: selectedWorkspaceEndpoint.token,
+        mode: "idexalos",
+      },
+    );
+  }, [engineRootEndpoint, selectedWorkspaceEndpoint, selectedWorkspaceRoot]);
+
+  useEffect(() => {
+    setActiveClient(opencodeClient);
+  }, [opencodeClient]);
+
+  const [libraryCommands, setLibraryCommands] = useState<LibraryCommandItem[]>([]);
+  const [libraryAgents, setLibraryAgents] = useState<LibraryAgentItem[]>([]);
+  const loadLibraryLists = useCallback(async () => {
+    if (opencodeClient) {
+      try {
+        const [commands, agents] = await Promise.all([
+          listCommands(opencodeClient, selectedWorkspaceRoot || undefined),
+          opencodeClient.app.agents()
+            .then((result) => unwrap(result))
+            .catch(() => []),
+        ]);
+        setLibraryCommands(libraryCommandsFromSlashOptions(commands));
+        setLibraryAgents(libraryAgentsFromOpencode(Array.isArray(agents) ? agents : []));
+      } catch {
+        setLibraryCommands([]);
+        setLibraryAgents([]);
+      }
+    } else {
+      setLibraryCommands([]);
+      setLibraryAgents([]);
+    }
+    await refreshConnectCapabilities({ force: true });
+  }, [opencodeClient, refreshConnectCapabilities, selectedWorkspaceRoot]);
+  useEffect(() => {
+    void loadLibraryLists();
+  }, [loadLibraryLists]);
+
+  const handleModelPickerLoadError = useCallback((error: unknown) => {
+    toast.error(error instanceof Error ? error.message : t("app.unknown_error"));
+  }, []);
+  const handleModelPickerOpen = useCallback(() => {
+    void providerAuthStore.runCloudProviderSync("model_picker_open");
+  }, [providerAuthStore]);
+  // Model lists here come from the engine chat runs on, so they match the chat's picker.
+  const chatEngine = useChatEngineClient({
+    endpoint: selectedWorkspaceEndpoint,
+    workspaceRoot: selectedWorkspaceRoot,
+    fallback: { client: opencodeClient, baseUrl: opencodeBaseUrl },
+  });
+  const modelPicker = useModelPicker({
+    client: chatEngine.client,
+    baseUrl: chatEngine.baseUrl,
+    workspaceRoot: selectedWorkspaceRoot,
+    onOpen: handleModelPickerOpen,
+    onLoadError: handleModelPickerLoadError,
+    pendingProviders: gatewayConnectProviders,
+    disabledProviders,
+    gatewayProviderIds,
+    cloudProvidersEnabled: cloudSession.isSignedIn,
+    importedProviders: providerAuthSnapshot.importedCloudProviders,
+  });
+  const currentCloudMcpModel = useMemo<IdexalOsCloudMcpProviderModelContext | null>(() => {
+    const provider = local.prefs.defaultModel?.providerID.trim() ?? "";
+    const model = local.prefs.defaultModel?.modelID.trim() ?? "";
+    return provider && model ? { provider, model } : null;
+  }, [local.prefs.defaultModel]);
+  const refreshCloudMcpHealth = useCallback(async () => {
+    const client = selectedWorkspaceEndpoint?.client ?? idexalOsClient;
+    const workspaceId = runtimeWorkspaceId?.trim() ?? "";
+    if (!client || !workspaceId) {
+      setCloudMcpHealthResult(null);
+      return null;
+    }
+    // probe: the Advanced page refresh should verify the Cloud endpoint
+    // directly (outside the engine), not just report the engine's cached state.
+    const health = await client.getIdexalOsCloudMcpHealth(workspaceId, currentCloudMcpModel ?? undefined, { probe: true });
+    if (routeStateRef.current.runtimeWorkspaceId?.trim() !== workspaceId) return null;
+    setCloudMcpHealthResult({ workspaceId, health });
+    return health;
+  }, [currentCloudMcpModel, idexalOsClient, runtimeWorkspaceId, selectedWorkspaceEndpoint]);
+  const { commandPaletteOpen, setCommandPaletteOpen } = useCommandPaletteShortcut(!props.embedded);
+  const developerModePaletteItem = useMemo(
+    () => settingsDeveloperModePaletteItem(developerMode, () => {
+      setCommandPaletteOpen(false);
+      toggleDeveloperMode();
+    }),
+    [developerMode, setCommandPaletteOpen, toggleDeveloperMode],
+  );
+  const paletteSessionOptions = useMemo(
+    () => buildCommandPaletteSessions(workspaces, sessionsByWorkspaceId, selectedWorkspaceId),
+    [sessionsByWorkspaceId, selectedWorkspaceId, workspaces],
+  );
+  const handleCreatePaletteSession = useCallback(() => {
+    const workspaceId = readActiveWorkspaceId() || selectedWorkspaceId;
+    if (!workspaceId) { navigate("/session"); return; }
+    openNewSessionDraft({ workspaceId }, navigate);
+  }, [navigate, selectedWorkspaceId]);
+  // Settings refreshes provider auth whenever the picker opens (the session
+  // route does not need this; its provider state is kept fresh elsewhere).
+  useEffect(() => {
+    if (!modelPicker.open) return;
+    void providerAuthStore.refreshProviders();
+  }, [modelPicker.open, providerAuthStore]);
+
+  useEffect(() => {
+    const refresh = () => setExtensionStateVersion((value) => value + 1);
+    window.addEventListener(IDEXAL_EXTENSION_STATE_CHANGED, refresh);
+    window.addEventListener("storage", refresh);
+    return () => {
+      window.removeEventListener(IDEXAL_EXTENSION_STATE_CHANGED, refresh);
+      window.removeEventListener("storage", refresh);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!idexalOsClient) {
+      setUserEnvKeys([]);
+      return;
+    }
+    let cancelled = false;
+    void idexalOsClient.listUserEnvKeys()
+      .then((response) => { if (!cancelled) setUserEnvKeys(response.keys); })
+      .catch(() => { if (!cancelled) setUserEnvKeys([]); });
+    return () => { cancelled = true; };
+  }, [idexalOsClient]);
+
+  /** Writes a local provider patch, reloads the engine, and reports the outcome in the provider's settings. */
+  const applyLocalProviderPatch = useCallback(async (
+    patch: Parameters<IdexalOsServerClient["patchConfig"]>[1],
+    done: { status: string; defaultModel?: { providerID: string; modelID: string } },
+  ) => {
+    const client = selectedWorkspaceEndpoint?.client ?? idexalOsClient;
+    const workspaceId = runtimeWorkspaceId?.trim() ?? "";
+    if (!client || !workspaceId) {
+      setLocalProviderError("idexal Os server is not connected for this workspace.");
+      return;
+    }
+
+    setLocalProviderBusy(true);
+    setLocalProviderStatus(null);
+    setLocalProviderError(null);
+    try {
+      await client.patchConfig(workspaceId, patch);
+      const defaultModel = done.defaultModel;
+      if (defaultModel) {
+        local.setPrefs((previous) => ({ ...previous, defaultModel, modelVariant: null }));
+      }
+      reloadCoordinator.markReloadRequired("config", { type: "config", name: "opencode.json", action: "updated" });
+      try {
+        await reloadEngineOrRestartDesktop(client, workspaceId);
+      } catch {
+        // The reload toast still lets the user retry if the immediate reload fails.
+      }
+      await refreshProviderListQueries(getReactQueryClient());
+      try {
+        window.dispatchEvent(new CustomEvent("idexal-os-server-settings-changed"));
+      } catch {
+        // ignore browser event dispatch failures
+      }
+      setLocalProviderStatus(done.status);
+    } catch (error) {
+      setLocalProviderError(describeRouteError(error));
+    } finally {
+      setLocalProviderBusy(false);
+    }
+  }, [local, idexalOsClient, reloadCoordinator, runtimeWorkspaceId, selectedWorkspaceEndpoint]);
+
+  const installLocalProvider = useCallback(async (input: LocalProviderInstallInput) => {
+    const modelId = input.modelId.trim();
+    if (!modelId) {
+      setLocalProviderError("Model ID is required.");
+      return;
+    }
+    await applyLocalProviderPatch(buildLocalProviderInstallPatch({ ...input, modelId }), {
+      status: `Added ${input.name} with ${modelId}.`,
+      ...(input.setDefault ? { defaultModel: { providerID: input.providerId, modelID: modelId } } : {}),
+    });
+  }, [applyLocalProviderPatch]);
+
+  const syncLocalProvider = useCallback(async (input: LocalProviderSyncInput) => {
+    if (input.models.length === 0) {
+      setLocalProviderError(`${input.name} has no models to sync.`);
+      return;
+    }
+    const count = input.models.length;
+    await applyLocalProviderPatch(buildLocalProviderSyncPatch(input), {
+      status: `Synced ${count} model${count === 1 ? "" : "s"} from ${input.name}.`,
+    });
+  }, [applyLocalProviderPatch]);
+
+  useEffect(() => {
+    local.setUi((previous) => ({ ...previous, view: "settings", tab: route.tab }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- local is stable via context
+  }, [route.tab]);
+
+  useEffect(() => {
+    setAppThemeMode(themeMode);
+  }, [themeMode]);
+
+  useEffect(() => {
+    writeStoredBoolean(SETTINGS_HIDE_TITLEBAR_KEY, hideTitlebar);
+  }, [hideTitlebar]);
+
+  const {
+    markRouteReady: markBootRouteReady,
+    phase: bootPhase,
+    routeReady: bootRouteReady,
+  } = useBootState();
+  const refreshRouteState = useMemo(() => async (options?: { supersede?: boolean }) => {
+    const attempt = refreshLifecycleRef.current.begin(options);
+    if (!attempt) return;
+    setLoading(true);
+    let desktopList: WorkspaceList | null = null;
+    let desktopWorkspaces = workspacesRef.current;
+    try {
+      if (isDesktopRuntime()) {
+        try {
+          desktopList = await workspaceBootstrap() as WorkspaceList;
+          desktopWorkspaces = (desktopList.workspaces ?? []).map(mapDesktopWorkspace);
+        } catch (error) {
+          const message = describeRouteError(error);
+          console.error("[settings-route] workspaceBootstrap failed", error);
+          recordInspectorEvent("route.workspace_bootstrap.error", {
+            route: "settings",
+            message,
+            preservedWorkspaceCount: workspacesRef.current.length,
+          });
+          desktopWorkspaces = workspacesRef.current;
+        }
+      }
+      if (!attempt.isCurrent()) return;
+
+      const { normalizedBaseUrl, resolvedToken, resolvedHostToken } = await resolveIdexalOsConnection();
+      if (!attempt.isCurrent()) return;
+
+      if (!normalizedBaseUrl || !resolvedToken) {
+        setIdexalOsClient(null);
+        setBaseUrl("");
+        setToken("");
+        setWorkspaces(desktopWorkspaces);
+        setSessionsByWorkspaceId({});
+        setErrorsByWorkspaceId({});
+        setLegacySelectedWorkspaceId((current) => {
+          const next = current || readActiveWorkspaceId() || resolveWorkspaceListSelectedId(desktopList) || desktopWorkspaces[0]?.id || "";
+          writeActiveWorkspaceId(next || null);
+          return next;
+        });
+        return;
+      }
+
+      const client = createIdexalOsServerClient({
+        baseUrl: normalizedBaseUrl,
+        token: resolvedToken,
+        hostToken: resolvedHostToken || undefined,
+      });
+      const list = await client.listWorkspaces();
+      if (!attempt.isCurrent()) return;
+      serverActiveWorkspaceIdRef.current = list.activeId ?? "";
+      const serverWorkspaceIds = new Set(list.items.map((workspace) => workspace.id));
+      const nextWorkspaces = mergeRouteWorkspaces(list.items, desktopWorkspaces);
+      const routeWorkspaceServerClientResolver = createWorkspaceServerClientResolver({
+        baseUrl: normalizedBaseUrl,
+        token: resolvedToken,
+      });
+      const routedWorkspaceId = routeWorkspaceIdRef.current;
+      if (routedWorkspaceId && nextWorkspaces.some((workspace) => workspace.id === routedWorkspaceId)) {
+        // Opening Settings unmounts the session route. Join its shared
+        // selection queue and commit the routed workspace before Settings
+        // performs any runtime-backed reads, so an older session switch
+        // cannot retake the desktop/runtime/server state underneath them.
+        setLegacySelectedWorkspaceId(routedWorkspaceId);
+        writeActiveWorkspaceId(routedWorkspaceId);
+        lastRequestedRouteWorkspaceIdRef.current = routedWorkspaceId;
+        routeWorkspaceSelectionCommitter.request(routedWorkspaceId, async (workspaceId) => {
+          await commitRouteWorkspaceSelection({
+            workspaceId,
+            desktopRuntime: isDesktopRuntime(),
+            setDesktopSelected: workspaceSetSelected,
+            setDesktopRuntimeActive: workspaceSetRuntimeActive,
+            activateWorkspace: async (selectedId) => {
+              const workspace = nextWorkspaces.find((item) => item.id === selectedId) ?? null;
+              const endpoint = routeWorkspaceServerClientResolver(workspace);
+              if (!endpoint) throw new Error(`Workspace endpoint unavailable for ${selectedId}.`);
+              if (workspace?.workspaceType === "local" && serverActiveWorkspaceIdRef.current === selectedId) return;
+              await endpoint.client.activateWorkspace(endpoint.workspaceId, { persist: true });
+              if (workspace?.workspaceType === "local") serverActiveWorkspaceIdRef.current = selectedId;
+            },
+          });
+        });
+        await routeWorkspaceSelectionCommitter.settled();
+        if (!attempt.isCurrent()) return;
+      }
+      const sessionEntries = await mapRouteWorkspaceLoads(
+        nextWorkspaces,
+        async (workspace) => {
+          const endpoint = routeWorkspaceServerClientResolver(workspace);
+          if (!endpoint) {
+            return { workspaceId: workspace.id, sessions: [], error: null as string | null };
+          }
+          if (!serverWorkspaceIds.has(workspace.id)) {
+            return { workspaceId: workspace.id, sessions: [], error: null as string | null };
+          }
+          try {
+            const response = await readRouteSessionsWithRetry({
+              load: () => listRouteSessions(endpoint),
+              retryDelaysMs: [250, 750, 1_500],
+            });
+            const workspaceRoot = normalizeDirectoryPath(workspace.path ?? "");
+            const items = workspaceRoot
+              ? response.filter((session) =>
+                  normalizeDirectoryPath(session?.directory ?? "") === workspaceRoot,
+                )
+              : response;
+            return {
+              workspaceId: workspace.id,
+              sessions: items,
+              error: null as string | null,
+              connectionState: null as WorkspaceConnectionState | null,
+            };
+          } catch (error) {
+            const fallback = error instanceof Error ? error.message : t("app.unknown_error");
+            return {
+              workspaceId: workspace.id,
+              sessions: [],
+              error: fallback,
+              connectionState: null,
+            };
+          }
+        },
+      );
+      if (!attempt.isCurrent()) return;
+
+      setIdexalOsClient(client);
+      setBaseUrl(normalizedBaseUrl);
+      setToken(resolvedToken);
+      setWorkspaces(nextWorkspaces);
+      setSessionsByWorkspaceId(Object.fromEntries(sessionEntries.map((entry) => [entry.workspaceId, entry.sessions])));
+      setErrorsByWorkspaceId(Object.fromEntries(sessionEntries.map((entry) => [entry.workspaceId, entry.error])));
+      setWorkspaceConnectionOverrides((current) => {
+        const next = { ...current };
+        for (const entry of sessionEntries) {
+          if (entry.connectionState) {
+            next[entry.workspaceId] = entry.connectionState;
+          } else if (next[entry.workspaceId]?.status === "error") {
+            delete next[entry.workspaceId];
+          }
+        }
+        return next;
+      });
+      setLegacySelectedWorkspaceId((current) => {
+        const sessionWorkspaceId = findSessionWorkspaceId(navigationSessionId, sessionEntries);
+        const preferred = routeWorkspaceIdRef.current || sessionWorkspaceId || navigationWorkspaceId || current || readActiveWorkspaceId() || "";
+        const next = reconcileSelectedWorkspaceId(preferred, list, desktopList, nextWorkspaces);
+        writeActiveWorkspaceId(next || null);
+        return next;
+      });
+    } catch (error) {
+      if (!attempt.isCurrent()) return;
+      const message = describeRouteError(error);
+      console.error("[settings-route] refreshRouteState failed", error);
+      recordInspectorEvent("route.refresh.error", {
+        route: "settings",
+        message,
+        preservedWorkspaceCount: desktopWorkspaces.length,
+      });
+      // Fires on mount/auto-refresh too, not just user actions.
+      notifyAlert({
+        kind: "system",
+        title: t("notifications.refresh_failed"),
+        body: message,
+        dedupeKey: "settings-route-refresh",
+      });
+      if (desktopWorkspaces.length > 0) {
+        setWorkspaces(desktopWorkspaces);
+        setLegacySelectedWorkspaceId((current) => {
+          const next = current || readActiveWorkspaceId() || resolveWorkspaceListSelectedId(desktopList) || desktopWorkspaces[0]?.id || "";
+          writeActiveWorkspaceId(next || null);
+          return next;
+        });
+      }
+    } finally {
+      attempt.finish();
+      if (attempt.isCurrent()) {
+        setLoading(false);
+        // Settings can be the first route a user lands on (direct link, deep
+        // link, or after reload). Let the boot overlay dismiss once we've
+        // completed our first data load.
+        markBootRouteReady();
+      }
+    }
+  }, [markBootRouteReady, navigationSessionId, navigationWorkspaceId, routeWorkspaceId]);
+
+  // The server store recovers on its own when the control plane comes up
+  // after settings mounted. Re-run the route refresh once it reports healthy
+  // so the runtime card and server-backed actions stop showing a boot-time
+  // failure for the rest of the session.
+  useEffect(() => {
+    if (idexalOsServerStatusForMcp !== "connected" || idexalOsClient) return;
+    void refreshRouteState({ supersede: true });
+  }, [idexalOsClient, idexalOsServerStatusForMcp, refreshRouteState]);
+
+  const reloadWorkspaceEngineFromUi = useCallback(async () => {    const workspaceId = routeStateRef.current.runtimeWorkspaceId?.trim() || selectedWorkspaceId.trim();
+    if (!idexalOsClient || !workspaceId) {
+      toast.error(t("app.error_connect_first"));
+      return false;
+    }
+
+    await reloadEngineOrRestartDesktop(idexalOsClient, workspaceId, refreshRouteState);
+    await refreshProviderListQueries(getReactQueryClient());
+
+    try {
+      window.dispatchEvent(new CustomEvent("idexal-os-server-settings-changed"));
+    } catch {
+      // ignore browser event dispatch failures
+    }
+
+    // OpenCode reconnects MCPs async after dispose — the store polls until
+    // statuses settle so users don't have to collapse/expand the card.
+    void pollMcpServersAfterReloadRef.current?.();
+
+    return true;
+  }, [idexalOsClient, refreshRouteState, selectedWorkspaceId]);
+
+  useEffect(() => {
+    return reloadCoordinator.registerWorkspaceReloadControls({
+      workspaceId: selectedWorkspace?.id || selectedWorkspaceId || "",
+      applyLiveChanges: async () => {
+        const status = await idexalOsClient?.getEngineV2PreviewStatus();
+        if (!status?.enabled || !status.chatRouting) return false;
+        await refreshProviderListQueries(getReactQueryClient()).catch(() => undefined);
+        return true;
+      },
+      canReloadWorkspaceEngine: () => Boolean(idexalOsClient && (selectedWorkspace?.id || selectedWorkspaceId)),
+      reloadWorkspaceEngine: reloadWorkspaceEngineFromUi,
+      activeSessions: () => activeReloadBlockingSessions,
+      stopSession: async (sessionId) => {
+        if (!activeClient) return;
+        await abortSessionSafe(activeClient, sessionId, undefined, {
+          source: "settings.reload_workspace.stop_session",
+          initiator: "user",
+          reason: "stop active session before workspace engine reload",
+        });
+      },
+    });
+  }, [
+    activeClient,
+    activeReloadBlockingSessions,
+    idexalOsClient,
+    reloadCoordinator,
+    reloadWorkspaceEngineFromUi,
+    selectedWorkspace?.id,
+    selectedWorkspaceId,
+  ]);
+
+  useEffect(() => {
+    workspacesRef.current = workspaces;
+  }, [workspaces]);
+
+  useEffect(() => {
+    if (!routeWorkspaceId || lastRequestedRouteWorkspaceIdRef.current === routeWorkspaceId) return;
+    if (!workspaces.some((workspace) => workspace.id === routeWorkspaceId)) return;
+    setLegacySelectedWorkspaceId(routeWorkspaceId);
+    writeActiveWorkspaceId(routeWorkspaceId);
+    lastRequestedRouteWorkspaceIdRef.current = routeWorkspaceId;
+    routeWorkspaceSelectionCommitter.request(
+      routeWorkspaceId,
+      (workspaceId) => workspaceSelectionCommitRef.current(workspaceId),
+    );
+  }, [routeWorkspaceId, workspaces]);
+
+  useEffect(() => {
+    const activeWorkspaceIds = new Set(workspaces.map((workspace) => workspace.id));
+    setWorkspaceConnectionOverrides((current) => {
+      let changed = false;
+      const next: Record<string, WorkspaceConnectionState> = {};
+      for (const [workspaceId, state] of Object.entries(current)) {
+        if (activeWorkspaceIds.has(workspaceId)) {
+          next[workspaceId] = state;
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [workspaces]);
+
+  useEffect(() => {
+    if (idexalOsClient) {
+      reconnectAttemptedWorkspaceIdRef.current = "";
+    }
+    // Same gate as the session route: reconnect must not probe the local
+    // server while desktop runtime bootstrap is still starting it.
+    if (
+      !shouldAttemptDesktopLocalReconnect({
+        desktopRuntime: isDesktopRuntime(),
+        bootPhase,
+        bootRouteReady,
+        routeLoading: loading,
+        hasClient: Boolean(idexalOsClient),
+        connectionPending: false,
+        workspaceType: selectedWorkspace?.workspaceType ?? null,
+      })
+    ) {
+      return;
+    }
+    if (!selectedWorkspace) return;
+    const workspaceId = selectedWorkspace.id?.trim() ?? "";
+    if (!workspaceId || reconnectAttemptedWorkspaceIdRef.current === workspaceId) return;
+    reconnectAttemptedWorkspaceIdRef.current = workspaceId;
+
+    void ensureDesktopLocalIdexalOsConnection({
+      route: "settings",
+      workspace: selectedWorkspace,
+      allWorkspaces: workspaces,
+    }).catch((error) => {
+      const message = error instanceof Error ? error.message : describeRouteError(error);
+      // Background auto-reconnect: alert + persistent center entry.
+      notifyAlert({
+        kind: "system",
+        title: t("notifications.reconnect_failed"),
+        body: message,
+        dedupeKey: "server-reconnect",
+      });
+    });
+  }, [bootPhase, bootRouteReady, loading, idexalOsClient, selectedWorkspace, workspaces]);
+
+  useEffect(() => {
+    // A workspace-route change must invalidate the previous refresh even if
+    // it is still waiting on that workspace's runtime. The superseded attempt
+    // can finish its network calls, but it can no longer write Settings state.
+    void refreshRouteState({ supersede: true });
+    const handleSettingsChange = () => {
+      void refreshRouteState({ supersede: true });
+    };
+    window.addEventListener("idexal-os-server-settings-changed", handleSettingsChange);
+    return () => {
+      window.removeEventListener("idexal-os-server-settings-changed", handleSettingsChange);
+    };
+  }, [refreshRouteState]);
+
+  // Load auto-compaction state from OpenCode config on workspace change.
+  useEffect(() => {
+    if (!idexalOsClient || !selectedWorkspaceId) return;
+    const workspaceId = routeStateRef.current.runtimeWorkspaceId?.trim() || selectedWorkspaceId;
+    let cancelled = false;
+    (async () => {
+      try {
+        const config = await idexalOsClient.getConfig(workspaceId);
+        if (cancelled) return;
+        const compaction = config.opencode?.compaction;
+        const auto = compaction && typeof compaction === "object" && "auto" in compaction
+          ? (compaction as { auto?: boolean }).auto
+          : undefined;
+        setAutoCompactContext(auto !== false);
+        setAutoCompactContextLoaded(true);
+      } catch {
+        if (!cancelled) setAutoCompactContextLoaded(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [idexalOsClient, selectedWorkspaceId]);
+
+  const toggleAutoCompactContext = useCallback(async () => {
+    if (autoCompactContextBusy) return;
+    const workspaceId = routeStateRef.current.runtimeWorkspaceId?.trim() || selectedWorkspaceId;
+    if (!idexalOsClient || !workspaceId) return;
+    const next = !autoCompactContext;
+    setAutoCompactContext(next);
+    setAutoCompactContextBusy(true);
+    try {
+      await idexalOsClient.patchConfig(workspaceId, {
+        opencode: { compaction: { auto: next } },
+      });
+      reloadCoordinator.markReloadRequired("config", {
+        type: "config",
+        name: "opencode.json",
+        action: "updated",
+      });
+    } catch {
+      setAutoCompactContext(!next);
+    } finally {
+      setAutoCompactContextBusy(false);
+    }
+  }, [autoCompactContext, autoCompactContextBusy, idexalOsClient, reloadCoordinator, selectedWorkspaceId]);
+
+  useEffect(() => {
+    idexalOsServerStore.start();
+    connectionsStore.start();
+    providerAuthStore.start();
+    extensionsStore.start();
+
+    return () => {
+      extensionsStore.dispose();
+      providerAuthStore.dispose();
+      connectionsStore.dispose();
+      idexalOsServerStore.dispose();
+    };
+  }, [connectionsStore, extensionsStore, idexalOsServerStore, providerAuthStore]);
+
+  const refreshMarketplaceAction = useMemo<IdexalOsControlAction>(() => ({
+    id: "extensions.refresh-marketplace",
+    label: "Refresh marketplace extensions",
+    description: "Force a fresh sync of organization marketplace plugins from the cloud.",
+    sideEffect: "mutation",
+    execute: async () => {
+      await extensionsStore.refreshCloudOrgMarketplaces({ force: true });
+      return { marketplaceCount: extensionsStore.cloudOrgMarketplaces().length };
+    },
+  }), [extensionsStore]);
+  useControlAction(refreshMarketplaceAction);
+
+  // Periodically reconcile workspace-imported cloud providers from Den while
+  // signed in (dev #1509 "auto-sync cloud providers"). Mounted here because
+  // the settings route owns the provider-auth store.
+  useCloudProviderAutoSync(providerAuthStore.runCloudProviderSync);
+
+  // Keep the Den cloud MCP configured with a fresh first-party token while
+  // signed in: connects on sign-in, re-mints on org switch and before expiry.
+  useCloudProviderAutoSync(() => connectionsStore.syncCloudControlMcp());
+
+  useEffect(() => {
+    if (route.tab !== "cloud-providers" && route.tab !== "ai") return;
+    void providerAuthStore.runCloudProviderSync("settings_cloud_opened");
+  }, [providerAuthStore, route.tab]);
+
+  useEffect(() => {
+    providerAuthStore.syncFromOptions();
+  }, [
+    providerAuthStore,
+    idexalOsServerSnapshot.idexalOsServerStatus,
+    idexalOsServerSnapshot.idexalOsServerCapabilities?.providerSync,
+    idexalOsServerSnapshot.idexalOsServerClient,
+    idexalOsServerSnapshot.idexalOsServerHostInfo?.generation,
+  ]);
+
+  useEffect(() => {
+    idexalOsServerStore.syncFromOptions();
+    connectionsStore.syncFromOptions();
+    providerAuthStore.syncFromOptions();
+    extensionsStore.syncFromOptions();
+  }, [
+    activeClient,
+    connectionsStore,
+    extensionsStore,
+    idexalOsServerStore,
+    providerAuthStore,
+    selectedWorkspace?.id,
+    selectedWorkspace?.workspaceType,
+    selectedWorkspaceRoot,
+  ]);
+
+  useEffect(() => {
+    if (!activeClient) {
+      setProviders([]);
+      setProviderDefaults({});
+      setProviderConnectedIds([]);
+      setDisabledProviders([]);
+      return;
+    }
+    void providerAuthStore.refreshProviders();
+    void connectionsStore.refreshMcpServers();
+  }, [activeClient, connectionsStore, providerAuthStore, selectedWorkspace?.id]);
+
+  const selectedWorkspaceName = selectedWorkspace?.displayNameResolved ?? t("session.workspace_fallback");
+  const workspaceOptions = workspaces.map((workspace) => ({
+    id: workspace.id,
+    name: workspace.displayNameResolved,
+    color: workspaceSwatchColor(workspace.id),
+  }));
+  const selectedWorkspaceColor = workspaceSwatchColor(selectedWorkspaceId);
+  const defaultModelLabel = local.prefs.defaultModel
+    ? (() => {
+        const provider = providers.find((item) => item.id === local.prefs.defaultModel?.providerID);
+        const model = provider?.models?.[local.prefs.defaultModel.modelID];
+        const providerLabel = provider?.name ?? resolveProviderDisplayName(local.prefs.defaultModel.providerID);
+        const modelLabel = model?.name ?? resolveModelDisplayName(local.prefs.defaultModel.modelID);
+        return `${providerLabel} - ${modelLabel}`;
+      })()
+    : t("session.default_model");
+  const defaultModelRef = local.prefs.defaultModel
+    ? `${local.prefs.defaultModel.providerID}/${local.prefs.defaultModel.modelID}`
+    : t("settings.default_label");
+  const defaultModelVariantLabel = local.prefs.modelVariant ?? t("settings.default_label");
+  const providerStatusLabel = providerConnectedIds.length > 0 ? t("status.connected") : t("status.disconnected_label");
+  const providerStatusStyle = providerConnectedIds.length > 0
+    ? "bg-green-7/10 text-green-11 border-green-7/20"
+    : "bg-gray-4/60 text-gray-11 border-gray-7/50";
+  const providerSummary = providerConnectedIds.length > 0
+    ? t("status.providers_connected", { count: providerConnectedIds.length })
+    : t("settings.no_providers_connected");
+  const providerConnectedIdSet = new Set(providerConnectedIds);
+  const disabledProviderIdSet = new Set(
+    disabledProviders.map((id) => id.trim().toLowerCase()).filter(Boolean),
+  );
+  const connectedProviders = providers.flatMap((provider) =>
+    providerConnectedIdSet.has(provider.id) &&
+    !disabledProviderIdSet.has(provider.id.trim().toLowerCase())
+      ? [{
+          id: provider.id,
+          name: provider.name ?? provider.id,
+          source: provider.source,
+        }]
+      : [],
+  );
+  // Disconnect hides built-in/config providers through disabled_providers, and
+  // the engine then omits them everywhere. List them so they can come back.
+  const hiddenProviders = [...new Set(disabledProviders.map((id) => id.trim()).filter(Boolean))].flatMap((id) =>
+    isDesktopProviderBlocked({ providerId: id, checkRestriction: checkDesktopRestriction })
+      ? []
+      : [{ id, name: providers.find((provider) => provider.id === id)?.name ?? PROVIDER_LABELS[id.toLowerCase()] ?? id }],
+  );
+  const idexalOsCloudMcpUrl = connectionsSnapshot.mcpServers.find(
+    (server) => server.name === "idexal-os-cloud",
+  )?.config.url ?? null;
+
+  // Build enablement context from all available runtime state.
+  const enablementContext = useMemo<EnablementContext>(() => {
+    const mcpConfigured = new Set(connectionsSnapshot.mcpServers.map((s) => s.name));
+    const connectedProviders = new Set(providerConnectedIds);
+    const configuredEnvKeys = new Set(userEnvKeys);
+
+    return {
+      mcpStatuses: connectionsSnapshot.mcpStatuses,
+      mcpConfigured,
+      connectedProviders,
+      configuredEnvKeys,
+      // Toggle state reader for extensions with defaultEnabled / explicit toggle.
+      isToggleEnabled: (ref: string) => {
+        const catalog = connectionsStore.quickConnect;
+        const match = catalog.find((e: { id?: string; serverName?: string }) => (e.id ?? e.serverName) === ref);
+        return match ? isIdexalOsExtensionEnabled(match) : false;
+      },
+    };
+  }, [connectionsSnapshot, extensionStateVersion, providerConnectedIds, userEnvKeys]);
+  const allowManageExtensions = !checkDesktopRestriction({ restriction: "allowManageExtensions" });
+  const builtInExtensionsDisabled = checkDesktopRestriction({ restriction: "allowBuiltInExtensions" });
+  const restartExtensionLocalServer = useCallback(async () => {
+    if (!isDesktopRuntime()) return false;
+    try {
+      await idexalOsServerRestart();
+      await idexalOsServerStore.reconnectIdexalOsServer();
+      await refreshRouteState();
+      return true;
+    } catch {
+      return false;
+    }
+  }, [idexalOsServerStore, refreshRouteState]);
+  const extensionController = useSettingsExtensionController({
+    idexalOsServerClient: selectedWorkspaceEndpoint?.client ?? idexalOsClient,
+    hostIdexalOsServerClient: idexalOsClient,
+    enablementContext,
+    restartLocalServer: restartExtensionLocalServer,
+    localProvider: {
+      busy: localProviderBusy,
+      status: localProviderStatus,
+      error: localProviderError,
+      onInstall: installLocalProvider,
+      onSync: syncLocalProvider,
+    },
+  });
+  const extensionCatalogPlatform = resolveIdexalOsExtensionCatalogPlatform(platform.platform, platform.os);
+  const quickConnectCatalog = useMemo(
+    () => filterIdexalOsExtensionCatalogForPlatform(connectionsStore.quickConnect, extensionCatalogPlatform),
+    [connectionsStore.quickConnect, extensionCatalogPlatform],
+  );
+  const extensionItems = useMemo(
+    () => buildExtensionItems({
+      quickConnect: quickConnectCatalog,
+      mcpServers: connectionsSnapshot.mcpServers,
+      installedSkills: extensionsStore.skills(),
+      importedCloudPlugins: extensionsSnapshot.importedCloudPlugins,
+      pendingCloudPluginChanges: extensionsSnapshot.pendingCloudPluginChanges,
+      cloudMarketplaces: extensionsSnapshot.cloudOrgMarketplaces,
+      orgMcpConnections: orgMcpConnections.connections,
+      enablementContext,
+      isBuiltInConnected: extensionController.isConnected,
+    }),
+    [connectionsSnapshot.mcpServers, enablementContext, extensionController.isConnected, extensionsSnapshot, extensionsStore, orgMcpConnections.connections, quickConnectCatalog],
+  );
+  // Every connection the organization provisioned for this member, connected
+  // or not: one that still needs the member's sign-in is the whole reason the
+  // "Needs your attention" group exists, so it must not be filtered out here.
+  const orgMcpConnectionItems = extensionItems.orgMcpConnectionItems;
+  const librarySkills = useMemo(
+    () => [
+      ...extensionItems.installedSkills,
+      ...connectCapabilities.skills.filter(
+        (skill) => !extensionItems.installedSkills.some(
+          (installed) => installed.name.toLowerCase() === skill.name.toLowerCase(),
+        ),
+      ),
+    ],
+    [connectCapabilities.skills, extensionItems.installedSkills],
+  );
+  const libraryConnectMcpServers = useMemo(
+    () => connectCapabilities.mcpServers.filter(
+      (entry) => !orgMcpConnectionItems.some((item) =>
+        item.name.localeCompare(entry.name, undefined, { sensitivity: "accent" }) === 0
+      ),
+    ),
+    [connectCapabilities.mcpServers, orgMcpConnectionItems],
+  );
+  const libraryConnectPlugins = useMemo(
+    () => connectPluginsForComposer(connectCapabilities.plugins),
+    [connectCapabilities.plugins],
+  );
+  const readLibrarySkill = useCallback(
+    (name: string) => extensionsStore.readSkill(name),
+    [extensionsStore],
+  );
+  const organizationConnectionsProbe = resolveOrganizationConnectionsProbe({
+    signedIn: cloudSession.isSignedIn,
+    activeOrganizationId: cloudSession.activeOrganization?.id,
+    loading: orgMcpConnections.loading,
+    loaded: orgMcpConnections.loaded,
+    error: orgMcpConnections.error,
+  });
+  const diagnosticsClient = selectedWorkspaceEndpoint?.client ?? idexalOsClient;
+  const diagnosticsAvailable = Boolean(
+    diagnosticsClient
+    && runtimeWorkspaceId?.trim()
+    && selectedWorkspace,
+  );
+  const diagnosticsScopeKey = useMemo(() => createOpaqueDiagnosticsScopeKey({
+    client: diagnosticsClient,
+    workspaceCredential: selectedWorkspaceEndpoint?.token ?? token,
+    workspaceId: runtimeWorkspaceId?.trim() ?? "",
+    workspaceType: "local",
+    denBaseUrl: cloudSession.baseUrl,
+    denCredential: cloudSession.authToken,
+    denSignedIn: cloudSession.isSignedIn,
+    organizationId: cloudSession.activeOrganization?.id ?? "signed-out",
+    principalId: cloudSession.user?.id ?? "signed-out",
+  }), [
+    cloudSession.activeOrganization?.id,
+    cloudSession.authToken,
+    cloudSession.baseUrl,
+    cloudSession.isSignedIn,
+    cloudSession.user?.id,
+    diagnosticsClient,
+    runtimeWorkspaceId,
+    selectedWorkspaceEndpoint?.token,
+    token,
+  ]);
+  const runAgentContextDiagnostics = useCallback(async () => {
+    const client = selectedWorkspaceEndpoint?.client ?? idexalOsClient;
+    const workspaceId = runtimeWorkspaceId?.trim() ?? "";
+    if (
+      !client
+      || !workspaceId
+      || !selectedWorkspace
+    ) {
+      throw new Error("Agent diagnostics require a connected workspace.");
+    }
+    const observations = await collectAgentContextDiagnosticObservations({
+      organizationConnections: orgMcpConnections.connections,
+      organizationConnectionsProbe,
+    });
+    return client.runAgentContextDiagnostics(workspaceId, observations);
+  }, [
+    idexalOsClient,
+    organizationConnectionsProbe,
+    orgMcpConnections.connections,
+    runtimeWorkspaceId,
+    selectedWorkspace,
+    selectedWorkspaceEndpoint,
+  ]);
+  const routeIdexalOsStatus = idexalOsClient ? "connected" : "disconnected";
+  const notFoundRouteError = !loading && routeWorkspaceId && !selectedWorkspace
+    ? "Workspace was not found. Select a new workspace from the sidebar."
+    : null;
+  useEffect(() => {
+    if (notFoundRouteError) {
+      notifyAlert({
+        kind: "system",
+        title: notFoundRouteError,
+        dedupeKey: "workspace-not-found",
+      });
+    }
+  }, [notFoundRouteError]);
+  const routeIdexalOsCapabilities: IdexalOsServerCapabilities | null = idexalOsClient
+    ? ROUTE_IDEXAL_CAPABILITIES
+    : null;
+  const environmentRuntimeKey = buildIdexalOsEnvRuntimeKey({
+    baseUrl: idexalOsServerSnapshot.idexalOsServerBaseUrl || idexalOsServerSnapshot.idexalOsServerUrl,
+    pid: idexalOsServerSnapshot.idexalOsServerHostInfo?.pid ?? null,
+    port: idexalOsServerSnapshot.idexalOsServerHostInfo?.port ?? null,
+  });
+
+  const handleApplyEnvironmentChanges = async () => {
+    if (!isDesktopRuntime()) {
+      throw new Error(t("settings.environment.apply_unavailable"));
+    }
+    if (activeReloadBlockingSessions.length > 0) {
+      throw new Error(t("settings.environment.apply_blocked_active_tasks"));
+    }
+    if (!selectedWorkspaceRoot) {
+      throw new Error(t("settings.environment.apply_no_local_workspace"));
+    }
+    const workspacePaths = Array.from(
+      new Set(
+        workspaces.flatMap((workspace) => {
+          const path = workspace.path?.trim() ?? "";
+          return path ? [path] : [];
+        }),
+      ),
+    );
+    const workspacePathSet = new Set(workspacePaths);
+    if (!workspacePathSet.has(selectedWorkspaceRoot)) {
+      workspacePaths.unshift(selectedWorkspaceRoot);
+    }
+    await engineStart(selectedWorkspaceRoot, {
+      preferSidecar: true,
+      runtime: "direct",
+      workspacePaths,
+      // The user env file is read when the local server process spawns, so a
+      // healthy engine must be replaced, not reused, for new values to apply.
+      forceRestart: true,
+    });
+    const reconnected = await idexalOsServerStore.reconnectIdexalOsServer();
+    if (!reconnected) {
+      await refreshRouteState().catch(() => {});
+      return { statusMessage: t("settings.environment.apply_refresh_failed") };
+    }
+    await refreshRouteState();
+  };
+
+  const handleSelectSettingsWorkspace = useCallback((workspaceId: string) => {
+    if (workspaceId === selectedWorkspaceId) return;
+    setLegacySelectedWorkspaceId(workspaceId);
+    writeActiveWorkspaceId(workspaceId);
+    lastRequestedRouteWorkspaceIdRef.current = workspaceId;
+    routeWorkspaceSelectionCommitter.request(
+      workspaceId,
+      (selectedId) => workspaceSelectionCommitRef.current(selectedId),
+    );
+    navigate(
+      props.standaloneExtensions
+        ? workspaceExtensionsRoute(workspaceId, extensionsPathForRoute(route))
+        : workspaceSettingsRoute(workspaceId, settingsPathForRoute(route)),
+      { state: location.state },
+    );
+  }, [location, navigate, props.standaloneExtensions, route, selectedWorkspaceId]);
+
+  const handleOpenRenameWorkspace = useCallback((workspaceId: string) => {
+    const workspace = workspaces.find((item) => item.id === workspaceId);
+    if (!workspace) return;
+    setRenameWorkspaceId(workspaceId);
+    setRenameWorkspaceTitle(workspaceLabel(workspace));
+  }, [workspaces]);
+
+  const handleSaveRenameWorkspace = useCallback(async () => {
+    if (!renameWorkspaceId) return;
+    const trimmed = renameWorkspaceTitle.trim();
+    if (!trimmed) return;
+    setRenameWorkspaceBusy(true);
+    try {
+      if (!idexalOsClient) {
+        toast.error("idexal Os server is unavailable. Reconnect the server before renaming workspaces.");
+        return;
+      }
+      await idexalOsClient.updateWorkspaceDisplayName(renameWorkspaceId, trimmed);
+      setRenameWorkspaceId(null);
+      setRenameWorkspaceTitle("");
+      await refreshRouteState();
+    } catch (error) {
+      toast.error("Workspace rename failed", {
+        description: describeRouteError(error),
+      });
+    } finally {
+      setRenameWorkspaceBusy(false);
+    }
+  }, [idexalOsClient, refreshRouteState, renameWorkspaceId, renameWorkspaceTitle]);
+
+  const handleRevealWorkspace = useCallback(async (workspaceId: string) => {
+    const workspace = workspaces.find((item) => item.id === workspaceId);
+    const path = workspace?.path?.trim();
+    if (!path || !isDesktopRuntime()) return;
+    await revealDesktopItemInDir(path).catch(() => undefined);
+  }, [workspaces]);
+
+  const handleForgetWorkspace = useCallback(async (workspaceId: string) => {
+    if (typeof window !== "undefined") {
+      const message = t("workspace_list.remove_confirm") || "Remove this workspace from the sidebar?";
+      if (!window.confirm(message)) return;
+    }
+    if (idexalOsClient) {
+      await idexalOsClient.deleteWorkspace(workspaceId).catch(() => undefined);
+    }
+    if (isDesktopRuntime()) {
+      await workspaceForget(workspaceId).catch(() => undefined);
+    }
+    if (selectedWorkspaceId === workspaceId) {
+      const nextWorkspace = workspaces.find((workspace) => workspace.id !== workspaceId);
+      const nextId = nextWorkspace?.id ?? "";
+      setLegacySelectedWorkspaceId(nextId);
+      if (nextId) {
+        await workspaceSetSelected(nextId).catch(() => undefined);
+      }
+    }
+    await refreshRouteState();
+  }, [idexalOsClient, refreshRouteState, selectedWorkspaceId, workspaces]);
+
+  if (route.redirectPath && !props.embedded) {
+    const target = props.standaloneExtensions
+      ? selectedWorkspaceId
+        ? workspaceExtensionsRoute(selectedWorkspaceId, extensionsPathForRoute(route))
+        : globalExtensionsRoute(extensionsPathForRoute(route))
+      : selectedWorkspaceId
+        ? workspaceSettingsRoute(selectedWorkspaceId, route.redirectPath)
+        : `/settings/${route.redirectPath}`;
+    return <Navigate to={target} replace state={location.state} />;
+  }
+
+  if (!props.embedded && !routeWorkspaceId && selectedWorkspaceId) {
+    const target = props.standaloneExtensions
+      ? workspaceExtensionsRoute(selectedWorkspaceId, extensionsPathForRoute(route))
+      : workspaceSettingsRoute(selectedWorkspaceId, settingsPathForRoute(route));
+    return <Navigate to={target} replace state={location.state} />;
+  }
+
+  if (!props.embedded && settingsTabBlocked) {
+    // Organization policy hides desktop settings. Library deep links keep
+    // working through the standalone Library surface; everything else lands on
+    // the Cloud account tab, which explains the active policy.
+    const target = route.tab === "extensions"
+      ? selectedWorkspaceId
+        ? workspaceExtensionsRoute(selectedWorkspaceId, extensionsPathForRoute(route))
+        : globalExtensionsRoute(extensionsPathForRoute(route))
+      : selectedWorkspaceId
+        ? workspaceSettingsRoute(selectedWorkspaceId, SETTINGS_TAB_WITHOUT_CONTROL)
+        : `/settings/${SETTINGS_TAB_WITHOUT_CONTROL}`;
+    return <Navigate to={target} replace state={location.state} />;
+  }
+
+  if (!props.embedded && cloudSettingsTabBlocked) {
+    // No Cloud sign-in on offer: the Cloud account, usage and provider
+    // destinations are not reachable, so a deep link falls back to General.
+    const target = selectedWorkspaceId
+      ? workspaceSettingsRoute(selectedWorkspaceId, "general")
+      : "/settings/general";
+    return <Navigate to={target} replace state={location.state} />;
+  }
+
+  const openCloudAccountSettings = () => {
+    navigateSettingsPath("cloud-account");
+  };
+
+  const settingsView = (() => {
+    switch (route.tab) {
+      case "general":
+        return (
+          <GeneralSettingsView
+            onNavigateTab={(tab) => navigateSettingsPath(tab)}
+            developerMode={developerMode}
+            onSendFeedback={() => platform.openLink(buildFeedbackUrl({ entrypoint: "settings" }))}
+            onJoinDiscord={() => platform.openLink("https://discord.gg/VEhNQXxYMB")}
+            onReportIssue={() => platform.openLink("https://github.com/idexal/idexalOs/issues/new?template=bug.yml")}
+          />
+        );
+      case "permissions":
+        return (
+          <SettingsStack>
+            <AuthorizedFoldersPanel
+              idexalOsServerClient={idexalOsClient}
+              idexalOsServerStatus={routeIdexalOsStatus}
+              idexalOsServerCapabilities={routeIdexalOsCapabilities}
+              runtimeWorkspaceId={runtimeWorkspaceId}
+              selectedWorkspaceRoot={selectedWorkspaceRoot}
+              onConfigUpdated={() => {
+                setConfigActionStatus(t("settings.config_updated"));
+                setPermissionsRefreshToken((token) => token + 1);
+                void providerAuthStore.refreshProviders();
+                void connectionsStore.refreshMcpServers();
+              }}
+            />
+          </SettingsStack>
+        );
+      case "memory":
+        return (
+          <SettingsStack>
+            <MemoryView
+              client={idexalOsClient}
+              workspaceId={(runtimeWorkspaceId || selectedWorkspaceId) || null}
+              workspaceName={selectedWorkspace?.name ?? selectedWorkspaceId}
+              canWrite={Boolean(idexalOsClient && (runtimeWorkspaceId || selectedWorkspaceId))}
+            />
+          </SettingsStack>
+        );
+      case "ai":
+        return (
+          <AiSettingsView
+            busy={busy}
+            providerAuthBusy={providerAuthSnapshot.providerAuthBusy}
+            providerStatusLabel={providerStatusLabel}
+            providerStatusStyle={providerStatusStyle}
+            providerSummary={providerSummary}
+            providerLoadState={activeClient ? providerAuthSnapshot.providerLoadState : { status: "idle", error: null }}
+            onRetryProviders={async () => { await providerAuthStore.refreshProviders({ force: true }); }}
+            connectedProviders={connectedProviders}
+            disconnectingProviderId={null}
+            providerConnectError={providerAuthSnapshot.providerAuthError}
+            providerDisconnectStatus={configActionStatus}
+            providerDisconnectError={null}
+            onOpenProviderAuth={handleOpenProviderAuth}
+            onDisconnectProvider={async (providerId) => {
+              const message = await providerAuthStore.disconnectProvider(providerId);
+              if (typeof message === "string" && message.trim()) {
+                setConfigActionStatus(message);
+              }
+            }}
+            canDisconnectProvider={(provider) =>
+              provider.id.trim().toLowerCase() === "opencode" || provider.source !== "env"
+            }
+            disabledProviders={activeClient ? hiddenProviders : []}
+            enablingProviderId={enablingProviderId}
+            onEnableProvider={async (providerId) => {
+              setEnablingProviderId(providerId);
+              try {
+                const message = await providerAuthStore.enableProvider(providerId);
+                if (message.trim()) setConfigActionStatus(message);
+              } catch {
+                // The store publishes the error as providerAuthError.
+              } finally {
+                setEnablingProviderId(null);
+              }
+            }}
+            canAddProviders={!providerAuthStore.isProviderAddRestricted()}
+            signedIn={cloudSession.isSignedIn}
+            organizationName={cloudSession.activeOrgName}
+            cloudProviderIds={new Set([
+              ...Object.values(providerAuthSnapshot.importedCloudProviders ?? {}).map((p) => p.providerId),
+              ...(idexalOsModelsEntitled || idexalOsModelsAvailable ? ["idexalos"] : []),
+            ])}
+            gatewayProviderIds={gatewayProviderIds}
+            gatewayConnectProviders={gatewayConnectProviders}
+            connectingGatewayProviderId={connectingGatewayProviderId}
+            onCancelGatewayConnect={() => {
+              gatewayConnectAbort.current?.abort();
+              setConnectingGatewayProviderId(null);
+              toast.info("Stopped waiting. Browser sign-in was not revoked. Refresh AI Providers after finishing, or Connect again to retry.");
+            }}
+            onConnectGatewayProvider={(provider) => { void handleConnectGatewayProvider(provider); }}
+            showIdexalOsModelsSyncing={showIdexalOsModelsSyncing}
+            autoPreferences={visibleAutoPreferences}
+            autoSwitchedOff={autoSwitchedOff}
+            autoBusy={autoBusy}
+            autoError={autoError}
+            onSetAutoEnabled={autoClient ? setAutoEnabled : undefined}
+            organizationProviderIds={organizationProviderIds}
+            planProviders={providerEntitlements.enabled === true ? providerEntitlements.providers : undefined}
+            planEnabled={providerEntitlements.enabled === true}
+            planName={providerEntitlements.plan ?? undefined}
+            byokAllowed={providerEntitlements.byok}
+            onOpenDen={openProvidersInDen}
+            fallbackModelOptions={modelPicker.actionOptions}
+            cloudProvidersView={
+              showCloudProviders ? (
+                <CloudProvidersView
+                  key={`${cloudSession.baseUrl}:${cloudSession.activeOrganization?.id ?? "signed-out"}`}
+                  embedded
+                  onOpenDen={openProvidersInDen}
+                  onOpenModelConnections={() => { void platform.openLink(denDashboardUrl(readDenSettings().baseUrl, "modelConnections")); }}
+                  gatewayConnectProviders={gatewayConnectProviders}
+                  connectingGatewayProviderId={connectingGatewayProviderId}
+                  onConnectGatewayProvider={(provider) => { void handleConnectGatewayProvider(provider); }}
+                  checkDesktopAppRestriction={checkDesktopRestriction}
+                  cloudOrgProviders={providerAuthSnapshot.cloudOrgProviders}
+                  connectCloudProvider={providerAuthStore.connectCloudProvider}
+                  importedCloudProviders={providerAuthSnapshot.importedCloudProviders}
+                  importsUnavailable={
+                    idexalOsServerSnapshot.idexalOsServerCapabilities?.config?.read === false ||
+                    idexalOsServerSnapshot.idexalOsServerCapabilities?.config?.write === false
+                  }
+                  lastSyncError={providerAuthSnapshot.lastSyncError}
+                  idexalOsServerAvailable={Boolean(idexalOsServerSnapshot.idexalOsServerClient)}
+                  onOpenAccount={openCloudAccountSettings}
+                  refreshCloudOrgProviders={providerAuthStore.refreshCloudOrgProviders}
+                  runCloudProviderSync={providerAuthStore.runCloudProviderSync}
+                  serverSync={providerAuthSnapshot.cloudProviderServerSync}
+                />
+              ) : undefined
+            }
+          />
+        );
+      case "ollama":
+        return (
+          <OllamaConfig
+            busy={localProviderBusy}
+            status={localProviderStatus}
+            error={localProviderError}
+            onInstall={installLocalProvider}
+            onSync={syncLocalProvider}
+          />
+        );
+      case "preferences":
+        return (
+          <PreferencesView
+            busy={busy}
+            linkOpenDestination={local.prefs.linkOpenDestination}
+            onLinkOpenDestinationChange={(linkOpenDestination) => {
+              local.setPrefs((previous) => ({ ...previous, linkOpenDestination, askBeforeOpeningLinks: false }));
+            }}
+            showThinking={local.prefs.showThinking}
+            onToggleShowThinking={() => {
+              local.setPrefs((previous) => ({ ...previous, showThinking: !previous.showThinking }));
+            }}
+            autoCompactContext={autoCompactContext}
+            autoCompactContextBusy={autoCompactContextBusy}
+            onToggleAutoCompactContext={toggleAutoCompactContext}
+            analyticsEnabled={local.prefs.analyticsEnabled}
+            onToggleAnalytics={() => {
+              local.setPrefs((previous) => ({ ...previous, analyticsEnabled: !previous.analyticsEnabled }));
+            }}
+            desktopNotifications={local.prefs.desktopNotifications}
+            onDesktopNotificationsChange={(desktopNotifications) => {
+              local.setPrefs((previous) => ({ ...previous, desktopNotifications }));
+            }}
+          />
+        );
+      case "extensions":
+        return (
+          <ExtensionsView
+            busy={busy}
+            hideDescription={props.standaloneExtensions !== true}
+            selectedWorkspaceRoot={selectedWorkspaceRoot}
+            canEditPlugins={allowManageExtensions}
+            canUseGlobalScope
+            accessHint={allowManageExtensions ? null : desktopRestrictionNotice("allowManageExtensions")}
+            suggestedPlugins={SUGGESTED_PLUGINS}
+            skillsContent={
+              <SuggestedSkillsView
+                skills={SUGGESTED_SKILLS}
+                installedNames={extensionsSnapshot.skills.map((skill) => skill.name)}
+                busy={busy}
+                canInstall={allowManageExtensions}
+                hasWorkspace={Boolean(selectedWorkspaceRoot)}
+                status={extensionsSnapshot.skillsStatus}
+                onInstall={(skill) => {
+                  void extensionsStore.installSuggestedSkill(skill.name, skill.content);
+                }}
+              />
+            }
+            extensions={extensionsStore}
+            initialSection={route.extensionsSection}
+            detailId={route.extensionDetailId ?? null}
+            onDetailIdChange={(id) => {
+              navigateSettingsPath(id ? `extensions/${encodeURIComponent(id)}` : "extensions");
+            }}
+            setSectionRoute={(section) => {
+              const path = section === "all" ? "extensions" : `extensions/${section}`;
+              navigateSettingsPath(path);
+            }}
+            onRefresh={() => {
+              // Force-sync the cloud MCP first (re-mint token + rewrite
+              // config, bypassing the freshness marker) so Refresh really
+              // means "make everything current now", then refresh the rest.
+              void connectionsStore.syncCloudControlMcp({ force: true }).then(() => {
+                void connectionsStore.refreshMcpServers();
+              });
+              void extensionsStore.refreshPlugins();
+              void extensionsStore.refreshCloudOrgMarketplaces({ force: true });
+              void orgMcpConnections.refresh();
+              void refreshConnectCapabilities({ force: true });
+            }}
+            mcpView={({ initialFilter, onFilterChange, initialState, pluginsContent, skillsContent, detailId, onDetailIdChange, onRefresh }) => (
+              <McpView
+                headerActionsTarget={props.libraryHeaderActionsTarget}
+                pluginsContent={pluginsContent}
+                skillsContent={skillsContent}
+                onOpenCloudAccount={() => navigate(selectedWorkspaceId ? workspaceSettingsRoute(selectedWorkspaceId, "cloud-account") : "/settings/cloud-account")}
+                busy={busy}
+                selectedWorkspaceRoot={selectedWorkspaceRoot}
+                    mcpServers={connectionsSnapshot.mcpServers}
+                mcpStatus={connectionsSnapshot.mcpStatus}
+                mcpLastUpdatedAt={connectionsSnapshot.mcpLastUpdatedAt}
+                mcpStatuses={connectionsSnapshot.mcpStatuses}
+                managedOAuthAvailable={connectionsSnapshot.managedOAuthAvailable}
+                mcpConnectingName={connectionsSnapshot.mcpConnectingName}
+                allowManageExtensions={allowManageExtensions}
+                quickConnect={quickConnectCatalog}
+                enablementContext={enablementContext}
+                builtInExtensionsDisabled={builtInExtensionsDisabled}
+                connectMcp={(entry) => {
+                  return connectionsStore.connectMcp(entry);
+                }}
+                configSlotForEntry={extensionController.configSlotForEntry}
+                isExtensionConnected={extensionController.isConnected}
+                authorizeMcp={(entry) => {
+                  void connectionsStore.authorizeMcp(entry);
+                }}
+                logoutMcpAuth={(name) => connectionsStore.logoutMcpAuth(name)}
+                removeMcp={(name) => {
+                  void connectionsStore.removeMcp(name);
+                }}
+                setMcpEnabled={
+                  routeIdexalOsStatus === "connected" && routeIdexalOsCapabilities?.mcp?.write
+                    ? (name, enabled) => connectionsStore.setMcpEnabled(name, enabled)
+                    : undefined
+                }
+                readConfigFile={readMcpConfigFile}
+                installedSkills={librarySkills}
+                installedCommands={libraryCommands}
+                installedAgents={libraryAgents}
+                availableConnectMcpServers={libraryConnectMcpServers}
+                availableConnectMcpStatuses={connectCapabilities.mcpStatuses}
+                inventoryLoading={connectCapabilitiesLoading || (orgMcpConnections.loading && !orgMcpConnections.loaded)}
+                inventoryError={connectCapabilitiesError}
+                installedPlugins={libraryConnectPlugins}
+                orgMcpItems={orgMcpConnectionItems}
+                organizationName={cloudSession.activeOrgName}
+                orgMcpError={orgMcpConnections.error}
+                uninstallSkill={(name) => { void extensionsStore.uninstallSkill(name); }}
+                removeCloudPlugin={(pluginId) => { void extensionsStore.removeCloudOrgPlugin(pluginId); }}
+                hasLocalPluginCopy={(pluginId) => Boolean(extensionsSnapshot.importedCloudPlugins[pluginId])}
+                orgMcpConnectingId={orgMcpConnections.connectingId}
+                connectOrgMcp={(connectionId) => { void orgMcpConnections.connect(connectionId); }}
+                reconnectOrgMcp={(connectionId) => { void orgMcpConnections.connect(connectionId, { forceFreshAuthorization: true }); }}
+                orgMcpDisconnectingId={orgMcpConnections.disconnectingId}
+                disconnectOrgMcp={(connectionId) => { void orgMcpConnections.disconnect(connectionId); }}
+                readSkill={readLibrarySkill}
+                createLibraryItem={(kind, input) => extensionsStore.createLibraryItem(kind, input)}
+                onLibraryListsRefresh={loadLibraryLists}
+                initialFilter={initialFilter}
+                onFilterChange={onFilterChange}
+                initialState={initialState}
+                detailId={detailId}
+                onDetailIdChange={onDetailIdChange}
+                onRefresh={onRefresh}
+              />
+            )}
+
+          />
+        );
+      case "cloud-account":
+        return (
+          <CloudAccountView
+            developerMode={developerMode}
+            session={denSession}
+          />
+        );
+      case "usage":
+        return <GatewayUsageSettingsView onOpenAccount={openCloudAccountSettings} />;
+      case "cloud-providers":
+        return (
+          <CloudProvidersView
+            checkDesktopAppRestriction={checkDesktopRestriction}
+            cloudOrgProviders={providerAuthSnapshot.cloudOrgProviders}
+            connectCloudProvider={providerAuthStore.connectCloudProvider}
+            importedCloudProviders={providerAuthSnapshot.importedCloudProviders}
+            importsUnavailable={
+              idexalOsServerSnapshot.idexalOsServerCapabilities?.config?.read === false ||
+              idexalOsServerSnapshot.idexalOsServerCapabilities?.config?.write === false
+            }
+            lastSyncError={providerAuthSnapshot.lastSyncError}
+            idexalOsServerAvailable={Boolean(idexalOsServerSnapshot.idexalOsServerClient)}
+            onOpenAccount={openCloudAccountSettings}
+            refreshCloudOrgProviders={providerAuthStore.refreshCloudOrgProviders}
+            runCloudProviderSync={providerAuthStore.runCloudProviderSync}
+            serverSync={providerAuthSnapshot.cloudProviderServerSync}
+          />
+        );
+      case "advanced":
+        return (
+          <SettingsStack>
+            <AdvancedView
+              sectionId={route.advancedSection}
+              key={runtimeWorkspaceId ?? selectedWorkspaceId}
+              busy={busy}
+              clientConnected={Boolean(opencodeClient)}
+              opencodeConnectStatus={null}
+              idexalOsServerStatus={idexalOsServerSnapshot.idexalOsServerStatus}
+              developerMode={developerMode}
+              toggleDeveloperMode={toggleDeveloperMode}
+              opencodeDevModeEnabled={false}
+              openDebugDeepLink={async () => ({ ok: false, message: "Debug deep links are not wired into the React settings route yet." })}
+              cloudMcpUrl={idexalOsCloudMcpUrl}
+              canInspectRuntimeConfig={Boolean(idexalOsClient && selectedWorkspaceId)}
+              getRuntimeConfigStatus={async () => {
+                if (!idexalOsClient || !selectedWorkspaceId) {
+                  throw new Error("Select a workspace to inspect runtime config.");
+                }
+                return idexalOsClient.getRuntimeConfigStatus(selectedWorkspaceId);
+              }}
+              cloudMcpHealth={cloudMcpHealth}
+              refreshCloudMcpHealth={refreshCloudMcpHealth}
+              organizationServer={denSession}
+              engineClient={idexalOsClient}
+            />
+            {platform.capabilities.localRuntimeControl ? (
+              <RecoveryView
+                anyActiveRuns={false}
+                workspaceConfigPath={selectedWorkspaceRoot ? `${selectedWorkspaceRoot}/.opencode/idexal-os.json` : ""}
+                resetConfigBusy={resetConfigBusy}
+                onResetAppConfigDefaults={resetWorkspaceConfig}
+                configActionStatus={configActionStatus}
+                cacheRepairBusy={cacheRepairBusy}
+                cacheRepairResult={cacheRepairResult}
+                onRepairOpencodeCache={repairLocalCache}
+                dockerCleanupBusy={dockerCleanupBusy}
+                dockerCleanupResult={dockerCleanupResult}
+                onCleanupIdexalOsDockerContainers={cleanupDockerContainers}
+              />
+            ) : null}
+            <EffectivePermissionsPanel
+              idexalOsServerClient={idexalOsClient}
+              idexalOsServerStatus={routeIdexalOsStatus}
+              idexalOsServerCapabilities={routeIdexalOsCapabilities}
+              runtimeWorkspaceId={runtimeWorkspaceId}
+              refreshToken={permissionsRefreshToken}
+            />
+          </SettingsStack>
+        );
+      case "appearance":
+        return (
+          <AppearanceView
+            busy={busy}
+            themeMode={themeMode}
+            setThemeMode={setThemeModeState}
+            language={currentLocale() as Language}
+            setLanguage={setLocale}
+            hideTitlebar={hideTitlebar}
+            toggleHideTitlebar={() => setHideTitlebar((current) => !current)}
+          />
+        );
+      case "shortcuts":
+        return (
+          <KeyboardShortcutsView
+            client={chatEngine.client}
+            baseUrl={chatEngine.baseUrl}
+            pickerOptions={modelPicker.options}
+            directory={selectedWorkspaceRoot}
+            onOpenProviders={() => navigateSettingsPath("ai")}
+          />
+        );
+      case "updates":
+        return (
+          <UpdatesView
+            busy={busy}
+            webDeployment={platform.platform === "web"}
+            appVersion={electronUpdaterState.appVersion}
+            updateEnv={electronUpdaterState.updateEnv}
+            updateAutoCheck={updateAutoCheck}
+            toggleUpdateAutoCheck={() => setUpdateAutoCheck((current) => !current)}
+            updateAutoDownload={updateAutoDownload}
+            toggleUpdateAutoDownload={() => setUpdateAutoDownload((current) => !current)}
+            updateStatus={electronUpdaterState.updateStatus}
+            anyActiveRuns={activeReloadBlockingSessions.length > 0}
+            checkForUpdates={electronUpdaterState.checkForUpdates}
+            downloadUpdate={electronUpdaterState.downloadUpdate}
+            installUpdateAndRestart={electronUpdaterState.installUpdateAndRestart}
+            releaseChannel={local.prefs.releaseChannel ?? "stable"}
+            onReleaseChannelChange={electronUpdaterState.setReleaseChannel}
+            alphaChannelSupported={
+              isElectronRuntime() &&
+              isMacPlatform() &&
+              readDesktopDistributionInfo().flavor === "public" &&
+              desktopConfig.config.allowAlphaUpdates !== false
+            }
+          />
+        );
+      case "environment":
+        return (
+          <EnvironmentView
+            client={idexalOsServerSnapshot.idexalOsServerClient}
+            onApplyChanges={isDesktopRuntime() ? handleApplyEnvironmentChanges : undefined}
+            applyBlocked={activeReloadBlockingSessions.length > 0}
+            applyBlockedReason={
+              activeReloadBlockingSessions.length > 0
+                ? t("settings.environment.apply_blocked_active_tasks")
+                : null
+            }
+            runtimeKey={environmentRuntimeKey}
+          />
+        );
+      case "proxy":
+        return <ProxyView />;
+      case "debug":
+        return (
+          <DebugView
+            key={runtimeWorkspaceId ?? selectedWorkspaceId}
+            {...debugViewProps}
+            agentAccess={{
+              client: selectedWorkspaceEndpoint?.client ?? idexalOsClient,
+              workspaceId: runtimeWorkspaceId,
+              currentModel: currentCloudMcpModel,
+              onHealthChange: handleCloudMcpHealthChange,
+            }}
+            agentContextDiagnostics={{
+              scopeKey: diagnosticsScopeKey,
+              available: diagnosticsAvailable,
+              onRun: runAgentContextDiagnostics,
+            }}
+          />
+        );
+      default:
+        return null;
+    }
+  })();
+
+  return (
+    <GatewayModelAccessProvider
+      providers={gatewayConnectProviders}
+      disabledProviders={disabledProviders}
+      scopeKey={JSON.stringify([selectedWorkspaceRoot, opencodeBaseUrl, cloudSession.activeOrganization?.id, cloudSession.isSignedIn])}
+      login={(provider, signal, model) => handleConnectGatewayProvider(provider, { signal, model })}
+    >
+      {props.standaloneExtensions ? (
+        <div data-extensions-main-surface className="flex h-full min-h-0 w-full flex-col overflow-hidden bg-background">
+          <div className="min-h-0 min-w-0 flex-1 overflow-y-auto px-4 py-5 sm:px-8">{settingsView}</div>
+        </div>
+      ) : (
+        <SettingsShell
+          activeTab={route.tab}
+          onSelectTab={(tab) => navigateSettingsPath(tab)}
+          developerMode={developerMode}
+          selectedWorkspaceId={selectedWorkspaceId}
+          selectedWorkspaceName={selectedWorkspaceName}
+          selectedWorkspaceColor={selectedWorkspaceColor}
+          workspaces={workspaceOptions}
+          onSelectWorkspace={handleSelectSettingsWorkspace}
+          headerStatus={routeIdexalOsStatus}
+          busyHint={loading ? t("session.loading_detail") : busyLabel}
+          onClose={props.onClose ?? (() => navigate(settingsReturnRoute(
+            selectedWorkspaceId,
+            navigationWorkspaceId,
+            navigationSessionId,
+          )))}
+          compact={props.embedded}
+        >
+          {settingsView}
+        </SettingsShell>
+      )}
+
+      <CommandPalette
+        engineClient={idexalOsClient}
+        open={commandPaletteOpen}
+        onClose={() => setCommandPaletteOpen(false)}
+        developerMode={developerMode}
+        onToggleSidebar={toggleSidebar}
+        onOpenAutomations={automationsPaletteAvailable ? () => navigate(automationsRoute()) : undefined}
+        onCreateNewSession={() => void handleCreatePaletteSession()}
+        onOpenSession={(workspaceId, sessionId) => {
+          navigate(workspaceSessionRoute(workspaceId, sessionId));
+        }}
+        onOpenSettings={(path = "/settings/general") => {
+          const settingsPath = path.replace(/^\/settings\//, "");
+          if (props.standaloneExtensions) {
+            navigate(
+              selectedWorkspaceId
+                ? workspaceSettingsRoute(selectedWorkspaceId, settingsPath)
+                : `/settings/${settingsPath}`,
+            );
+            return;
+          }
+          navigateSettingsPath(settingsPath);
+        }}
+        onOpenExtensions={(section) => {
+          const target = selectedWorkspaceId
+            ? workspaceExtensionsRoute(selectedWorkspaceId, section)
+            : globalExtensionsRoute(section);
+          navigate(target);
+        }}
+        onOpenModelPicker={() => {
+          modelPicker.setQuery("");
+          modelPicker.setRecentProviderIds(new Set());
+          window.requestAnimationFrame(() => modelPicker.setOpen(true));
+        }}
+        modelOptions={modelPicker.actionOptions}
+        selectedModel={local.prefs.defaultModel ?? undefined}
+        selectedModelBehavior={local.prefs.modelVariant ?? null}
+        onSelectModel={(next, behavior) => local.setPrefs((prev) => applyDefaultModelPreference(prev, next, behavior))}
+        sessions={paletteSessionOptions}
+        extraItems={checkDesktopRestriction({ restriction: "allowControlSettings" }) ? [] : [developerModePaletteItem]}
+      />
+
+      <ProviderAuthModal
+        open={providerAuthSnapshot.providerAuthModalOpen}
+        loading={false}
+        submitting={providerAuthSnapshot.providerAuthBusy}
+        error={providerAuthSnapshot.providerAuthError}
+        preferredProviderId={providerAuthSnapshot.providerAuthPreferredProviderId}
+        // Hide any provider the org blocks at the desktop layer so users
+        // can't connect a forbidden one (dev #1505). Same helper covers
+        // opencode-provider gating via the `allowZenModel` restriction.
+        // We also strip the matching key from `authMethods` because the
+        // modal builds its entry list from `Object.keys(authMethods)`,
+        // not from `providers`.
+        providers={providerAuthSnapshot.providerAuthProviders.filter(
+          (provider) =>
+            !isDesktopProviderBlocked({
+              providerId: provider.id,
+              checkRestriction: checkDesktopRestriction,
+            }),
+        )}
+        connectedProviderIds={providerConnectedIds}
+        keylessProviderIds={keylessProviderIds(providers)}
+        gatewayProviderIds={gatewayProviderIds}
+        authMethods={Object.fromEntries(
+          Object.entries(providerAuthSnapshot.providerAuthMethods).filter(
+            ([providerId]) =>
+              !isDesktopProviderBlocked({
+                providerId,
+                checkRestriction: checkDesktopRestriction,
+              }),
+          ),
+        )}
+        onSelect={providerAuthStore.startProviderAuth}
+        onSubmitApiKey={providerAuthStore.submitProviderApiKey}
+        onSubmitCustomProvider={providerAuthStore.addCustomProvider}
+        onSubmitOAuth={providerAuthStore.completeProviderAuthOAuth}
+        onRefreshProviders={providerAuthStore.refreshProviders}
+        idexalOsModelsState={visibleAutoPreferences ? !visibleAutoPreferences.enabled ? "off" : visibleAutoPreferences.available ? "included" : "unavailable" : undefined}
+        organizationName={cloudSession.activeOrgName}
+        organizationProviderIds={organizationProviderIds}
+        organizationProviderCount={cloudSession.isSignedIn ? new Set([...providerAuthSnapshot.cloudOrgProviders.map((provider) => provider.id), ...Object.keys(providerAuthSnapshot.importedCloudProviders), ...gatewayConnectProviders.map((provider) => provider.cloudProviderId)]).size : undefined}
+        onOpenDen={cloudSession.isSignedIn ? openProvidersInDen : undefined}
+        onClose={() => providerAuthStore.closeProviderAuthModal()}
+      />
+      <RenameWorkspaceModal
+        open={renameWorkspaceId !== null}
+        title={renameWorkspaceTitle}
+        busy={renameWorkspaceBusy}
+        canSave={!renameWorkspaceBusy && renameWorkspaceTitle.trim().length > 0}
+        onClose={() => {
+          if (renameWorkspaceBusy) return;
+          setRenameWorkspaceId(null);
+          setRenameWorkspaceTitle("");
+        }}
+        onSave={() => void handleSaveRenameWorkspace()}
+        onTitleChange={setRenameWorkspaceTitle}
+      />
+      <ConnectionsModals
+        client={activeClient}
+        projectDir={selectedWorkspaceRoot}
+        reloadBlocked={activeReloadBlockingSessions.length > 0}
+        activeSessions={activeReloadBlockingSessions}
+        onForceStopSession={async (sessionId) => {
+          if (!activeClient) return;
+          await abortSessionSafe(activeClient, sessionId, undefined, {
+            source: "settings.connections.force_stop_session",
+            initiator: "user",
+            reason: "force stop active session from connections modal",
+          });
+        }}
+        onReloadEngine={reloadCoordinator.reloadWorkspaceEngine}
+        modalState={{
+          mcpAuthModalOpen: connectionsSnapshot.mcpAuthModalOpen,
+          mcpAuthEntry: connectionsSnapshot.mcpAuthEntry,
+          mcpAuthNeedsReload: connectionsSnapshot.mcpAuthNeedsReload,
+        }}
+        onCloseMcpAuthModal={() => connectionsStore.closeMcpAuthModal()}
+        onMcpAuthenticated={(name) => connectionsStore.recordMcpAuthenticated(name)}
+        onCompleteMcpAuthModal={() => connectionsStore.completeMcpAuthModal()}
+      />
+      <ModelPickerModal
+        open={modelPicker.open}
+        options={modelPicker.options}
+        knownOptions={modelPicker.knownOptions}
+        disabledProviders={disabledProviders}
+        gatewayProviderIds={gatewayProviderIds}
+        gatewayConnectProviders={gatewayConnectProviders}
+        onConnectGatewayProvider={(provider) => { void handleConnectGatewayProvider(provider); }}
+        query={modelPicker.query}
+        setQuery={modelPicker.setQuery}
+        target="default"
+        currentBehaviorValue={local.prefs.modelVariant ?? null}
+        current={
+          local.prefs.defaultModel ?? { providerID: "", modelID: "" }
+        }
+        onSelect={(next: ModelRef) => {
+          local.setPrefs((prev) => applyDefaultModelPreference(prev, next));
+          modelPicker.setOpen(false);
+        }}
+        onBehaviorChange={(_model, value) => local.setPrefs((previous) => ({ ...previous, modelVariant: value }))}
+        catalogState={modelPicker.catalogState}
+        onRefreshOrganizationModels={async () => { await providerAuthStore.refreshCloudOrgProviders({ force: true }); }}
+        onOpenSettings={() => { modelPicker.setOpen(false); navigateSettingsPath("ai"); }}
+        onOpenProviderSettings={() => navigateSettingsPath("ai")}
+        onClose={() => modelPicker.setOpen(false)}
+      />
+    </GatewayModelAccessProvider>
+  );
+}
+
+export function SettingsRoute() {
+  return <SettingsSurface />;
+}
+
+export function SettingsSurface(props: SettingsSurfaceProps) {
+  return (
+    <CloudSessionProvider>
+      <SettingsRouteContent {...props} />
+    </CloudSessionProvider>
+  );
+}

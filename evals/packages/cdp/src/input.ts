@@ -1,0 +1,704 @@
+import { callFunctionOnSurface, evaluateOnSurface } from "./surface.ts";
+import type { Surface } from "./surface.ts";
+import type { CdpClient } from "./cdp.ts";
+
+export type TargetRole = "button" | "link" | "textbox" | "checkbox" | "switch" | "menuitem" | "tab" | "option" | "separator" | "combobox" | "listbox" | "alert" | "heading" | "progressbar" | "radio";
+export type TargetMatcher = string | RegExp;
+
+export type Target = string | {
+  text?: TargetMatcher;
+  role?: TargetRole;
+  label?: TargetMatcher;
+  placeholder?: string;
+  testId?: string;
+  nth?: number;
+  mcpApp?: { resourceUri: string; index?: number };
+};
+
+export interface Point {
+  x: number;
+  y: number;
+}
+
+export interface Located {
+  center: Point;
+  rect: { x: number; y: number; width: number; height: number };
+  tag: string;
+  name: string;
+  visible: boolean;
+  hitTestOk: boolean;
+  editable: boolean;
+  /** What disables the control (`disabled`, `aria-disabled="true"`), or null when it accepts input. */
+  disabled: string | null;
+  value: string;
+  text: string;
+  covering: { tag: string; text: string; role: string } | null;
+}
+
+/** Read-only DOM geometry, focus and fixed layout styles; excludes input values and attributes. */
+export async function readDom(surface: Surface, selector: string) {
+  const snapshot = await callFunctionOnSurface(surface, (selector) => ({
+    viewportWidth: document.documentElement.clientWidth,
+    documentWidth: document.documentElement.scrollWidth,
+    elements: Array.from(document.querySelectorAll(selector), (element) => {
+      const { left, right, top, bottom, width, height } = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return {
+        tag: element.tagName.toLowerCase(),
+        text: element.textContent?.trim() ?? "",
+        focused: element === document.activeElement,
+        rect: { left, right, top, bottom, width, height },
+        style: {
+          colorScheme: style.colorScheme,
+          borderTopWidth: style.borderTopWidth,
+          borderBottomWidth: style.borderBottomWidth,
+          borderTopLeftRadius: style.borderTopLeftRadius,
+        },
+      };
+    }),
+  }), [selector]);
+  if (!snapshot || !Number.isFinite(snapshot.viewportWidth) || !Number.isFinite(snapshot.documentWidth)
+    || !Array.isArray(snapshot.elements) || !snapshot.elements.every((element) => element
+      && typeof element.tag === "string" && typeof element.text === "string" && typeof element.focused === "boolean"
+      && element.style && [element.style.colorScheme, element.style.borderTopWidth, element.style.borderBottomWidth, element.style.borderTopLeftRadius].every(value => typeof value === "string")
+      && element.rect && [element.rect.left, element.rect.right, element.rect.top, element.rect.bottom, element.rect.width, element.rect.height].every(Number.isFinite))) {
+    throw new Error("DOM inspection returned an invalid snapshot.");
+  }
+  return snapshot;
+}
+
+interface SerializedMatcher {
+  kind: "string" | "regexp";
+  value: string;
+  flags?: string;
+}
+
+interface ParsedTarget {
+  bare?: SerializedMatcher;
+  text?: SerializedMatcher;
+  role?: TargetRole;
+  label?: SerializedMatcher;
+  placeholder?: string;
+  testId?: string;
+  nth: number;
+  composer: boolean;
+}
+
+export interface KeyDescriptor {
+  key: string;
+  code: string;
+  windowsVirtualKeyCode: number;
+  modifiers: number;
+}
+
+function matcher(value: TargetMatcher): SerializedMatcher {
+  return typeof value === "string"
+    ? { kind: "string", value }
+    : { kind: "regexp", value: value.source, flags: value.flags };
+}
+
+export function parseTarget(target: Target): ParsedTarget {
+  if (typeof target === "string") {
+    return {
+      bare: matcher(target),
+      nth: 0,
+      composer: target.trim().toLowerCase() === "composer",
+    };
+  }
+  return {
+    text: target.text === undefined ? undefined : matcher(target.text),
+    role: target.role,
+    label: target.label === undefined ? undefined : matcher(target.label),
+    placeholder: target.placeholder,
+    testId: target.testId,
+    nth: target.nth ?? 0,
+    composer: false,
+  };
+}
+
+const KEY_CODES: Readonly<Record<string, { code: string; virtualKeyCode: number }>> = {
+  Enter: { code: "Enter", virtualKeyCode: 13 },
+  Escape: { code: "Escape", virtualKeyCode: 27 },
+  Tab: { code: "Tab", virtualKeyCode: 9 },
+  Backspace: { code: "Backspace", virtualKeyCode: 8 },
+  ArrowDown: { code: "ArrowDown", virtualKeyCode: 40 },
+  ArrowUp: { code: "ArrowUp", virtualKeyCode: 38 },
+  ArrowLeft: { code: "ArrowLeft", virtualKeyCode: 37 },
+  ArrowRight: { code: "ArrowRight", virtualKeyCode: 39 },
+  Delete: { code: "Delete", virtualKeyCode: 46 },
+  Home: { code: "Home", virtualKeyCode: 36 },
+  End: { code: "End", virtualKeyCode: 35 },
+  PageUp: { code: "PageUp", virtualKeyCode: 33 },
+  PageDown: { code: "PageDown", virtualKeyCode: 34 },
+  Space: { code: "Space", virtualKeyCode: 32 },
+};
+
+const MODIFIERS: Readonly<Record<string, number>> = {
+  Alt: 1,
+  Control: 2,
+  Ctrl: 2,
+  Meta: 4,
+  Shift: 8,
+};
+
+export function mapKey(input: string): KeyDescriptor {
+  const parts = input.split("+");
+  const key = parts.pop()?.trim() ?? "";
+  if (!key) throw new Error(`Invalid key ${JSON.stringify(input)}.`);
+  let modifiers = 0;
+  for (const part of parts) {
+    const modifier = MODIFIERS[part];
+    if (modifier === undefined) throw new Error(`Unsupported modifier ${JSON.stringify(part)} in ${JSON.stringify(input)}.`);
+    modifiers |= modifier;
+  }
+  const known = KEY_CODES[key];
+  if (known) return { key: key === "Space" ? " " : key, code: known.code, windowsVirtualKeyCode: known.virtualKeyCode, modifiers };
+  if (key.length !== 1) throw new Error(`Unsupported key ${JSON.stringify(key)}.`);
+  const upper = key.toUpperCase();
+  const code = /[A-Z]/.test(upper) ? `Key${upper}` : /[0-9]/.test(key) ? `Digit${key}` : key;
+  return { key, code, windowsVirtualKeyCode: upper.charCodeAt(0), modifiers };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function numberField(value: Record<string, unknown>, key: string): number | null {
+  return typeof value[key] === "number" && Number.isFinite(value[key]) ? value[key] : null;
+}
+
+export class TargetNotFoundError extends Error {}
+
+/** Upper bound on listed miss candidates; the message says when the page had more. */
+export const MISS_CANDIDATE_LIMIT = 40;
+
+/**
+ * Render the browser-side miss report (route, page roots, visible candidates of the requested
+ * role) as message text. Tolerates partial reports so older or mocked surfaces still produce
+ * a usable error.
+ */
+function describeMiss(value: Record<string, unknown>): string {
+  const parts: string[] = [];
+  if (typeof value.route === "string" && value.route.length > 0) parts.push(`Route ${value.route}.`);
+  if (isRecord(value.roots)) {
+    const flags = Object.entries(value.roots)
+      .filter((entry): entry is [string, boolean] => typeof entry[1] === "boolean")
+      .map(([name, present]) => `${name}=${present}`);
+    if (flags.length > 0) parts.push(`Page roots: ${flags.join(" ")}.`);
+  }
+  const role = typeof value.candidateRole === "string" && value.candidateRole.length > 0 ? value.candidateRole : "button/link";
+  const candidates = Array.isArray(value.candidates)
+    ? value.candidates.filter((candidate): candidate is string => typeof candidate === "string")
+    : [];
+  if (candidates.length === 0) parts.push(`No visible ${role} candidates.`);
+  else {
+    const shown = candidates.slice(0, MISS_CANDIDATE_LIMIT);
+    const truncated = candidates.length > shown.length ? ` (showing first ${shown.length} of ${candidates.length})` : "";
+    parts.push(`Visible ${role} candidates (${candidates.length})${truncated}: ${shown.join(", ")}.`);
+  }
+  return parts.length > 0 ? ` ${parts.join(" ")}` : "";
+}
+
+function domNodes(value: unknown): Record<string, unknown>[] {
+  if (!isRecord(value)) return [];
+  return [value, ...[
+    ...(Array.isArray(value.children) ? value.children : []),
+    ...(Array.isArray(value.shadowRoots) ? value.shadowRoots : []),
+    value.contentDocument,
+  ].flatMap(domNodes)];
+}
+
+function domAttribute(node: Record<string, unknown>, name: string): string | undefined {
+  if (!Array.isArray(node.attributes)) return undefined;
+  const index = node.attributes.indexOf(name);
+  const value = index >= 0 ? node.attributes[index + 1] : undefined;
+  return typeof value === "string" ? value : undefined;
+}
+
+async function nodeRect(client: CdpClient, nodeId: unknown): Promise<Located["rect"]> {
+  if (typeof nodeId !== "number") throw new Error("MCP App control has no DOM node identity.");
+  const box = await client.send("DOM.getBoxModel", { nodeId });
+  const quad = isRecord(box) && isRecord(box.model) ? box.model.content : null;
+  if (!Array.isArray(quad) || quad.length !== 8 || !quad.every(value => typeof value === "number" && Number.isFinite(value))) {
+    throw new Error("MCP App control returned invalid geometry.");
+  }
+  const numbers = quad.filter((value): value is number => typeof value === "number");
+  if (numbers[1] !== numbers[3] || numbers[2] !== numbers[4] || numbers[5] !== numbers[7] || numbers[6] !== numbers[0]) {
+    throw new Error("Rotated MCP App controls are not supported.");
+  }
+  return { x: numbers[0], y: numbers[1], width: numbers[2] - numbers[0], height: numbers[5] - numbers[1] };
+}
+
+type FrameBoundary = { client: CdpClient; node: Record<string, unknown> };
+
+async function locateMcpApp(surface: Surface, target: Exclude<Target, string>): Promise<Located> {
+  if (!target.mcpApp || !["button", "heading"].includes(target.role ?? "")) {
+    throw new Error("MCP App targets require an explicit button or heading role.");
+  }
+  await surface.client.send("DOM.enable");
+  const document = await surface.client.send("DOM.getDocument", { depth: -1, pierce: true });
+  if (!isRecord(document) || !isRecord(document.root) || document.root.nodeName !== "#document") throw new Error("MCP App DOM document was not readable.");
+  const roots = domNodes(document.root)
+    .filter(node => domAttribute(node, "data-mcp-app-resource") === target.mcpApp?.resourceUri);
+  const root = roots.at(target.mcpApp.index ?? 0);
+  if (!root) throw new TargetNotFoundError(`MCP App ${target.mcpApp.resourceUri} is not mounted.`);
+  const text = (node: Record<string, unknown>) => domNodes(node)
+    .filter(child => child.nodeName === "#text").map(child => child.nodeValue).join("").trim();
+  const matches = (matcher: TargetMatcher | undefined, value: string) => matcher === undefined
+    || (typeof matcher === "string" ? matcher.trim() === value : new RegExp(matcher.source, matcher.flags).test(value));
+  const attachments: string[] = [];
+  let frameDocuments = 0;
+  const candidates: { node: Record<string, unknown>; client: CdpClient; boundaries: FrameBoundary[]; ancestors: FrameBoundary[] }[] = [];
+  const visit = async (value: unknown, client: CdpClient, boundaries: FrameBoundary[], insideFrame: boolean, ancestors: FrameBoundary[] = []): Promise<void> => {
+    if (!isRecord(value)) return;
+    const role = domAttribute(value, "role") ?? (value.nodeName === "BUTTON" ? "button" : /^H[1-6]$/.test(String(value.nodeName)) ? "heading" : "");
+    if (insideFrame && role === target.role && matches(target.label, domAttribute(value, "aria-label") ?? text(value)) && matches(target.text, text(value))) {
+      candidates.push({ node: value, client, boundaries, ancestors });
+    }
+    const parents = String(value.nodeName).startsWith("#") ? ancestors : [...ancestors, { client, node: value }];
+    if (value.nodeName === "IFRAME") {
+      if (isRecord(value.contentDocument)) {
+        frameDocuments += 1;
+        await visit(value.contentDocument, client, boundaries, true, parents);
+      }
+      else if (typeof value.frameId === "string") {
+        const attached = await surface.client.send("Target.attachToTarget", { targetId: value.frameId, flatten: true }).catch(async cause => {
+          const result = await surface.client.send("Target.getTargets");
+          const targets = isRecord(result) && Array.isArray(result.targetInfos) ? result.targetInfos.filter(isRecord).map(info => ({ id: info.targetId, type: info.type })) : [];
+          throw new Error(`Cannot attach frame ${value.frameId}; targets ${JSON.stringify(targets)}`, { cause });
+        });
+        if (!isRecord(attached) || typeof attached.sessionId !== "string") throw new Error("MCP App frame attachment failed.");
+        const sessionId = attached.sessionId;
+        attachments.push(sessionId);
+        const child: CdpClient = { send: (method, params, options) => surface.client.send(method, params, { ...options, sessionId }), close() {} };
+        await child.send("DOM.enable");
+        const document = await child.send("DOM.getDocument", { depth: -1, pierce: true });
+        if (!isRecord(document) || !isRecord(document.root) || document.root.nodeName !== "#document") throw new Error("MCP App child document was not readable.");
+        frameDocuments += 1;
+        await visit(document.root, child, [...boundaries, { client, node: value }], true, parents);
+      }
+      return;
+    }
+    for (const child of [...(Array.isArray(value.children) ? value.children : []), ...(Array.isArray(value.shadowRoots) ? value.shadowRoots : [])]) {
+      await visit(child, client, boundaries, insideFrame, parents);
+    }
+  };
+  try {
+    await visit(root, surface.client, [], false);
+    if (frameDocuments === 0) throw new Error("MCP App frame documents unavailable; absence cannot be established.");
+    const candidate = candidates[target.nth ?? 0];
+    if (!candidate) throw new TargetNotFoundError(`MCP App control not found: ${JSON.stringify(target)}. No matching control in its frame documents.`);
+    const { node, client, boundaries } = candidate;
+    const nodeId = node.nodeId;
+    if (typeof nodeId !== "number") throw new Error("MCP App control has no DOM node identity.");
+    for (const boundary of boundaries) await boundary.client.send("DOM.scrollIntoViewIfNeeded", { nodeId: boundary.node.nodeId });
+    await client.send("DOM.scrollIntoViewIfNeeded", { nodeId });
+    const rect = await nodeRect(client, nodeId);
+    const center = { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+    const hit = await client.send("DOM.getNodeForLocation", { x: Math.round(center.x), y: Math.round(center.y) });
+    let hitTestOk = isRecord(hit) && domNodes(node).some(child => child.backendNodeId === hit.backendNodeId);
+    for (const boundary of [...boundaries].reverse()) {
+      const frame = await nodeRect(boundary.client, boundary.node.nodeId);
+      rect.x += frame.x;
+      rect.y += frame.y;
+      center.x += frame.x;
+      center.y += frame.y;
+      const hit = await boundary.client.send("DOM.getNodeForLocation", { x: Math.round(center.x), y: Math.round(center.y) });
+      hitTestOk = hitTestOk && isRecord(hit) && (hit.backendNodeId === boundary.node.backendNodeId || hit.frameId === boundary.node.frameId);
+    }
+    let hidden = false;
+    for (const ancestor of [...candidate.ancestors, { client, node }]) {
+      await ancestor.client.send("CSS.enable");
+      const computed = await ancestor.client.send("CSS.getComputedStyleForNode", { nodeId: ancestor.node.nodeId });
+      if (!isRecord(computed) || !Array.isArray(computed.computedStyle)) throw new Error("MCP App control styles were not readable.");
+      hidden ||= computed.computedStyle.filter(isRecord).some(style => (style.name === "visibility" && style.value !== "visible")
+        || (style.name === "display" && style.value === "none") || (style.name === "opacity" && Number(style.value) === 0));
+    }
+    return {
+      center, rect, tag: String(node.nodeName).toLowerCase(),
+      name: domAttribute(node, "aria-label") ?? text(node), text: text(node), value: "", editable: false,
+      visible: !hidden && rect.width > 0 && rect.height > 0 && hitTestOk, hitTestOk,
+      disabled: domAttribute(node, "disabled") !== undefined ? "disabled" : domAttribute(node, "aria-disabled") === "true" ? "aria-disabled" : null,
+      covering: hitTestOk ? null : { tag: "unknown", text: "MCP App control is covered or outside the viewport", role: "" },
+    };
+  } finally {
+    for (const sessionId of attachments.reverse()) await surface.client.send("Target.detachFromTarget", { sessionId });
+  }
+}
+
+export async function locate(surface: Surface, target: Target): Promise<Located> {
+  if (typeof target !== "string" && target.mcpApp) return locateMcpApp(surface, target);
+  const parsed = JSON.stringify(parseTarget(target));
+  const value = await callFunctionOnSurface(surface, (serialized) => {
+    const target: ParsedTarget = JSON.parse(serialized);
+    const matcher = (spec: SerializedMatcher | undefined, candidate: unknown) => {
+      if (!spec) return true;
+      const actual = String(candidate ?? "").trim();
+      if (spec.kind === "regexp") return new RegExp(spec.value, spec.flags ?? "").test(actual);
+      return actual === spec.value.trim();
+    };
+    const startsMatcher = (spec: SerializedMatcher | undefined, candidate: unknown) => {
+      if (!spec || spec.kind !== "string") return false;
+      return String(candidate ?? "").trim().toLowerCase().startsWith(spec.value.trim().toLowerCase());
+    };
+    const implicitRole = (element: Element) => {
+      const explicit = element.getAttribute("role");
+      if (explicit) return explicit;
+      const tag = element.tagName.toLowerCase();
+      if (tag === "button") return "button";
+      if (tag === "select") return element instanceof HTMLSelectElement && (element.multiple || element.size > 1) ? "listbox" : "combobox";
+      if (/^h[1-6]$/.test(tag)) return "heading";
+      if (tag === "a" && element.hasAttribute("href")) return "link";
+      if (tag === "textarea" || (element instanceof HTMLElement && element.isContentEditable)) return "textbox";
+      if (tag === "input") {
+        const type = (element.getAttribute("type") ?? "text").toLowerCase();
+        if (type === "checkbox") return "checkbox";
+        if (type === "radio") return "radio";
+        if (!["button", "submit", "reset", "hidden"].includes(type)) return "textbox";
+      }
+      return "";
+    };
+    const associatedLabel = (element: Element) => {
+      if ((element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement || element instanceof HTMLButtonElement) && element.labels?.length) return [...element.labels].map((label) => label.innerText ?? label.textContent ?? "").join(" ").trim();
+      const parent = element.closest("label");
+      return (parent?.innerText ?? parent?.textContent ?? "").trim();
+    };
+    const accessibleName = (element: Element) => {
+      const labelledBy = (element.getAttribute("aria-labelledby") ?? "").split(/\s+/).filter(Boolean)
+        .map((id) => document.getElementById(id)?.innerText ?? document.getElementById(id)?.textContent ?? "").join(" ").trim();
+      return (element.getAttribute("aria-label") ?? "").trim()
+        || labelledBy
+        || associatedLabel(element)
+        || (element.getAttribute("placeholder") ?? "").trim()
+        || ((element instanceof HTMLElement ? element.innerText : null) ?? element.textContent ?? "").trim();
+    };
+    const text = (element: Element) => ((element instanceof HTMLElement ? element.innerText : null) ?? element.textContent ?? "").trim();
+    const rendered = (element: Element) => {
+      const rect = element.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      let current: Element | null = element;
+      while (current instanceof Element) {
+        const style = getComputedStyle(current);
+        if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+        current = current.parentElement;
+      }
+      return true;
+    };
+    const selector = target.composer
+      ? '[contenteditable="true"][data-lexical-editor="true"]'
+      : target.role === "heading"
+        ? 'h1, h2, h3, h4, h5, h6, [role="heading"]'
+        : target.text && !target.role && !target.label && !target.placeholder && !target.testId
+          ? 'body *'
+          : 'button, a[href], input, textarea, select, [role="combobox"], [role="listbox"], [contenteditable="true"], [role="button"], [role="link"], [role="textbox"], [role="checkbox"], [role="switch"], [role="menuitem"], [role="tab"], [role="option"], [role="separator"], [role="alert"], [role="progressbar"], [role="radio"], [data-testid]';
+    const candidates = [...document.querySelectorAll<HTMLElement>(selector)].filter((element: Element) => {
+      if (target.role && implicitRole(element) !== target.role) return false;
+      if (target.placeholder !== undefined && (element.getAttribute("placeholder") ?? element.getAttribute("aria-placeholder")) !== target.placeholder) return false;
+      if (target.testId !== undefined && element.getAttribute("data-testid") !== target.testId) return false;
+      if (!matcher(target.label, accessibleName(element))) return false;
+      return true;
+    });
+    let matches = candidates;
+    if (target.text) {
+      const exact = candidates.filter((element: Element) => matcher(target.text, text(element)))
+        .filter((element: Element) => ![...element.children].some((child) => matcher(target.text, text(child))));
+      if (exact.length > 0) matches = exact;
+      else {
+        const starts = candidates.filter((element: Element) => rendered(element) && startsMatcher(target.text, text(element)))
+          .filter((element: Element) => ![...element.children].some((child) => startsMatcher(target.text, text(child))));
+        matches = starts.length === 1 ? starts : [];
+      }
+    }
+    if (target.bare && !target.composer) {
+      const exact = candidates.filter((element: Element) => matcher(target.bare, accessibleName(element)));
+      if (exact.length > 0) matches = exact;
+      else {
+        const starts = candidates.filter((element: Element) => rendered(element) && startsMatcher(target.bare, text(element)))
+          .filter((element: Element) => ![...element.children].some((child) => startsMatcher(target.bare, text(child))));
+        matches = starts.length === 1 ? starts : [];
+      }
+    }
+    // Retained conversations leave hidden controls in DOM order. A person's
+    // target is the rendered control; a hidden earlier composer must not steal
+    // clicks or draft verification from the selected conversation.
+    const visibleMatches = matches.filter(rendered);
+    const element = visibleMatches[target.nth] ?? (visibleMatches.length === 0 ? matches[target.nth] : undefined);
+    if (!element) {
+      // Miss diagnostics: every rendered element of the requested role (or every rendered
+      // button/link for role-less targets), so a miss shows the page's real controls rather
+      // than the first few in DOM order, which are always the shell rail.
+      const candidateRole = target.role;
+      const diagnosticSelector = candidateRole
+        ? selector
+        : 'button, a[href], [role="button"], [role="link"]';
+      const visibleCandidates = [...document.querySelectorAll<HTMLElement>(diagnosticSelector)]
+        .filter((candidate: Element) => (!candidateRole || implicitRole(candidate) === candidateRole) && rendered(candidate))
+        .map((candidate) => {
+          const role = implicitRole(candidate) || candidate.tagName.toLowerCase();
+          return role + " " + JSON.stringify(accessibleName(candidate));
+        });
+      return {
+        notFound: true,
+        candidates: visibleCandidates,
+        candidateRole: candidateRole ?? "button/link",
+        route: location.hash || location.pathname,
+        roots: {
+          appHeader: document.querySelector("[data-app-header]") !== null,
+          dashboardPage: document.querySelector("[data-dashboard-page]") !== null,
+        },
+      };
+    }
+    // Re-centering a reachable hover action can move its parent away from the
+    // pointer and hide the action before the click. Keep reachable controls
+    // still; scroll only when their click point is outside or covered.
+    const initial = element.getBoundingClientRect();
+    const initialX = initial.left + initial.width / 2;
+    const initialY = initial.top + initial.height / 2;
+    const initialHit = initialX >= 0 && initialY >= 0 && initialX <= innerWidth && initialY <= innerHeight
+      ? document.elementFromPoint(initialX, initialY) : null;
+    const isButton = element instanceof HTMLButtonElement || element.getAttribute("role") === "button";
+    if (!isButton || !initialHit || (initialHit !== element && !element.contains(initialHit))) {
+      element.scrollIntoView({ block: "center", inline: "center" });
+    }
+    const rect = element.getBoundingClientRect();
+    const center = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    let current: Element | null = element;
+    let styleVisible = true;
+    while (current instanceof Element) {
+      const style = getComputedStyle(current);
+      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) styleVisible = false;
+      current = current.parentElement;
+    }
+    const inViewport = center.x >= 0 && center.y >= 0 && center.x <= innerWidth && center.y <= innerHeight;
+    const hit = inViewport ? document.elementFromPoint(center.x, center.y) : null;
+    const hitTestOk = Boolean(hit && (hit === element || element.contains(hit)));
+    const disabledBy = [
+      element.matches(":disabled") ? "disabled" : "",
+      element.getAttribute("aria-disabled") === "true" ? 'aria-disabled="true"' : "",
+    ].filter(Boolean).join(" ");
+    return {
+      center,
+      rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+      tag: element.tagName.toLowerCase(),
+      name: accessibleName(element),
+      visible: styleVisible && rect.width > 0 && rect.height > 0 && inViewport,
+      hitTestOk,
+      editable: element instanceof HTMLSelectElement ? !element.matches(":disabled") : (element instanceof HTMLElement && element.isContentEditable) || (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) && !element.readOnly,
+      disabled: disabledBy || null,
+      value: (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) ? element.value : (element instanceof HTMLElement && element.isContentEditable) ? element.innerText : "",
+      text: ((element instanceof HTMLElement && element.isContentEditable) ? element.innerText : element.innerText ?? element.textContent ?? "").trim(),
+      covering: hit && !hitTestOk ? {
+        tag: hit.tagName.toLowerCase(),
+        text: ((hit instanceof HTMLElement ? hit.innerText : null) ?? hit.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 160),
+        role: implicitRole(hit),
+      } : null,
+    };
+  }, [parsed]);
+  if (isRecord(value) && value.notFound === true) {
+    throw new TargetNotFoundError(`Could not locate ${JSON.stringify(typeof target === "string" ? target : parseTarget(target))}.${describeMiss(value)}`);
+  }
+  if (!isRecord(value) || !isRecord(value.center) || !isRecord(value.rect)) {
+    throw new Error(`Could not locate ${JSON.stringify(typeof target === "string" ? target : parseTarget(target))}.`);
+  }
+  const x = numberField(value.center, "x");
+  const y = numberField(value.center, "y");
+  const rectX = numberField(value.rect, "x");
+  const rectY = numberField(value.rect, "y");
+  const width = numberField(value.rect, "width");
+  const height = numberField(value.rect, "height");
+  const covering = value.covering === null
+    ? null
+    : isRecord(value.covering)
+      && typeof value.covering.tag === "string"
+      && typeof value.covering.text === "string"
+      && typeof value.covering.role === "string"
+      ? { tag: value.covering.tag, text: value.covering.text, role: value.covering.role }
+      : undefined;
+  if (x === null || y === null || rectX === null || rectY === null || width === null || height === null
+    || typeof value.tag !== "string" || typeof value.name !== "string"
+    || typeof value.visible !== "boolean" || typeof value.hitTestOk !== "boolean"
+    || typeof value.editable !== "boolean" || typeof value.value !== "string" || typeof value.text !== "string"
+    || (value.disabled !== null && typeof value.disabled !== "string")
+    || covering === undefined) {
+    throw new Error("CDP returned invalid located-element geometry.");
+  }
+  return {
+    center: { x, y },
+    rect: { x: rectX, y: rectY, width, height },
+    tag: value.tag,
+    name: value.name,
+    visible: value.visible,
+    hitTestOk: value.hitTestOk,
+    editable: value.editable,
+    disabled: value.disabled,
+    value: value.value,
+    text: value.text,
+    covering,
+  };
+}
+
+export async function clickAt(
+  surface: Surface,
+  point: Point,
+  options: { button?: "left" | "right" | "middle"; clickCount?: number } = {},
+): Promise<void> {
+  const button = options.button ?? "left";
+  const clickCount = options.clickCount ?? 1;
+  // A person activates the window they click. Electron can leave an admin or
+  // OAuth window foregrounded; synthetic input alone does not activate this
+  // target, and subsequent insertText can otherwise be silently discarded.
+  // An isolated frame (an MCP App) has no window of its own to activate.
+  await surface.client.send("Page.bringToFront").catch((cause: unknown) => {
+    if (!String(cause).includes("only be executed on top-level targets")) throw cause;
+  });
+  await surface.client.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y, button: "none" });
+  await surface.client.send("Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button, clickCount });
+  await surface.client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button, clickCount });
+}
+
+export async function typeText(surface: Surface, text: string): Promise<void> {
+  await surface.client.send("Input.insertText", { text });
+}
+
+// Synthesized CDP key events do not go through the OS keymap, so editing
+// shortcuts only act on the focused field when the matching editing command is
+// named explicitly.
+const EDITING_COMMANDS: Record<string, string[]> = {
+  "Meta+A": ["selectAll"],
+  "Control+A": ["selectAll"],
+  "Meta+V": ["paste"],
+  "Control+V": ["paste"],
+  "Meta+ArrowDown": ["moveToEndOfDocument"],
+  "Control+End": ["moveToEndOfDocument"],
+  // macOS standard key bindings: bare Home/End scroll the document and only
+  // move the caret when nothing in the scroll chain accepts the scroll. Named
+  // on every lane so specs see the same keys a Mac user presses.
+  Home: ["scrollToBeginningOfDocument"],
+  End: ["scrollToEndOfDocument"],
+  "Shift+Home": ["moveToBeginningOfDocumentAndModifySelection"],
+  "Shift+End": ["moveToEndOfDocumentAndModifySelection"],
+};
+
+export async function pressKey(surface: Surface, key: string): Promise<void> {
+  const descriptor = mapKey(key);
+  // Let Chrome derive native codes: Windows VK values are different macOS keys.
+  const params = {
+    key: descriptor.key,
+    code: descriptor.code,
+    windowsVirtualKeyCode: descriptor.windowsVirtualKeyCode,
+    modifiers: descriptor.modifiers,
+  };
+  const commands = EDITING_COMMANDS[key];
+  // Enter needs a text event for native HTML button activation. Keydown alone
+  // reaches JS handlers but does not produce the browser's default click.
+  // CDP does not derive character insertion from the virtual key code. Native
+  // segmented inputs (date/time) need text on plain printable key presses.
+  const text = descriptor.key === "Enter" && (descriptor.modifiers & (1 | 2 | 4)) === 0
+    ? "\r"
+    : descriptor.key.length === 1 && descriptor.modifiers === 0 ? descriptor.key : undefined;
+  await surface.client.send("Input.dispatchKeyEvent", { type: "keyDown", ...params, ...(text === undefined ? {} : { text }), ...(commands ? { commands } : {}) });
+  await surface.client.send("Input.dispatchKeyEvent", { type: "keyUp", ...params });
+}
+
+export async function hoverAt(surface: Surface, point: Point): Promise<void> {
+  await surface.client.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y, button: "none" });
+}
+
+export async function reload(surface: Surface, options: { timeoutMs?: number } = {}): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  await surface.client.send("Page.reload");
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      if (await evaluateOnSurface(surface, () => (document.readyState === 'complete'), { timeoutMs: Math.min(2_000, Math.max(1, deadline - Date.now())) }) === true) return;
+    } catch {
+      // Reload briefly destroys the execution context.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Page did not finish reloading within ${timeoutMs}ms.`);
+}
+
+export async function waitForLocated(
+  surface: Surface,
+  target: Target,
+  options: { timeoutMs?: number; mustHitTest?: boolean } = {},
+): Promise<Located> {
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  let previous: Located | null = null;
+  while (Date.now() < deadline) {
+    try {
+      // locate() centers the element on every attempt, so smooth scrolling and
+      // transient overlays are re-evaluated instead of preserving stale geometry.
+      const found = await locate(surface, target);
+      const stable = previous && Math.abs(found.rect.x - previous.rect.x) < 0.5
+        && Math.abs(found.rect.y - previous.rect.y) < 0.5
+        && Math.abs(found.rect.width - previous.rect.width) < 0.5
+        && Math.abs(found.rect.height - previous.rect.height) < 0.5;
+      if (found.visible && (!options.mustHitTest || (found.hitTestOk && stable))) return found;
+      // Hit testing alone can select a neighboring option as an animated menu moves.
+      previous = found;
+      const covering = found.covering
+        ? ` Covered by ${found.covering.tag}${found.covering.role ? ` role=${JSON.stringify(found.covering.role)}` : ""}${found.covering.text ? ` text=${JSON.stringify(found.covering.text)}` : ""}.`
+        : "";
+      lastError = new Error(`Located element was visible=${found.visible}, hitTestOk=${found.hitTestOk}.${covering}`);
+    } catch (error) {
+      lastError = error;
+      previous = null;
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(0, deadline - Date.now()))));
+  }
+  const detail = lastError instanceof Error ? ` ${lastError.message}` : "";
+  throw new Error(`Timed out after ${timeoutMs}ms locating target.${detail}`);
+}
+
+/** The target was found but is disabled, so a click would be silently ignored by the page. */
+export class DisabledTargetError extends Error {}
+
+function describeRect(rect: Located["rect"]): string {
+  return `${Math.round(rect.x)},${Math.round(rect.y)} ${Math.round(rect.width)}×${Math.round(rect.height)}`;
+}
+
+function assertInteractive(found: Located): void {
+  if (found.disabled === null) return;
+  throw new DisabledTargetError(`Refused to click disabled ${found.tag} ${JSON.stringify(found.name)} (${found.disabled}); the page would ignore the click.`);
+}
+
+/**
+ * Wait for a visible target, then re-inspect it immediately before dispatching so
+ * a disabled state or a layout shift after the first inspection cannot absorb the click.
+ */
+export async function clickTarget(
+  surface: Surface,
+  target: Target,
+  options: { timeoutMs?: number; mustHitTest?: boolean; button?: "left" | "right" | "middle"; clickCount?: number } = {},
+): Promise<Located> {
+  const mustHitTest = options.mustHitTest ?? true;
+  const found = await waitForLocated(surface, target, { timeoutMs: options.timeoutMs, mustHitTest });
+  assertInteractive(found);
+  const fresh = await locate(surface, target);
+  assertInteractive(fresh);
+  if (!fresh.visible || (mustHitTest && !fresh.hitTestOk)) {
+    const covering = fresh.covering ? ` Covered by ${fresh.covering.tag}${fresh.covering.text ? ` text=${JSON.stringify(fresh.covering.text)}` : ""}.` : "";
+    throw new Error(`Target ${JSON.stringify(fresh.name)} moved before the click could be dispatched: ${describeRect(found.rect)} → ${describeRect(fresh.rect)} (visible=${fresh.visible}, hitTestOk=${fresh.hitTestOk}).${covering}`);
+  }
+  await clickAt(surface, fresh.center, { button: options.button, clickCount: options.clickCount });
+  return fresh;
+}
+
+/** Require every inspection in the interval to observe a missing or hidden target. */
+export async function assertAbsent(surface: Surface, target: Target, timeoutMs = 3000): Promise<void> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("Absence observation requires a positive duration");
+  const deadline = Date.now() + timeoutMs;
+  do {
+    try {
+      const found = await locate(surface, target);
+      if (found.visible) throw new Error(`Target remained visible: ${JSON.stringify(target)}; text ${JSON.stringify(found.text)}`);
+    } catch (error) {
+      if (!(error instanceof TargetNotFoundError)) throw error;
+    }
+    await new Promise(resolve => setTimeout(resolve, Math.min(100, Math.max(0, deadline - Date.now()))));
+  } while (Date.now() < deadline);
+}

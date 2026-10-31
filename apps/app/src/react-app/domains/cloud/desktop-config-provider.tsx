@@ -1,0 +1,763 @@
+/** @jsxImportSource react */
+import {
+  createContext,
+  useCallback,
+  use,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { MCP_QUICK_CONNECT } from "../../../app/constants";
+import { isIdexalOsExtensionEnabled, IDEXAL_EXTENSION_STATE_CHANGED } from "../settings/extension-state";
+import { desktopCapabilityConfig, desktopPolicyKeys } from "@idexal/types/den/desktop-policies";
+
+import {
+  checkDesktopAppRestriction,
+  type DesktopAppRestrictionChecker,
+} from "../../../app/cloud/desktop-app-restrictions";
+import {
+  createDenClient,
+  DenApiError,
+  ensureDenActiveOrganization,
+  getDenDesktopConfigCacheKey,
+  normalizeDenDesktopConfig,
+  readCachedDenDesktopConfig,
+  readDenBootstrapConfig,
+  readDenSettings,
+  setDenBootstrapConfig,
+  writeCachedDenDesktopConfig,
+  type DenDesktopConfig,
+} from "../../../app/lib/den";
+import { applyBrandAppName, applyBrandIcon, getBrandIconState } from "../../../app/lib/desktop";
+import { createIdexalOsServerClient } from "../../../app/lib/idexal-os-server";
+import {
+  denSessionUpdatedEvent,
+  denSettingsChangedEvent,
+} from "../../../app/lib/den-session-events";
+import { isDesktopRuntime } from "../../../app/lib/runtime-env";
+import { resolveIdexalOsConnection } from "../../shell/idexal-os-connection";
+import {
+  createConnectPolicyReconciler,
+  type ConnectPolicyReconciler,
+  type ConnectPolicySyncState,
+  type ConnectPolicyTarget,
+} from "./connect-policy-reconciler";
+import { useDenAuth } from "./den-auth-provider";
+import {
+  bootstrapBrandingFromDesktopConfig,
+  bootstrapBrandingNeedsSync,
+  brandIconReconcileAction,
+} from "./workspace-branding-restart";
+
+export type DesktopConfigStore = {
+  config: DenDesktopConfig;
+  loading: boolean;
+  freshConfigStatus: "pending" | "ready" | "failed";
+  refresh: () => Promise<void>;
+  refreshFresh: () => Promise<DenDesktopConfig>;
+  /**
+   * Stable checker function that matches the `DesktopAppRestrictionChecker`
+   * shape Solid passes to its stores. Useful when wiring restriction gates
+   * from non-hook code paths.
+   */
+  checkRestriction: DesktopAppRestrictionChecker;
+  /**
+   * Sanitized convergence state of the organization Connect policy against
+   * the local runtime. Informational only — nothing gates on it, so local
+   * work continues while reconciliation is pending or stalled.
+   */
+  connectPolicySync: ConnectPolicySyncState;
+};
+
+const DesktopConfigContext = createContext<DesktopConfigStore | undefined>(
+  undefined,
+);
+
+const DEFAULT_DESKTOP_CONFIG: DenDesktopConfig = {};
+// Like cloud provider sync: every 5 minutes, and when the member comes back to
+// the app or the network, so changed agent permissions arrive within minutes.
+const DESKTOP_CONFIG_REFRESH_MS = 5 * 60 * 1000;
+const DESKTOP_CONFIG_ITEMS = [
+  ...desktopPolicyKeys,
+  "allowedDesktopVersions",
+  "brandAppName",
+  "brandLogoUrl",
+  "brandIconUrl",
+  "brandAccentColor",
+  "automationsEnabled",
+  "dashboardEnabled",
+  "connectEnabled",
+  "onboardingPrompts",
+  "onboardingPromptDescriptions",
+  "agentControl",
+  "agentPermissions",
+  "connectorPermissions",
+  "defaultModel",
+  "desktopAccess",
+  "providerEntitlements",
+] as const satisfies readonly (keyof DenDesktopConfig)[];
+
+// The member a cached config was fetched for. The cache is per organization,
+// while agent permissions are per member, so another member's cached rules
+// never count as known.
+const CACHED_CONFIG_MEMBER_PREFIX = "idexal-os.den.desktopConfigMember:";
+
+function cachedConfigFor(cacheKey: string, userId: string): boolean {
+  try {
+    return userId !== "" && window.localStorage.getItem(`${CACHED_CONFIG_MEMBER_PREFIX}${cacheKey}`) === userId;
+  } catch {
+    return false;
+  }
+}
+
+function rememberCachedConfigMember(cacheKey: string, userId: string): void {
+  try {
+    if (userId) window.localStorage.setItem(`${CACHED_CONFIG_MEMBER_PREFIX}${cacheKey}`, userId);
+  } catch {
+    // A lost record only means the next start waits for a fresh config.
+  }
+}
+
+export function resolveConnectStateToPush(config: DenDesktopConfig): boolean | null {
+  return typeof config.connectEnabled === "boolean" ? config.connectEnabled : null;
+}
+
+/**
+ * Resolve the current local-runtime target for the Connect policy. The target
+ * key identifies one runtime lifetime: the desktop bridge reports a monotonic
+ * per-start generation (ports and tokens are sticky across restarts), so
+ * after a restart or a workspace switch the key changes and the policy must
+ * be reapplied to the new generation.
+ */
+export async function resolveConnectPolicyTarget(): Promise<ConnectPolicyTarget | null> {
+  const connection = await resolveIdexalOsConnection();
+  if (!connection.normalizedBaseUrl || !connection.resolvedHostToken) return null;
+  const { normalizedBaseUrl, resolvedToken, resolvedHostToken } = connection;
+  // The desktop runtime reports a monotonic per-start generation; remote or
+  // stored connections identify a lifetime by URL and host token instead.
+  const generation = connection.hostInfo?.generation ?? null;
+  return {
+    key: `${normalizedBaseUrl}\u0000${resolvedHostToken}\u0000${generation ?? ""}`,
+    apply: async (connectEnabled) => {
+      await createIdexalOsServerClient({
+        baseUrl: normalizedBaseUrl,
+        token: resolvedToken,
+        hostToken: resolvedHostToken,
+      }).setConnectState(connectEnabled);
+    },
+  };
+}
+
+type DesktopConfigItem = (typeof DESKTOP_CONFIG_ITEMS)[number];
+type DesktopConfigAction = {
+  item: DesktopConfigItem;
+  nextValue: DenDesktopConfig[DesktopConfigItem];
+  previousValue: DenDesktopConfig[DesktopConfigItem];
+};
+
+function isBootstrapBrandingActionItem(item: DesktopConfigItem): boolean {
+  return item === "brandAppName" || item === "brandLogoUrl" || item === "brandIconUrl";
+}
+
+function desktopConfigItemMatches(
+  previousValue: DenDesktopConfig[DesktopConfigItem],
+  nextValue: DenDesktopConfig[DesktopConfigItem],
+) {
+  if (Array.isArray(previousValue) || Array.isArray(nextValue)) {
+    if (!Array.isArray(previousValue) || !Array.isArray(nextValue)) return false;
+    if (previousValue.length !== nextValue.length) return false;
+    return previousValue.every((value, index) => value === nextValue[index]);
+  }
+  if (typeof previousValue === "object" || typeof nextValue === "object") {
+    return JSON.stringify(previousValue ?? null) === JSON.stringify(nextValue ?? null);
+  }
+
+  return previousValue === nextValue;
+}
+
+/**
+ * The local server enforces the member's agent permissions from the policy it
+ * read at sign-in; when Den reports different ones, it reads them again so the
+ * engines and the built-in browser pick them up without a relaunch.
+ */
+async function refreshServerManagedPolicy(): Promise<void> {
+  const connection = await resolveIdexalOsConnection();
+  if (!connection.normalizedBaseUrl || !connection.resolvedHostToken) return;
+  await createIdexalOsServerClient({
+    baseUrl: connection.normalizedBaseUrl,
+    token: connection.resolvedToken,
+    hostToken: connection.resolvedHostToken,
+  }).refreshManagedPolicy();
+}
+
+function getDesktopConfigActions(input: {
+  currentConfig: DenDesktopConfig;
+  latestConfig: DenDesktopConfig;
+}): DesktopConfigAction[] {
+  return DESKTOP_CONFIG_ITEMS.flatMap((item) => {
+    const previousValue = input.currentConfig[item];
+    const nextValue = input.latestConfig[item];
+
+    if (desktopConfigItemMatches(previousValue, nextValue)) return [];
+
+    return [{ item, previousValue, nextValue }];
+  });
+}
+
+type DesktopConfigProviderProps = {
+  children: ReactNode;
+};
+
+// Rewrites desktop-bootstrap.json branding to match `normalizedConfig` so a
+// cleared wordmark/icon cannot resurrect from the install/connect snapshot on
+// the next relaunch. No-op when the bootstrap already matches.
+function syncBootstrapBranding(normalizedConfig: DenDesktopConfig): void {
+  if (!isDesktopRuntime()) return;
+  const bootstrap = readDenBootstrapConfig();
+  if (!bootstrapBrandingNeedsSync(bootstrap, normalizedConfig)) return;
+  const branding = bootstrapBrandingFromDesktopConfig(normalizedConfig);
+  void setDenBootstrapConfig(
+    {
+      ...bootstrap,
+      brandAppName: branding.brandAppName,
+      brandLogoUrl: branding.brandLogoUrl,
+      brandIconUrl: branding.brandIconUrl,
+    },
+    { dispatchSettingsChanged: false },
+  ).catch(() => undefined);
+}
+
+// Level-based safety net behind the edge-triggered config diff: the shell
+// (Electron main) restores its cached/bootstrap brand icon on every launch,
+// so when a clear's edge is missed (stale localStorage cache, failed IPC,
+// org/base-URL switch changing the cache key), nothing would ever tell the
+// shell to reset and the branded icon would persist forever. After every
+// fresh config fetch, compare the shell's applied state to the config and
+// re-assert the expected icon plus the bootstrap branding snapshot.
+async function reconcileShellBranding(latestConfig: DenDesktopConfig): Promise<void> {
+  if (!isDesktopRuntime()) return;
+  const normalizedConfig = normalizeDenDesktopConfig(latestConfig);
+  syncBootstrapBranding(normalizedConfig);
+  const action = brandIconReconcileAction(normalizedConfig, await getBrandIconState());
+  if (!action) return;
+  const result = await applyBrandIcon(action.apply);
+  if (!result.ok) {
+    console.warn(`[brand-icon] Desktop icon reconcile was not applied: ${result.reason ?? "unknown failure"}`);
+  }
+}
+
+type DesktopConfigState = {
+  config: DenDesktopConfig;
+  loading: boolean;
+  freshConfigStatus: "pending" | "ready" | "failed";
+  /** `config` is this sign-in's, fresh or cached, or there is no organization to read one for. */
+  known: boolean;
+};
+
+/**
+ * React port of the Solid `DesktopConfigProvider`
+ * (`apps/app/src/app/cloud/desktop-config-provider.tsx` on dev).
+ *
+ * Fetches the org-scoped desktop policy config
+ * (`packages/types/den/desktop-policies.ts` shape) and caches it in
+ * localStorage. The runtime projection omits desktop restrictions while
+ * enforcement is suspended; Cloud entitlements, branding and the
+ * organization's allowed desktop versions stay intact.
+ * Re-fetches on Den session / settings events, when the member returns to
+ * the app or the network, and on a five-minute interval.
+ */
+export function DesktopConfigProvider({ children }: DesktopConfigProviderProps) {
+  const denAuth = useDenAuth();
+  const [desktopConfigState, setDesktopConfigState] = useState<DesktopConfigState>({
+    config: DEFAULT_DESKTOP_CONFIG,
+    loading: true,
+    freshConfigStatus: "pending",
+    known: false,
+  });
+  const { config, freshConfigStatus, known, loading } = desktopConfigState;
+  // Bumped whenever the browser tells us the Den session or settings changed.
+  const [settingsVersion, bumpSettingsVersion] = useReducer((value: number) => value + 1, 0);
+  // Monotonic run id — same guard-against-stale-resolution pattern as DenAuthProvider.
+  const refreshRunRef = useRef(0);
+  const connectPolicyReconcilerRef = useRef<ConnectPolicyReconciler | null>(null);
+  const [connectPolicySync, setConnectPolicySync] = useState<ConnectPolicySyncState>({ state: "idle" });
+  // Safe in-memory copy of the last config we actually applied. State drives
+  // rendering, while this ref lets the handler compare without stale closures.
+  const currentDesktopConfigRef = useRef<DenDesktopConfig>(DEFAULT_DESKTOP_CONFIG);
+  const devRefreshDesktopConfigRef = useRef<DenDesktopConfig | null>(null);
+  const isSignedIn = denAuth.isSignedIn;
+  const userId = denAuth.user?.id?.trim() ?? "";
+
+  useEffect(() => {
+    const syncBrowserControl = () => {
+      const browser = MCP_QUICK_CONNECT.find((item) => item.id === "idexal-os-browser");
+      const enabled = !!browser
+        && isIdexalOsExtensionEnabled(browser)
+        && config.allowBuiltInExtensions !== false
+        && config.agentControl?.browser !== false
+        && config.agentControl?.enabled !== false;
+      void window.__IDEXAL_ELECTRON__?.browser?.setControlEnabled?.(enabled);
+    };
+    syncBrowserControl();
+    window.addEventListener(IDEXAL_EXTENSION_STATE_CHANGED, syncBrowserControl);
+    return () => window.removeEventListener(IDEXAL_EXTENSION_STATE_CHANGED, syncBrowserControl);
+  }, [config.allowBuiltInExtensions, config.agentControl]);
+
+  // The built-in browser applies the member's website rules to every page it
+  // opens, from the last config received for this member (fresh, or cached
+  // while Den is unreachable), like every other desktop policy. A config
+  // without agent permissions opens every page, so organizations that do not
+  // use them see no change. Only before any config for this member is known
+  // (a first sign-in, another member's cache) does it wait, unless the
+  // organization's cached config shows it does not use agent permissions.
+  // When Den can't be reached it doesn't wait either: the desktop applies the
+  // latest rules stored on this computer, so the member keeps working.
+  const denUnreachable = freshConfigStatus === "failed";
+  const browserRules = useMemo(() => {
+    if (!isSignedIn && denAuth.status !== "checking") return [];
+    if (known) return (config.agentPermissions?.rules ?? []).filter(
+      (rule) => rule.action === "webfetch" || rule.action === "browser",
+    );
+    if (denUnreachable) return [];
+    const cached = readCachedDenDesktopConfig(getDenDesktopConfigCacheKey());
+    return cached && cached.agentPermissions === undefined ? [] : null;
+  }, [config.agentPermissions, denAuth.status, denUnreachable, isSignedIn, known]);
+  useEffect(() => {
+    void window.__IDEXAL_ELECTRON__?.browser?.setAgentPermissionRules?.(browserRules);
+  }, [browserRules]);
+
+  const applyDesktopConfigActions = useCallback((latestConfig: DenDesktopConfig) => {
+    const normalizedConfig = desktopCapabilityConfig(normalizeDenDesktopConfig(latestConfig));
+    const actions = getDesktopConfigActions({
+      currentConfig: currentDesktopConfigRef.current,
+      latestConfig: normalizedConfig,
+    });
+
+    if (actions.length === 0) {
+      // Entitlement-only changes (plan, proxy limits, quotas) produce no
+      // side-effect action, but they still have to reach the components that
+      // gate features on them; otherwise the UI keeps showing the previous
+      // plan's limits until an unrelated policy changes.
+      currentDesktopConfigRef.current = normalizedConfig;
+      setDesktopConfigState((current) => ({ ...current, config: normalizedConfig }));
+      return false;
+    }
+
+    const brandIconAction = actions.find((action) => action.item === "brandIconUrl");
+    if (brandIconAction) {
+      void applyBrandIcon(
+        typeof brandIconAction.nextValue === "string" ? brandIconAction.nextValue : null,
+      ).then((result) => {
+        if (!result.ok) {
+          console.warn(`[brand-icon] Desktop icon was not applied: ${result.reason ?? "unknown failure"}`);
+        }
+      }).catch((error: unknown) => {
+        console.warn("[brand-icon] Desktop icon apply request failed", error);
+      });
+    }
+
+    if (actions.some((action) => action.item === "agentPermissions")) {
+      void refreshServerManagedPolicy().catch(() => undefined);
+    }
+
+    const brandAppNameAction = actions.find((action) => action.item === "brandAppName");
+    if (brandAppNameAction) {
+      const appName = typeof brandAppNameAction.nextValue === "string" ? brandAppNameAction.nextValue : null;
+      document.title = appName ?? "idexal Os";
+      void applyBrandAppName(appName).catch(() => null);
+    }
+
+    // Keep desktop-bootstrap.json aligned so a cleared wordmark/icon cannot
+    // resurrect from the install/connect snapshot on the next relaunch.
+    const shouldSyncBootstrapBranding = actions.some((action) =>
+      isBootstrapBrandingActionItem(action.item),
+    );
+    if (shouldSyncBootstrapBranding) {
+      syncBootstrapBranding(normalizedConfig);
+    }
+
+    currentDesktopConfigRef.current = normalizedConfig;
+    setDesktopConfigState((current) => ({
+      ...current,
+      config: normalizedConfig,
+    }));
+    return true;
+  }, []);
+
+  const desktopConfigHandler = useCallback(async (requireFresh = false): Promise<DenDesktopConfig> => {
+    if (import.meta.env.DEV && requireFresh && devRefreshDesktopConfigRef.current) {
+      const nextConfig = desktopCapabilityConfig(devRefreshDesktopConfigRef.current);
+      applyDesktopConfigActions(nextConfig);
+      setDesktopConfigState((current) => ({ ...current, freshConfigStatus: "ready", known: true }));
+      void reconcileShellBranding(nextConfig).catch(() => undefined);
+      return nextConfig;
+    }
+
+    const currentRun = ++refreshRunRef.current;
+    const settings = readDenSettings();
+    const token = settings.authToken?.trim() ?? "";
+    const activeOrgId = settings.activeOrgId?.trim() ?? "";
+    const cacheKey = getDenDesktopConfigCacheKey();
+
+    if (!isSignedIn || !token || !activeOrgId) {
+      applyDesktopConfigActions(DEFAULT_DESKTOP_CONFIG);
+      setDesktopConfigState((current) => ({
+        ...current,
+        freshConfigStatus: "failed",
+        loading: false,
+        known: true,
+      }));
+      return DEFAULT_DESKTOP_CONFIG;
+    }
+
+    const cached = readCachedDenDesktopConfig(cacheKey);
+    const cachedKnown = Boolean(cached) && cachedConfigFor(cacheKey, userId);
+    if (cached) {
+      applyDesktopConfigActions(cached);
+      setDesktopConfigState((current) => ({ ...current, known: cachedKnown }));
+    }
+
+    if (!cached) {
+      setDesktopConfigState((current) => ({ ...current, loading: true }));
+    }
+
+    try {
+      const nextConfig = await createDenClient({
+        baseUrl: settings.baseUrl,
+        token,
+      }).getDesktopConfig(activeOrgId);
+
+      if (currentRun !== refreshRunRef.current) return nextConfig;
+
+      writeCachedDenDesktopConfig(cacheKey, nextConfig);
+      rememberCachedConfigMember(cacheKey, userId);
+      applyDesktopConfigActions(nextConfig);
+      setDesktopConfigState((current) => ({ ...current, freshConfigStatus: "ready", known: true }));
+      void reconcileShellBranding(nextConfig).catch(() => undefined);
+      return nextConfig;
+    } catch (error) {
+      if (currentRun !== refreshRunRef.current) {
+        if (requireFresh) throw error;
+        return cached ?? DEFAULT_DESKTOP_CONFIG;
+      }
+
+      // If the server says the active org doesn't exist, re-sync Better Auth
+      // so the next refresh hits a valid org. Same recovery path as Solid.
+      if (
+        error instanceof DenApiError &&
+        error.status === 404 &&
+        error.code === "organization_not_found"
+      ) {
+        await ensureDenActiveOrganization({ forceServerSync: true }).catch(
+          () => null,
+        );
+      }
+
+      const fallbackConfig = cached ?? DEFAULT_DESKTOP_CONFIG;
+      applyDesktopConfigActions(fallbackConfig);
+      setDesktopConfigState((current) => ({ ...current, freshConfigStatus: "failed", known: cachedKnown }));
+      if (requireFresh) throw error;
+      return fallbackConfig;
+    } finally {
+      if (currentRun === refreshRunRef.current) {
+        setDesktopConfigState((current) => ({ ...current, loading: false }));
+      }
+    }
+  }, [applyDesktopConfigActions, isSignedIn, userId]);
+
+  const refresh = useCallback(
+    async () => {
+      await desktopConfigHandler();
+    },
+    [desktopConfigHandler],
+  );
+  const refreshFresh = useCallback(
+    // Callers (updater checks and install re-check, recovery picker, onboarding
+    // branding) need the organization's current allowed desktop versions, so
+    // always fetch. When Den is unreachable or older and the fetch fails, fall
+    // back to the last known config instead of failing the update flow. Return
+    // the same capability projection the provider state uses so suspended
+    // desktop policy keys never reach them.
+    () => desktopConfigHandler(true)
+      .catch(() => currentDesktopConfigRef.current)
+      .then(desktopCapabilityConfig),
+    [desktopConfigHandler],
+  );
+
+  // Re-run whenever auth flips or Den settings change. Read the cache
+  // synchronously so gated UI never flickers through "unrestricted" just
+  // because we haven't finished the HTTP call yet.
+  useEffect(() => {
+    // settingsVersion is read to tie this effect to settings-change events.
+    void settingsVersion;
+
+    if (denAuth.status === "checking") {
+      setDesktopConfigState((current) => ({
+        ...current,
+        freshConfigStatus: "pending",
+        loading: true,
+        known: false,
+      }));
+      return;
+    }
+
+    if (!isSignedIn) {
+      applyDesktopConfigActions(DEFAULT_DESKTOP_CONFIG);
+      setDesktopConfigState((current) => ({
+        ...current,
+        freshConfigStatus: "failed",
+        loading: false,
+        known: true,
+      }));
+      return;
+    }
+
+    const cacheKey = getDenDesktopConfigCacheKey();
+    const cached = readCachedDenDesktopConfig(cacheKey);
+    applyDesktopConfigActions(cached ?? DEFAULT_DESKTOP_CONFIG);
+    setDesktopConfigState((current) => ({
+      ...current,
+      freshConfigStatus: "pending",
+      loading: !cached,
+      known: Boolean(cached) && cachedConfigFor(cacheKey, userId),
+    }));
+    void desktopConfigHandler();
+  }, [applyDesktopConfigActions, denAuth.status, desktopConfigHandler, isSignedIn, settingsVersion, userId]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const handleSettingsChanged = () => {
+      bumpSettingsVersion();
+    };
+
+    const handleAppResume = () => {
+      if (isSignedIn) void desktopConfigHandler();
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") handleAppResume();
+    };
+
+    window.addEventListener(denSessionUpdatedEvent, handleSettingsChanged);
+    window.addEventListener(denSettingsChangedEvent, handleSettingsChanged);
+    window.addEventListener("focus", handleAppResume);
+    window.addEventListener("online", handleAppResume);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    const interval = window.setInterval(() => {
+      if (!isSignedIn) return;
+      void desktopConfigHandler();
+      // Level-based safety net behind the event-driven reconciler: if a
+      // runtime-generation observation was ever missed, the periodic tick
+      // re-checks convergence (one target resolution; no request when the
+      // recorded tuple already matches).
+      connectPolicyReconcilerRef.current?.notifyTargetChanged();
+    }, DESKTOP_CONFIG_REFRESH_MS);
+
+    return () => {
+      window.removeEventListener(denSessionUpdatedEvent, handleSettingsChanged);
+      window.removeEventListener(denSettingsChangedEvent, handleSettingsChanged);
+      window.removeEventListener("focus", handleAppResume);
+      window.removeEventListener("online", handleAppResume);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.clearInterval(interval);
+    };
+  }, [desktopConfigHandler, isSignedIn]);
+
+  const connectEnabled = resolveConnectStateToPush(config);
+
+  // Reconciler lifecycle: created once per mount and rearmed by runtime
+  // observations. Every renderer path that (re)publishes the local server —
+  // boot, engine reload, workspace reconnect, debug restart — dispatches
+  // "idexal-os-server-settings-changed", which is the runtime-generation
+  // observation channel.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const reconciler = createConnectPolicyReconciler({
+      resolveTarget: resolveConnectPolicyTarget,
+      wait: (delayMs) => new Promise((resolveWait) => window.setTimeout(resolveWait, delayMs)),
+      onStateChange: setConnectPolicySync,
+    });
+    connectPolicyReconcilerRef.current = reconciler;
+    const handleRuntimeChanged = () => reconciler.notifyTargetChanged();
+    window.addEventListener("idexal-os-server-settings-changed", handleRuntimeChanged);
+    return () => {
+      window.removeEventListener("idexal-os-server-settings-changed", handleRuntimeChanged);
+      reconciler.dispose();
+      if (connectPolicyReconcilerRef.current === reconciler) {
+        connectPolicyReconcilerRef.current = null;
+      }
+    };
+  }, []);
+
+  // Desired-state feed: reconcile whenever the effective Connect policy or
+  // its source (the active organization) changes. `settingsVersion` ties this
+  // to Den session/settings events so an organization switch re-reconciles
+  // even when both organizations desire the same switch value.
+  useEffect(() => {
+    if (loading) return;
+    const reconciler = connectPolicyReconcilerRef.current;
+    if (!reconciler) return;
+    if (connectEnabled === null) {
+      reconciler.setDesired(null);
+      return;
+    }
+    const activeOrgId = readDenSettings().activeOrgId?.trim() ?? "";
+    reconciler.setDesired({ connectEnabled, revision: activeOrgId });
+  }, [connectEnabled, loading, settingsVersion]);
+
+  // Dev-only: expose a bridge so evals can inject config directly without
+  // requiring a cloud sign-in. This simply applies the config to React state.
+  useEffect(() => {
+    if (!import.meta.env.DEV || typeof window === "undefined") return;
+    const bridge = (configPayload: unknown) => {
+      applyDesktopConfigActions(
+        normalizeDenDesktopConfig(configPayload),
+      );
+    };
+    Object.defineProperty(window, "__idexalOsApplyDesktopConfig", { value: bridge, configurable: true });
+    const refreshBridge = (configPayload: unknown) => {
+      devRefreshDesktopConfigRef.current = normalizeDenDesktopConfig(configPayload);
+    };
+    Object.defineProperty(window, "__idexalOsSetDesktopConfigRefreshResult", {
+      value: refreshBridge,
+      configurable: true,
+    });
+    return () => {
+      Object.defineProperty(window, "__idexalOsApplyDesktopConfig", { value: undefined, configurable: true });
+      Object.defineProperty(window, "__idexalOsSetDesktopConfigRefreshResult", { value: undefined, configurable: true });
+    };
+  }, [applyDesktopConfigActions]);
+
+  const configRef = useRef(config);
+  configRef.current = config;
+  const checkRestriction = useCallback<DesktopAppRestrictionChecker>(
+    ({ restriction }) => checkDesktopAppRestriction({ config: configRef.current, restriction }),
+    [],
+  );
+  const value = useMemo<DesktopConfigStore>(() => {
+    return {
+      config,
+      freshConfigStatus,
+      loading,
+      refresh,
+      refreshFresh,
+      checkRestriction,
+      connectPolicySync,
+    };
+  }, [checkRestriction, config, freshConfigStatus, loading, refresh, refreshFresh, connectPolicySync]);
+
+  return (
+    <DesktopConfigContext.Provider value={value}>
+      {children}
+    </DesktopConfigContext.Provider>
+  );
+}
+
+export function useDesktopConfig(): DesktopConfigStore {
+  const context = use(DesktopConfigContext);
+  if (!context) {
+    throw new Error("useDesktopConfig must be used within a DesktopConfigProvider");
+  }
+  return context;
+}
+
+const allowWhenNoPolicyIsKnown: DesktopAppRestrictionChecker = () => false;
+
+/**
+ * Restriction sites are shared with control-action harnesses that render a
+ * component without the cloud provider. No provider means no organization
+ * policy is known, and the policy contract allows in that case; config
+ * readers stay strict because they have no meaningful default.
+ */
+function useOptionalDesktopConfig(): DesktopConfigStore | null {
+  return use(DesktopConfigContext) ?? null;
+}
+
+/**
+ * Convenience hook that returns the raw desktop policy flags
+ * (e.g. `{ allowZenModel: true }`). Callers usually just want the flags,
+ * not the loading state — feature gates should read through this.
+ */
+export function useOrgRestrictions(): DenDesktopConfig {
+  return useDesktopConfig().config;
+}
+
+/**
+ * Hook variant that returns the stable `checkRestriction` function so
+ * feature sites that already receive a "checker" (e.g. helpers ported
+ * from Solid stores) can call it directly without reshaping.
+ */
+export function useCheckDesktopRestriction(): DesktopAppRestrictionChecker {
+  const context = useOptionalDesktopConfig();
+  return context?.checkRestriction ?? allowWhenNoPolicyIsKnown;
+}
+
+/**
+ * Single-restriction hook — returns true/false for a specific key.
+ * Use this at feature sites that only care about one flag
+ * (e.g. `useDesktopRestriction("allowMultipleWorkspaces")`).
+ */
+export function useDesktopRestriction(
+  restriction: Parameters<DesktopAppRestrictionChecker>[0]["restriction"],
+): boolean {
+  return useDesktopConfig().checkRestriction({ restriction });
+}
+
+/**
+ * The organization's desktop access grant, as delivered by
+ * `GET /v1/me/desktop-config` under `desktopAccess`.
+ *
+ * - `granted` is `true` when the user's plan lets them open the desktop app.
+ * - `required` is informational: the public flavor always requires sign-in.
+ * - `planSlug` names the plan the decision was computed for (or `null` when
+ *   the organization has no active plan row).
+ *
+ * A missing block (a platform from before this field) is treated as
+ * `granted: true`, so a deployment that has not enabled the gate behaves
+ * exactly as before.
+ */
+export function useDesktopAccessGrant(): {
+  required: boolean;
+  granted: boolean;
+  planSlug: string | null;
+} {
+  const { config } = useDesktopConfig();
+  const access = config.desktopAccess;
+  return {
+    required: access?.required ?? false,
+    granted: access?.granted ?? true,
+    planSlug: access?.planSlug ?? null,
+  };
+}
+
+/**
+ * What the organization's plan lets this member use, provider by provider,
+ * as delivered by `GET /v1/me/desktop-config` under `providerEntitlements`.
+ *
+ * - `byok` is `false` only when the operator has turned members' own keys off
+ *   (or the plan denies them); a missing block means "not restricted", so a
+ *   platform from before this field keeps the BYOK surface visible.
+ * - `providers` lists the providers the plan covers; a missing list means the
+ *   desktop was not told and should not filter.
+ */
+export function useProviderEntitlements(): {
+  byok: boolean;
+  enabled: boolean | null;
+  plan: string | null;
+  providers: NonNullable<DenDesktopConfig["providerEntitlements"]>["providers"];
+  known: boolean;
+} {
+  const { config } = useDesktopConfig();
+  const entitlements = config.providerEntitlements;
+  return {
+    byok: entitlements?.byok ?? true,
+    enabled: entitlements?.enabled ?? null,
+    plan: entitlements?.plan ?? null,
+    providers: entitlements?.providers,
+    known: entitlements !== undefined,
+  };
+}

@@ -1,0 +1,24 @@
+:root {
+  color-scheme: light dark;
+  font-family: var(--font-sans, system-ui, sans-serif);
+  font-size: var(--font-text-sm-size, 13px);
+  line-height: var(--font-text-sm-line-height, 1.5);
+  color: var(--color-text-primary, CanvasText);
+  background: transparent;
+  --app-muted: var(--color-text-secondary, GrayText);
+  --app-radius: var(--border-radius-md, 0.45rem);
+  --app-padding: 16px;
+}
+body { margin: 0; padding: var(--app-padding); }
+p, h1 { margin: 0; font-size: inherit; overflow-wrap: anywhere; }
+h1 { font-weight: 500; flex: 1; }
+.connection { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; min-height: 40px; }
+.logo { width: 24px; height: 24px; display: grid; place-items: center; }
+.logo img { width: 20px; height: 20px; object-fit: contain; }
+.actions { display: flex; gap: 8px; }
+button { font: inherit; border: 0; border-radius: var(--app-radius); padding: 6px 12px; background: transparent; color: inherit; cursor: pointer; }
+button.primary { background: var(--color-text-primary, CanvasText); color: var(--color-background-primary, Canvas); }
+button:disabled { opacity: 0.5; cursor: default; }
+button:focus-visible { outline: 2px solid var(--color-ring-primary, Highlight); outline-offset: 2px; }
+.status { margin-top: 8px; color: var(--app-muted); }
+.placeholder { min-height: 40px; background: var(--color-background-secondary, ButtonFace); border-radius: var(--app-radius); }

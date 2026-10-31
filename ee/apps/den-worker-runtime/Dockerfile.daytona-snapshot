@@ -1,0 +1,113 @@
+# The builder runs on the BUILD host's native platform and cross-compiles for
+# the target: bun compiles idexal-os-server via --target and the web build is
+# arch-independent. This avoids emulating the whole toolchain under QEMU
+# (node's libuv crashes under qemu-x86_64: uv__io_poll EEXIST assert).
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS idexal-os-builder
+
+WORKDIR /src
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates curl git unzip \
+    python3 make g++ \
+  && npm install -g bun@1.3.14 \
+  && corepack enable \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY . .
+
+# python3/make/g++ above: better-sqlite3 v13 has no install script, but pnpm's
+# implicit node-gyp build for packages with a binding.gyp still compiles it
+# from source here, which needs a toolchain (v12 downloaded prebuilds instead).
+RUN pnpm install --frozen-lockfile --filter idexal-os-server... --filter @idexal/app...
+
+ARG TARGETARCH
+# .git is excluded from the Docker context; pass the UI source revision in.
+ARG IDEXAL_GIT_SHA
+
+RUN set -eux; \
+  arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+  case "$arch" in \
+    amd64) target="bun-linux-x64" ;; \
+    arm64) target="bun-linux-arm64" ;; \
+    *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+  esac; \
+  pnpm --filter idexal-os-server build; \
+  pnpm --filter idexal-os-server exec bun ./script/build.ts --outdir dist/bin --target "$target"; \
+  install -m 0755 "apps/server/dist/bin/idexal-os-server-${target}" /tmp/idexal-os-server; \
+  pnpm --filter @idexal/app build:web
+
+FROM node:22-bookworm-slim
+
+ARG IDEXAL_SERVER_VERSION=0.18.1
+ARG OPENCODE_VERSION
+ARG OPENCODE_DOWNLOAD_URL=
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates curl tar unzip \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=idexal-os-builder /tmp/idexal-os-server /usr/local/bin/idexal-os-server
+COPY --from=idexal-os-builder /src/apps/app/dist /opt/idexalos/web
+COPY --from=idexal-os-builder /src/apps/server/dist/opencode-plugins /opt/idexalos/opencode-plugins
+
+RUN set -eux; \
+  test -n "$OPENCODE_VERSION"; \
+  arch="$(dpkg --print-architecture)"; \
+  case "$arch" in \
+    amd64) asset="opencode-linux-x64-baseline.tar.gz" ;; \
+    arm64) asset="opencode-linux-arm64.tar.gz" ;; \
+    *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+  esac; \
+  url="$OPENCODE_DOWNLOAD_URL"; \
+  if [ -z "$url" ]; then \
+    url="https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/${asset}"; \
+  fi; \
+  tmpdir="$(mktemp -d)"; \
+  curl -fsSL "$url" -o "$tmpdir/$asset"; \
+  tar -xzf "$tmpdir/$asset" -C "$tmpdir"; \
+  binary="$(find "$tmpdir" -type f -name opencode | head -n 1)"; \
+  test -n "$binary"; \
+  install -m 0755 "$binary" /usr/local/bin/opencode; \
+  rm -rf "$tmpdir"
+
+# Bake the same pinned, integrity-checked v2 artifact the server would install.
+# No package lifecycle scripts and no runtime downloads, even after a restore.
+COPY --from=idexal-os-builder /src/constants.json /tmp/idexal-os-constants.json
+COPY --from=idexal-os-builder /src/apps/server/src/opencode-v2-artifacts.json /tmp/opencode-v2-artifacts.json
+RUN set -eux; \
+  arch="$(dpkg --print-architecture)"; \
+  case "$arch" in \
+    amd64) platform="linux-x64-baseline" ;; \
+    arm64) platform="linux-arm64" ;; \
+    *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+  esac; \
+  url="$(node -e 'const c=require("/tmp/idexal-os-constants.json"); const a=require("/tmp/opencode-v2-artifacts.json"); if(a.version!==c.opencodeV2Version) throw new Error("OpenCode v2 artifact pin mismatch"); process.stdout.write(a.platforms[process.argv[1]].url)' "$platform")"; \
+  tmpdir="$(mktemp -d)"; \
+  curl -fsSL "$url" -o "$tmpdir/opencode2.tgz"; \
+  node -e 'const fs=require("node:fs"); const crypto=require("node:crypto"); const a=require("/tmp/opencode-v2-artifacts.json"); const actual="sha512-"+crypto.createHash("sha512").update(fs.readFileSync(process.argv[2])).digest("base64"); if(actual!==a.platforms[process.argv[1]].integrity) throw new Error("OpenCode v2 archive integrity mismatch")' "$platform" "$tmpdir/opencode2.tgz"; \
+  tar -xzf "$tmpdir/opencode2.tgz" -C "$tmpdir" package/bin/opencode; \
+  install -m 0755 "$tmpdir/package/bin/opencode" /usr/local/bin/opencode2; \
+  rm -rf "$tmpdir" /tmp/opencode-v2-artifacts.json
+
+ENV IDEXAL_OPENCODE2_BIN=/usr/local/bin/opencode2
+
+# Runtime asserts run the target-arch binaries. Keep them on in CI (native
+# amd64 runners); disable only for local cross-builds, where bun binaries die
+# with "Illegal instruction" under qemu-x86_64 even though they run fine on
+# real hardware.
+ARG RUNTIME_ASSERTS=1
+RUN if [ "$RUNTIME_ASSERTS" = "1" ]; then \
+    test -f /opt/idexalos/opencode-plugins/idexal-os-extensions-preview.js \
+    && test -f /opt/idexalos/opencode-plugins/idexal-os-capabilities-knowledge.js \
+    && test -f /opt/idexalos/opencode-plugins/idexal-os-office-attachments.js \
+    && test -f /opt/idexalos/opencode-plugins/idexal-os-anthropic-adaptive-thinking.js \
+    && test -f /opt/idexalos/opencode-plugins/idexal-os-anthropic-tool-schema.js \
+    && test "$(idexal-os-server --version)" = "$IDEXAL_SERVER_VERSION" \
+    && opencode --version \
+    && "$IDEXAL_OPENCODE2_BIN" --version | node -e 'const fs=require("node:fs"); const expected=require("/tmp/idexal-os-constants.json").opencodeV2Version; const actual=fs.readFileSync(0,"utf8").trim().replace(/^opencode v?/, ""); if(actual!==expected) throw new Error(`OpenCode v2 version mismatch: ${actual}`)'; \
+  else \
+    echo "RUNTIME_ASSERTS disabled (cross-build); binaries must be verified on target hardware"; \
+  fi \
+  && rm /tmp/idexal-os-constants.json
+
+CMD ["sleep", "infinity"]

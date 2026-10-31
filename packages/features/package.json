@@ -1,0 +1,45 @@
+{
+  "name": "@idexal/features",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "idexal Os feature registry: declare a feature once, resolve it per deployment and organization.",
+  "exports": {
+    ".": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/index.d.ts",
+        "default": "./src/index.ts"
+      },
+      "development": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./registry": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/registry.d.ts",
+        "default": "./src/registry.ts"
+      },
+      "development": "./src/registry.ts",
+      "default": "./src/registry.ts"
+    },
+    "./resolve": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/resolve.d.ts",
+        "default": "./src/resolve.ts"
+      },
+      "development": "./src/resolve.ts",
+      "default": "./src/resolve.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "node --test src/*.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "typescript": "^5.6.3"
+  }
+}

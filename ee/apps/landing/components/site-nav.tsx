@@ -1,0 +1,331 @@
+"use client";
+
+import Link from "next/link";
+import { ChevronDown, Menu, X } from "lucide-react";
+import { useEffect, useId, useRef, useState } from "react";
+import { IdexalOsMark } from "./idexal-os-mark";
+import { DownloadLink } from "./download-link";
+import { LP_PRODUCTS } from "./lp-products";
+
+type ActivePage =
+  | "home"
+  | "pricing"
+  | "download"
+  | "enterprise"
+  | "connect"
+  | "cloud"
+  | "dashboard"
+  | "docs"
+  | "roadmap";
+
+type Props = {
+  stars: string;
+  callUrl?: string;
+  mobilePrimaryHref?: string;
+  mobilePrimaryLabel?: string;
+  active?: ActivePage;
+};
+
+type NavItem = {
+  href: string;
+  label: string;
+  key: ActivePage;
+  newTab?: boolean;
+};
+
+export function SiteNav(props: Props) {
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const [scrolled, setScrolled] = useState(false);
+
+  useEffect(() => {
+    const onScroll = () => setScrolled(window.scrollY > 10);
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+  const callHref = props.callUrl || "/enterprise#book";
+  const cloudSignupHref = "https://os.idexal.com?mode=sign-up";
+  const mobilePrimaryHref = props.mobilePrimaryHref || cloudSignupHref;
+  const mobilePrimaryLabel = props.mobilePrimaryLabel || "Get Started for free";
+  const callExternal = /^https?:\/\//.test(callHref);
+  const mobilePrimaryExternal = /^https?:\/\//.test(mobilePrimaryHref);
+  const navItems: NavItem[] = [
+    { href: "/enterprise", label: "Enterprise", key: "enterprise" },
+    { href: "/pricing", label: "Pricing", key: "pricing" },
+    { href: "/docs", label: "Docs", key: "docs", newTab: true },
+    { href: "/roadmap", label: "Roadmap", key: "roadmap" }
+  ];
+  const productsActive =
+    props.active === "connect" ||
+    props.active === "cloud" ||
+    props.active === "download";
+
+  const opensInNewTab = (item: NavItem) =>
+    item.newTab || /^(?:https?:\/\/)/.test(item.href);
+
+  const navLink = (isActive: boolean) =>
+    isActive
+      ? "text-[#011627]"
+      : "text-gray-600 transition-colors hover:text-[#011627]";
+
+  return (
+    <header className={`sticky top-0 z-20 w-full transition-all duration-300 ${scrolled ? "bg-white/80 shadow-sm backdrop-blur-md" : ""}`}>
+      <div className="mx-auto flex w-full max-w-[1176px] flex-col px-6">
+        <div className="grid min-h-[97px] grid-cols-[auto_1fr_auto] items-center py-4">
+          <Link
+            href="/"
+            aria-label="idexal Os"
+            className="group inline-flex items-center"
+            onClick={() => setMobileOpen(false)}
+          >
+            <IdexalOsMark className="h-[30px] w-[38px] transition-opacity group-hover:opacity-80" />
+          </Link>
+
+          <nav className="hidden items-center justify-start gap-7 pl-10 text-[14px] font-normal lg:flex">
+            <ProductsMenu active={productsActive} />
+            {navItems.map(item => (
+              <Link
+                key={item.key}
+                href={item.href}
+                {...(opensInNewTab(item) ? { target: "_blank", rel: "noreferrer" } : {})}
+                className={navLink(props.active === item.key)}
+              >
+                {item.label}
+              </Link>
+            ))}
+          </nav>
+
+          <div className="col-start-3 flex items-center gap-4">
+            <a
+              href="https://github.com/idexal/idexalOs"
+              className="hidden h-9 items-center gap-2 rounded-full border border-[var(--lp-border)] bg-white px-3.5 text-sm font-normal text-[var(--lp-muted)] transition-colors hover:text-[var(--lp-ink)] sm:flex"
+              rel="noreferrer"
+              target="_blank"
+              aria-label="idexal Os GitHub stars"
+            >
+              <svg
+                className="h-4 w-4"
+                fill="currentColor"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+              >
+                <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.041-1.416-4.041-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z" />
+              </svg>
+              {props.stars}
+            </a>
+            <DownloadLink
+              className="lp-pill-primary lp-pill-sm !hidden lg:!inline-flex"
+            >
+              Download idexal Os
+            </DownloadLink>
+            <button
+              type="button"
+              className="rounded-full p-2 text-[#011627] transition-colors hover:bg-white/70 lg:hidden"
+              onClick={() => setMobileOpen(current => !current)}
+              aria-expanded={mobileOpen}
+              aria-label={
+                mobileOpen ? "Close navigation menu" : "Open navigation menu"
+              }
+            >
+              {mobileOpen ? <X size={24} /> : <Menu size={24} />}
+            </button>
+          </div>
+        </div>
+
+        {mobileOpen ? (
+          <div className="mb-8 rounded-xl bg-white p-4 shadow-[0_1px_3px_rgba(1,22,39,0.08)] lg:hidden">
+            <div className="flex flex-col gap-1 text-[15px] font-medium text-gray-700">
+              <div className="px-4 pb-1 pt-2 text-[13px] font-normal text-[var(--lp-muted)]">
+                Products
+              </div>
+              {LP_PRODUCTS.map(product => (
+                <Link
+                  key={product.key}
+                  href={product.href}
+                  className="flex items-center gap-3 rounded-2xl px-4 py-3 text-[var(--lp-ink)]"
+                  onClick={() => setMobileOpen(false)}
+                >
+                  <product.icon size={16} strokeWidth={1.5} aria-hidden="true" />
+                  {product.name}
+                </Link>
+              ))}
+              <div className="mx-4 my-2 border-t border-[var(--lp-border)]" />
+              {navItems.map(item => (
+                <Link
+                  key={item.key}
+                  href={item.href}
+                  {...(opensInNewTab(item) ? { target: "_blank", rel: "noreferrer" } : {})}
+                  className={`rounded-2xl px-4 py-3 ${navLink(
+                    props.active === item.key
+                  )}`}
+                  onClick={() => setMobileOpen(false)}
+                >
+                  {item.label}
+                </Link>
+              ))}
+            </div>
+
+            <div className="mt-4 flex flex-col gap-3">
+              <Link
+                href={mobilePrimaryHref}
+                className="doc-button text-sm"
+                rel={mobilePrimaryExternal ? "noreferrer" : undefined}
+                target={mobilePrimaryExternal ? "_blank" : undefined}
+                onClick={() => setMobileOpen(false)}
+              >
+                {mobilePrimaryLabel}
+              </Link>
+              <a
+                href={callHref}
+                className="secondary-button text-sm"
+                rel={callExternal ? "noreferrer" : undefined}
+                target={callExternal ? "_blank" : undefined}
+              >
+                Book a call
+              </a>
+              <a
+                href="https://github.com/idexal/idexalOs"
+                className="inline-flex items-center justify-center gap-2 rounded-lg border border-gray-100 bg-white px-4 py-2 text-sm font-medium text-gray-500 shadow-[0_1px_2px_rgba(17,24,39,0.06)] transition-colors hover:text-[#011627]"
+                rel="noreferrer"
+                target="_blank"
+              >
+                <svg
+                  className="h-4 w-4"
+                  fill="currentColor"
+                  viewBox="0 0 24 24"
+                  aria-hidden="true"
+                >
+                  <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.041-1.416-4.041-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z" />
+                </svg>
+                GitHub {props.stars}
+              </a>
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </header>
+  );
+}
+
+function ProductsMenu({ active }: { active: boolean }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const panelId = useId();
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (
+        rootRef.current &&
+        event.target instanceof Node &&
+        !rootRef.current.contains(event.target)
+      ) {
+        setOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setOpen(false);
+        buttonRef.current?.focus();
+      }
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    return () => {
+      if (closeTimer.current) clearTimeout(closeTimer.current);
+    };
+  }, []);
+
+  const cancelClose = () => {
+    if (closeTimer.current) {
+      clearTimeout(closeTimer.current);
+      closeTimer.current = null;
+    }
+  };
+  const scheduleClose = () => {
+    cancelClose();
+    closeTimer.current = setTimeout(() => setOpen(false), 120);
+  };
+
+  return (
+    <div
+      ref={rootRef}
+      className="relative"
+      onPointerEnter={event => {
+        if (event.pointerType !== "mouse") return;
+        cancelClose();
+        setOpen(true);
+      }}
+      onPointerLeave={event => {
+        if (event.pointerType !== "mouse") return;
+        scheduleClose();
+      }}
+      onBlur={event => {
+        if (
+          event.relatedTarget instanceof Node &&
+          rootRef.current?.contains(event.relatedTarget)
+        ) {
+          return;
+        }
+        setOpen(false);
+      }}
+    >
+      <button
+        ref={buttonRef}
+        type="button"
+        aria-expanded={open}
+        aria-controls={panelId}
+        onClick={() => setOpen(current => !current)}
+        className={`inline-flex items-center gap-1.5 rounded-md focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-[var(--lp-ink)] ${
+          active || open
+            ? "text-[#011627]"
+            : "text-gray-600 transition-colors hover:text-[#011627]"
+        }`}
+      >
+        Products
+        <ChevronDown
+          size={14}
+          strokeWidth={1.75}
+          aria-hidden="true"
+          className={`transition-transform duration-150 ease-out motion-reduce:transition-none ${open ? "rotate-180" : ""}`}
+        />
+      </button>
+      <div
+        id={panelId}
+        hidden={!open}
+        className="absolute left-[-18px] top-full z-30 pt-3"
+      >
+        <ul className="lp-products-menu w-[420px] rounded-2xl bg-white p-2">
+          {LP_PRODUCTS.map(product => (
+            <li key={product.key}>
+              <Link
+                href={product.href}
+                onClick={() => setOpen(false)}
+                className="flex h-12 items-center gap-3 rounded-[10px] px-2.5 text-[var(--lp-ink)] transition-colors duration-150 hover:bg-[#f5f7fa] focus-visible:bg-[#f5f7fa] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--lp-ink)]"
+              >
+                <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[var(--lp-tonal)]">
+                  <product.icon size={16} strokeWidth={1.5} aria-hidden="true" />
+                </span>
+                <span className="flex-1 text-[14px] font-medium tracking-[-0.005em]">
+                  {product.name}
+                </span>
+                <span className="w-[130px] shrink-0 text-right text-[13px] text-[var(--lp-muted)]">
+                  {product.fact}
+                </span>
+              </Link>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+}

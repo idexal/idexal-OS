@@ -1,0 +1,3187 @@
+import { useSyncExternalStore } from "react";
+import { liveProviderSyncStatusQueryKey, usesLiveProviderSync, type LiveProviderSyncStatus } from "./live-provider-sync";
+import { isOpencodeV2BaseUrl } from "@/app/lib/opencode-v2-adapter";
+import { CLOUD_MODEL_CONFIG_VERSION } from "@idexal/types/cloud-model-fast";
+
+import { applyEdits, modify, parse } from "jsonc-parser";
+import type {
+  ProviderAuthAuthorization,
+  ProviderListResponse,
+} from "@opencode-ai/sdk/v2/client";
+
+import { t } from "../../../../i18n";
+import {
+  createDenClient,
+  readDenSettings,
+  resolveDenBaseUrls,
+  type DenOrgLlmProvider,
+  type DenOrgLlmProviderConnection,
+} from "../../../../app/lib/den";
+import { readGatewayUsageScope } from "../../../../app/lib/gateway-usage-scope";
+import { refreshGatewayUsageAfterCloudSync } from "../../cloud/gateway-usage-refresh";
+import { getIdexalOsGatewayOrigin } from "../../../../app/lib/gateway-runtime";
+import { unwrap, waitForHealthy } from "../../../../app/lib/opencode";
+import {
+  readOpencodeConfig,
+  writeOpencodeConfig,
+  engineRestart,
+  workspaceIdexalOsRead,
+  workspaceIdexalOsWrite,
+} from "../../../../app/lib/desktop";
+import { IdexalOsServerError } from "../../../../app/lib/idexal-os-server";
+import type {
+  Client,
+  ProviderListItem,
+  WorkspaceDisplay,
+} from "../../../../app/types";
+import { isDesktopRuntime, safeStringify } from "../../../../app/utils";
+import {
+  compareProviders,
+  filterProviderList,
+} from "../../../../app/utils/providers";
+import { getReactQueryClient } from "../../../infra/query-client";
+import {
+  clearProviderListQueries,
+  ensureProviderCatalogQuery,
+  ensureProviderListQuery,
+  getConnectedProviderItems,
+} from "../../../infra/provider-list-query";
+import type {
+  IdexalOsCloudProviderSyncRun,
+  IdexalOsCloudProviderSyncSkippedProvider,
+} from "../../../../app/lib/idexal-os-server";
+import type { IdexalOsServerStoreSnapshot } from "../idexal-os-server-store";
+
+/**
+ * The slice of the idexal-os-server store this store actually consumes.
+ * The settings route passes the full store; the session route passes a
+ * lightweight endpoint-backed adapter (previously forced through `as never`).
+ */
+export type ProviderAuthIdexalOsServer = {
+  getSnapshot: () => Pick<
+    IdexalOsServerStoreSnapshot,
+    "idexalOsServerStatus" | "idexalOsServerClient"
+  > & {
+    idexalOsServerAuth?: { token?: string; hostToken?: string };
+    idexalOsServerHostInfo?: { generation: number | null } | null;
+    idexalOsServerCapabilities: { config?: { read?: boolean; write?: boolean }; providerSync?: boolean } | null;
+  };
+};
+import {
+  denSettingsChangedEvent,
+  denSessionUpdatedEvent,
+  type DenSessionUpdatedDetail,
+} from "../../../../app/lib/den-session-events";
+import {
+  readWorkspaceCloudImports,
+  withWorkspaceCloudImports,
+  type CloudImportedProvider,
+} from "../../../../app/cloud/import-state";
+import {
+  buildRuntimeProviderPatch,
+  formatConfigWithoutCloudProvider,
+  getCloudManagedProviderId,
+  getCloudProviderEnv,
+  getProviderModelIds,
+  isCloudManagedProviderKey,
+  isCloudProviderOutOfSync,
+  isGatewayModelReady,
+  type GatewayConnectProvider,
+  resolveCloudProviderCredentials,
+} from "./cloud-provider-config";
+import {
+  buildCustomProviderConfig,
+  CUSTOM_PROVIDER_ID_PREFIX,
+  customProviderBaseUrlError,
+  customProviderIdForName,
+  formatConfigWithCustomProvider,
+  formatConfigWithoutCustomProvider,
+  parseCustomProviderModelIds,
+  type CustomProviderInput,
+} from "./custom-provider-config";
+import { dispatchNewProviders, dispatchProviderCatalogChanged } from "../../../../app/lib/provider-events";
+import { hasPendingGatewayModelSelection } from "./pending-gateway-model-selection";
+import { readManagedDisabledProviders, updateManagedDisabledProviders } from "../managed-engine-config";
+import {
+  DESKTOP_RESTRICTION_OPENCODE_PROVIDER_ID,
+  isDesktopProviderBlocked,
+  type DesktopAppRestrictionChecker,
+} from "../../../../app/cloud/desktop-app-restrictions";
+import {
+  isProviderAddRestrictedByDesktopPolicy,
+  isProviderAllowedByDesktopPolicy,
+  resolveEntitledOrgDefaultModel,
+  type ModelEntitlementOption,
+} from "./provider-policy";
+import {
+  readStoredDefaultModel,
+  writeStoredDefaultModel,
+} from "../../../kernel/model-config";
+import { DEFAULT_MODEL } from "../../../../app/constants";
+
+type ProviderReturnFocusTarget = "none" | "composer";
+type CloudProviderSyncReason =
+  | "sign_in"
+  | "app_launch"
+  | "app_resume"
+  | "model_picker_open"
+  | "new_chat"
+  | "settings_cloud_opened"
+  | "manual";
+
+type CloudProviderSyncWorkResult = void | IdexalOsCloudProviderSyncRun | { status: "live" };
+
+type GlobalCloudProviderSyncOutcome = { contextKey: string } & (
+  | { status: "completed"; result: CloudProviderSyncWorkResult }
+  | { status: "cancelled" }
+  | { status: "failed"; error: unknown }
+);
+
+type GlobalCloudProviderSyncBatch = {
+  contextKey: string;
+  sync: () => Promise<CloudProviderSyncWorkResult>;
+  isCurrent?: () => boolean;
+  promise: Promise<GlobalCloudProviderSyncOutcome>;
+  resolve: (outcome: GlobalCloudProviderSyncOutcome) => void;
+};
+
+let lastGlobalProviderDisposeRefreshAt = 0;
+let activeGlobalCloudProviderSync: GlobalCloudProviderSyncBatch | null = null;
+let trailingGlobalCloudProviderSync: GlobalCloudProviderSyncBatch | null = null;
+let loggedGatewayCloudProviderSyncSkip = false;
+
+async function enqueueGlobalCloudProviderSync(
+  contextKey: string,
+  sync: () => Promise<CloudProviderSyncWorkResult>,
+  isCurrent?: () => boolean,
+): Promise<CloudProviderSyncWorkResult> {
+  // A trailing batch may be replaced or forwarded to an active batch. Match
+  // the executed context, not the context its waiters originally requested.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (isCurrent?.() === false) return;
+    const outcome = await queueGlobalCloudProviderSync(contextKey, sync, isCurrent);
+    if (isCurrent?.() === false) return;
+    if (outcome.contextKey !== contextKey || outcome.status === "cancelled") continue;
+    if (outcome.status === "failed") throw outcome.error;
+    return outcome.result;
+  }
+  throw new Error("Cloud provider sync context kept changing. Try again.");
+}
+
+function queueGlobalCloudProviderSync(
+  contextKey: string,
+  sync: () => Promise<CloudProviderSyncWorkResult>,
+  isCurrent?: () => boolean,
+): Promise<GlobalCloudProviderSyncOutcome> {
+  if (activeGlobalCloudProviderSync?.contextKey === contextKey && activeGlobalCloudProviderSync.isCurrent?.() !== false) {
+    const trailing = trailingGlobalCloudProviderSync;
+    if (trailing && trailing.contextKey !== contextKey) {
+      trailingGlobalCloudProviderSync = null;
+      void activeGlobalCloudProviderSync.promise.then(trailing.resolve);
+    }
+    return activeGlobalCloudProviderSync.promise;
+  }
+  if (trailingGlobalCloudProviderSync) {
+    if (trailingGlobalCloudProviderSync.contextKey !== contextKey || trailingGlobalCloudProviderSync.isCurrent?.() === false) {
+      trailingGlobalCloudProviderSync.contextKey = contextKey;
+      trailingGlobalCloudProviderSync.sync = sync;
+      trailingGlobalCloudProviderSync.isCurrent = isCurrent;
+    }
+    return trailingGlobalCloudProviderSync.promise;
+  }
+
+  const batch = createGlobalCloudProviderSyncBatch(contextKey, sync, isCurrent);
+  if (activeGlobalCloudProviderSync) {
+    trailingGlobalCloudProviderSync = batch;
+  } else {
+    startGlobalCloudProviderSync(batch);
+  }
+  return batch.promise;
+}
+
+function createGlobalCloudProviderSyncBatch(
+  contextKey: string,
+  sync: () => Promise<CloudProviderSyncWorkResult>,
+  isCurrent?: () => boolean,
+): GlobalCloudProviderSyncBatch {
+  let resolve: (outcome: GlobalCloudProviderSyncOutcome) => void = () => undefined;
+  const promise = new Promise<GlobalCloudProviderSyncOutcome>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { contextKey, sync, isCurrent, promise, resolve };
+}
+
+function startGlobalCloudProviderSync(batch: GlobalCloudProviderSyncBatch): void {
+  activeGlobalCloudProviderSync = batch;
+  const contextKey = batch.contextKey;
+  if (batch.isCurrent?.() === false) {
+    batch.resolve({ contextKey, status: "cancelled" });
+    finishGlobalCloudProviderSync(batch);
+    return;
+  }
+  void batch.sync().then(
+    (result) => {
+      batch.resolve(batch.isCurrent?.() === false
+        ? { contextKey, status: "cancelled" }
+        : { contextKey, status: "completed", result });
+      finishGlobalCloudProviderSync(batch);
+    },
+    (error) => {
+      batch.resolve(batch.isCurrent?.() === false
+        ? { contextKey, status: "cancelled" }
+        : { contextKey, status: "failed", error });
+      finishGlobalCloudProviderSync(batch);
+    },
+  );
+}
+
+function finishGlobalCloudProviderSync(batch: GlobalCloudProviderSyncBatch): void {
+  if (activeGlobalCloudProviderSync !== batch) return;
+  activeGlobalCloudProviderSync = null;
+  const trailing = trailingGlobalCloudProviderSync;
+  trailingGlobalCloudProviderSync = null;
+  if (trailing) startGlobalCloudProviderSync(trailing);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stableConfigValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(stableConfigValue);
+  }
+  if (!isRecord(value)) {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, stableConfigValue(value[key])]),
+  );
+}
+
+function canonicalConfig(raw: string): string | null {
+  const parsed: unknown = parse(raw);
+  if (parsed === undefined && raw.trim()) return null;
+  return JSON.stringify(stableConfigValue(parsed ?? {}));
+}
+
+function configsAreSemanticallyEqual(left: string, right: string): boolean {
+  if (left === right) return true;
+  const leftCanonical = canonicalConfig(left);
+  const rightCanonical = canonicalConfig(right);
+  return leftCanonical !== null && leftCanonical === rightCanonical;
+}
+
+export type ProviderAuthMethod = {
+  type: "oauth" | "api" | "cloud";
+  label: string;
+  methodIndex?: number;
+};
+
+export type CloudProviderSyncError = {
+  kind: "error" | "conflict" | "needs_credential" | "needs_server";
+  message: string;
+};
+
+export type ProviderAuthProvider = {
+  id: string;
+  name: string;
+  env: string[];
+};
+
+export type ProviderOAuthStartResult = {
+  methodIndex: number;
+  authorization: ProviderAuthAuthorization;
+};
+
+/**
+ * Server-side sync facts the Cloud Providers settings rows derive from when
+ * the local server owns provider sync: whether an engine reload is still owed
+ * (materialized providers are not served yet) and which Den-granted providers
+ * the server skipped, keyed by cloudProviderId. Null while the legacy
+ * renderer-side import path owns the state (remote/hostless workspaces).
+ */
+export type CloudProviderServerSyncState = {
+  lastRun?: { at: string | number; status: "applied" | "noop" | "failed" | "no_session"; message?: string } | null;
+  lastVerifiedAt?: string | number | null;
+  reloadPending: boolean;
+  skippedProviders: Record<string, IdexalOsCloudProviderSyncSkippedProvider>;
+};
+
+export type ProviderLoadState = {
+  status: "idle" | "loading" | "ready" | "error";
+  error: string | null;
+};
+
+export type ProviderAuthStoreSnapshot = {
+  providerLoadState: ProviderLoadState;
+  gatewayUsageProviderScope?: number | null;
+  providerAuthModalOpen: boolean;
+  providerAuthBusy: boolean;
+  providerAuthError: string | null;
+  providerAuthMethods: Record<string, ProviderAuthMethod[]>;
+  providerAuthPreferredProviderId: string | null;
+  providerAuthProviders: ProviderAuthProvider[];
+  cloudOrgProviders: DenOrgLlmProvider[];
+  importedCloudProviders: Record<string, CloudImportedProvider>;
+  cloudProviderServerSync: CloudProviderServerSyncState | null;
+  lastSyncError: Record<string, CloudProviderSyncError>;
+};
+
+type CreateProviderAuthStoreOptions = {
+  client: () => Client | null;
+  providers: () => ProviderListItem[];
+  providerDefaults: () => Record<string, string>;
+  providerConnectedIds: () => string[];
+  disabledProviders: () => string[];
+  checkDesktopAppRestriction: DesktopAppRestrictionChecker;
+  selectedWorkspaceDisplay: () => WorkspaceDisplay;
+  providerBaseUrl: () => string;
+  selectedWorkspaceRoot: () => string;
+  runtimeWorkspaceId: () => string | null;
+  ensureRuntimeWorkspaceId?: () => Promise<string | null | undefined>;
+  idexalOsServer: ProviderAuthIdexalOsServer;
+  setProviders: (value: ProviderListItem[]) => void;
+  setProviderDefaults: (value: Record<string, string>) => void;
+  setProviderConnectedIds: (value: string[]) => void;
+  setDisabledProviders: (value: string[]) => void;
+  markOpencodeConfigReloadRequired: () => void;
+  focusPromptSoon?: () => void;
+};
+
+type MutableState = {
+  providerLoadState: ProviderLoadState;
+  gatewayUsageProviderScope?: number | null;
+  providerAuthModalOpen: boolean;
+  providerAuthBusy: boolean;
+  providerAuthError: string | null;
+  providerAuthMethods: Record<string, ProviderAuthMethod[]>;
+  providerAuthPreferredProviderId: string | null;
+  providerAuthReturnFocusTarget: ProviderReturnFocusTarget;
+  cloudOrgProviders: DenOrgLlmProvider[];
+  importedCloudProviders: Record<string, CloudImportedProvider>;
+  cloudProviderServerSync: CloudProviderServerSyncState | null;
+  lastSyncError: Record<string, CloudProviderSyncError>;
+};
+
+class CloudProviderImportConflictError extends Error {}
+class CloudProviderNeedsCredentialError extends Error {}
+class CloudProviderNeedsServerError extends Error {}
+
+function providerListModelEntitlementOptions(
+  providerList: ProviderListResponse | null | undefined,
+): ModelEntitlementOption[] {
+  return getConnectedProviderItems(providerList).flatMap((provider) =>
+    Object.keys(provider.models ?? {}).map((modelID) => ({
+      providerID: provider.id,
+      modelID,
+    })),
+  );
+}
+
+export type ProviderAuthStore = ReturnType<typeof createProviderAuthStore>;
+
+export function createProviderAuthStore(options: CreateProviderAuthStoreOptions) {
+  const listeners = new Set<() => void>();
+
+  let snapshot: ProviderAuthStoreSnapshot;
+  let disposed = false;
+  let started = false;
+  let denSessionCleanup: (() => void) | null = null;
+  let lastWorkspaceKey = "";
+
+  let state: MutableState = {
+    providerLoadState: { status: "idle", error: null },
+    providerAuthModalOpen: false,
+    providerAuthBusy: false,
+    providerAuthError: null,
+    providerAuthMethods: {},
+    providerAuthPreferredProviderId: null,
+    providerAuthReturnFocusTarget: "none",
+    cloudOrgProviders: [],
+    importedCloudProviders: {},
+    cloudProviderServerSync: null,
+    lastSyncError: {},
+  };
+
+  let verifiedGatewayUsageContext = "";
+  let cloudOrgProvidersLoadKey = "";
+  let cloudOrgProvidersInFlightKey = "";
+  let cloudOrgProvidersInFlight: Promise<DenOrgLlmProvider[]> | null = null;
+  let cloudOrgProvidersGeneration = 0;
+  let cloudProviderSyncContextKey = "";
+  let lastDenSessionPushKey = "";
+  let lastDenIdentityPushKey = "";
+  let denSessionDelivery: { key: string; controller: AbortController } | null = null;
+  let denSessionPushInFlight: { mode: "identity" | "sync"; promise: Promise<boolean> } | null = null;
+
+  const emitChange = () => {
+    for (const listener of listeners) listener();
+   };
+
+  // Providers that are not connected yet, loaded only when the Connect modal
+  // opens. The everyday provider list holds connected providers only.
+  let providerCatalog: ProviderListItem[] = [];
+
+  const getProviderAuthProviders = (): ProviderAuthProvider[] => {
+    const merged = new Map<string, ProviderAuthProvider>();
+    const restrictToCloud = options.checkDesktopAppRestriction({ restriction: "allowCustomProviders" });
+
+    for (const provider of [...options.providers(), ...providerCatalog]) {
+      const id = provider.id?.trim();
+      if (!id || merged.has(id)) continue;
+      if (
+        !isProviderAllowedByDesktopPolicy({
+          providerId: id,
+          restrictToCloud,
+          checkRestriction: options.checkDesktopAppRestriction,
+        })
+      ) {
+        continue;
+      }
+      merged.set(id, {
+        id,
+        name: provider.name?.trim() || id,
+        env: Array.isArray(provider.env) ? provider.env : [],
+      });
+    }
+
+    for (const provider of state.cloudOrgProviders) {
+      const id = getCloudManagedProviderId(provider);
+      if (!id || merged.has(id)) continue;
+      if (
+        !isProviderAllowedByDesktopPolicy({
+          providerId: id,
+          restrictToCloud,
+          checkRestriction: options.checkDesktopAppRestriction,
+        })
+      ) {
+        continue;
+      }
+      merged.set(id, {
+        id,
+        name: provider.name.trim() || id,
+        env: provider.runtimeEnvKeys ?? getCloudProviderEnv(provider.providerConfig),
+      });
+    }
+
+    return Array.from(merged.values()).toSorted(compareProviders);
+  };
+
+  const resolveIdexalOsConfigTarget = async (mode: "read" | "write") => {
+    const idexalOsSnapshot = options.idexalOsServer.getSnapshot();
+    const idexalOsClient = idexalOsSnapshot.idexalOsServerClient;
+    let idexalOsWorkspaceId = options.runtimeWorkspaceId()?.trim() || null;
+    if (!idexalOsWorkspaceId && idexalOsSnapshot.idexalOsServerStatus === "connected" && idexalOsClient) {
+      idexalOsWorkspaceId = (await options.ensureRuntimeWorkspaceId?.())?.trim() || null;
+    }
+    const hasIdexalOsTarget =
+      idexalOsSnapshot.idexalOsServerStatus === "connected" &&
+      Boolean(idexalOsClient && idexalOsWorkspaceId);
+    const canUseIdexalOsServer =
+      hasIdexalOsTarget &&
+      idexalOsSnapshot.idexalOsServerCapabilities?.config?.[mode] !== false;
+    return {
+      idexalOsClient,
+      idexalOsWorkspaceId,
+      hasIdexalOsTarget,
+      canUseIdexalOsServer,
+    };
+  };
+
+  const serverHandlesProviderSync = () => {
+    const idexalOsSnapshot = options.idexalOsServer.getSnapshot();
+    return Boolean(
+      idexalOsSnapshot.idexalOsServerStatus === "connected" &&
+      idexalOsSnapshot.idexalOsServerCapabilities?.providerSync === true &&
+      idexalOsSnapshot.idexalOsServerAuth?.hostToken?.trim() &&
+      idexalOsSnapshot.idexalOsServerClient,
+    );
+  };
+
+  const getDenSessionDeliveryKey = () => {
+    const idexalOsSnapshot = options.idexalOsServer.getSnapshot();
+    const settings = readDenSettings();
+    if (!serverHandlesProviderSync() || !settings.authToken?.trim() || !settings.activeOrgId?.trim()) return "";
+    return JSON.stringify([
+      settings.apiBaseUrl ?? resolveDenBaseUrls(settings).apiBaseUrl,
+      settings.activeOrgId.trim(),
+      settings.authToken.trim(),
+      idexalOsSnapshot.idexalOsServerClient?.baseUrl,
+      idexalOsSnapshot.idexalOsServerAuth?.token,
+      idexalOsSnapshot.idexalOsServerAuth?.hostToken,
+      idexalOsSnapshot.idexalOsServerHostInfo?.generation,
+    ]);
+  };
+
+  const invalidateDenSessionDelivery = () => {
+    denSessionDelivery?.controller.abort();
+    denSessionDelivery = null;
+    denSessionPushInFlight = null;
+    lastDenSessionPushKey = "";
+    lastDenIdentityPushKey = "";
+    cloudProviderSyncContextKey = "";
+  };
+
+  const syncDenSessionDelivery = () => {
+    const key = getDenSessionDeliveryKey();
+    if (key !== (denSessionDelivery?.key ?? "")) {
+      invalidateDenSessionDelivery();
+      verifiedGatewayUsageContext = "";
+      mutateState((current) => ({ ...current, cloudProviderServerSync: null, gatewayUsageProviderScope: null }));
+      if (key && !disposed) {
+        denSessionDelivery = { key, controller: new AbortController() };
+      }
+    }
+    return denSessionDelivery;
+  };
+
+  const isCurrentDenSessionDelivery = (delivery: typeof denSessionDelivery) =>
+    !disposed && delivery !== null && delivery === denSessionDelivery && delivery.key === getDenSessionDeliveryKey();
+
+  const pushDenSession = (mode: "identity" | "sync" = "sync", force = false): Promise<boolean> => {
+    const delivery = syncDenSessionDelivery();
+    const idexalOsClient = options.idexalOsServer.getSnapshot().idexalOsServerClient;
+    if (!delivery || !idexalOsClient || disposed) return Promise.resolve(false);
+    if (!force && delivery.key === (mode === "identity" ? lastDenIdentityPushKey : lastDenSessionPushKey)) return Promise.resolve(true);
+    if (denSessionPushInFlight) {
+      if (denSessionPushInFlight.mode === mode) return denSessionPushInFlight.promise;
+      // Readiness can recover during early verification, including an older
+      // server's 404. Serialize the full PUT, but never dedupe it against identity.
+      return denSessionPushInFlight.promise.catch(() => false).then(() =>
+        isCurrentDenSessionDelivery(delivery) ? pushDenSession(mode, force) : false);
+    }
+    if (mode === "sync" && !hasCloudProviderSyncPrerequisites()) return Promise.resolve(false);
+    if (mode === "sync") lastDenSessionPushKey = "";
+    const settings = readDenSettings();
+    const apiBaseUrl = settings.apiBaseUrl ?? resolveDenBaseUrls(settings).apiBaseUrl;
+    const token = settings.authToken?.trim() ?? "";
+    const orgId = settings.activeOrgId?.trim() ?? "";
+    const request = (async () => {
+      // Policy verification can fail transiently with 403 policy_unavailable;
+      // auth denials and rate limits remain terminal.
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        if (!isCurrentDenSessionDelivery(delivery)) return false;
+        try {
+          const put = mode === "identity" ? idexalOsClient.putDenIdentity : idexalOsClient.putDenSession;
+          await put({ baseUrl: apiBaseUrl, token, orgId }, delivery.controller.signal);
+          if (!isCurrentDenSessionDelivery(delivery)) return false;
+          lastDenIdentityPushKey = delivery.key;
+          lastDenSessionPushKey = mode === "sync" ? delivery.key : "";
+          return true;
+        } catch (error) {
+          if (!isCurrentDenSessionDelivery(delivery)) return false;
+          const retryable = error instanceof IdexalOsServerError
+            ? (error.status === 403 && error.code === "policy_unavailable") || error.status === 408 || error.status >= 500
+            : error instanceof TypeError || (error instanceof Error && error.message === "Request timed out.");
+          if (!retryable || attempt === 2) throw error;
+          await new Promise<void>((resolve) => {
+            const finish = () => {
+              clearTimeout(timer);
+              delivery.controller.signal.removeEventListener("abort", finish);
+              resolve();
+            };
+            const timer = setTimeout(finish, 250 * 2 ** attempt);
+            delivery.controller.signal.addEventListener("abort", finish, { once: true });
+          });
+        }
+      }
+      return false;
+    })();
+    denSessionPushInFlight = { mode, promise: request };
+    const clearInFlight = () => {
+      if (denSessionPushInFlight?.promise === request) {
+        denSessionPushInFlight = null;
+      }
+    };
+    void request.then(clearInFlight, clearInFlight);
+    return request;
+  };
+
+  const refreshSnapshot = () => {
+    snapshot = {
+      providerLoadState: state.providerLoadState,
+      gatewayUsageProviderScope: state.gatewayUsageProviderScope === readGatewayUsageScope().generation
+        && verifiedGatewayUsageContext === getCloudProviderSyncContextKey()
+        && state.cloudProviderServerSync?.reloadPending !== true ? state.gatewayUsageProviderScope : null,
+      providerAuthModalOpen: state.providerAuthModalOpen,
+      providerAuthBusy: state.providerAuthBusy,
+      providerAuthError: state.providerAuthError,
+      providerAuthMethods: state.providerAuthMethods,
+      providerAuthPreferredProviderId: state.providerAuthPreferredProviderId,
+      providerAuthProviders: getProviderAuthProviders(),
+      cloudOrgProviders: state.cloudOrgProviders,
+      importedCloudProviders: state.importedCloudProviders,
+      cloudProviderServerSync: state.cloudProviderServerSync,
+      lastSyncError: state.lastSyncError,
+    };
+  };
+
+  const mutateState = (updater: (current: MutableState) => MutableState) => {
+    state = updater(state);
+    refreshSnapshot();
+    emitChange();
+  };
+
+  const setStateField = <K extends keyof MutableState>(
+    key: K,
+    value: MutableState[K],
+  ) => {
+    if (Object.is(state[key], value)) return;
+    mutateState((current) => ({ ...current, [key]: value }));
+  };
+
+  const readCloudProviderBaseUrl = (provider: DenOrgLlmProviderConnection) => {
+    const options = provider.providerConfig.options;
+    if (options && typeof options === "object" && !Array.isArray(options)) {
+      const baseURL = "baseURL" in options ? options.baseURL : undefined;
+      if (typeof baseURL === "string" && baseURL.trim()) return baseURL.trim().replace(/\/api\/v1\/?$/, "");
+    }
+    const api = provider.providerConfig.api;
+    if (typeof api === "string" && api.trim()) return api.trim().replace(/\/api\/v1\/?$/, "");
+    return "";
+  };
+
+  const mirrorCloudProviderEnv = async (
+    provider: DenOrgLlmProviderConnection,
+    apiKey: string,
+    resolvedEnvEntries: Array<{ key: string; value: string }>,
+  ) => {
+    const trimmedKey = apiKey.trim();
+    if (!trimmedKey) return;
+    const idexalOsClient = options.idexalOsServer.getSnapshot().idexalOsServerClient;
+    if (!idexalOsClient) return;
+    const entries = [...resolvedEnvEntries];
+    if (entries.length === 0) {
+      entries.push(
+        ...getCloudProviderEnv(provider.providerConfig)
+          .slice(0, 1)
+          .map((key) => ({ key, value: trimmedKey })),
+      );
+    }
+    if (provider.source === "idexalos") {
+      if (!entries.some((entry) => entry.key === "IDEXAL_API_KEY")) {
+        entries.unshift({ key: "IDEXAL_API_KEY", value: trimmedKey });
+      }
+      const baseUrl = readCloudProviderBaseUrl(provider);
+      if (baseUrl) entries.push({ key: "IDEXAL_INFERENCE_BASE_URL", value: baseUrl });
+    }
+    if (entries.length === 0) return;
+    await idexalOsClient.upsertUserEnv(entries);
+  };
+
+  const readWorkspaceIdexalOsConfigRecord = async (): Promise<
+    Record<string, unknown>
+  > => {
+    const root = options.selectedWorkspaceRoot().trim();
+    const isLocalWorkspace =
+      options.selectedWorkspaceDisplay().workspaceType === "local";
+    const { idexalOsClient, idexalOsWorkspaceId, hasIdexalOsTarget, canUseIdexalOsServer } =
+      await resolveIdexalOsConfigTarget("read");
+
+    if (canUseIdexalOsServer && idexalOsClient && idexalOsWorkspaceId) {
+      const config = await idexalOsClient.getConfig(idexalOsWorkspaceId);
+      return config.idexalos ?? {};
+    }
+
+    if (hasIdexalOsTarget) {
+      return {};
+    }
+
+    if (isLocalWorkspace && isDesktopRuntime() && root) {
+      return (await workspaceIdexalOsRead({
+        workspacePath: root,
+      })) as unknown as Record<string, unknown>;
+    }
+
+    return {};
+  };
+
+  const writeWorkspaceIdexalOsConfigRecord = async (
+    config: Record<string, unknown>,
+    isCurrent = () => true,
+  ) => {
+    const root = options.selectedWorkspaceRoot().trim();
+    const isLocalWorkspace =
+      options.selectedWorkspaceDisplay().workspaceType === "local";
+    const { idexalOsClient, idexalOsWorkspaceId, hasIdexalOsTarget, canUseIdexalOsServer } =
+      await resolveIdexalOsConfigTarget("write");
+    if (!isCurrent()) return false;
+
+    if (canUseIdexalOsServer && idexalOsClient && idexalOsWorkspaceId) {
+      await idexalOsClient.patchConfig(idexalOsWorkspaceId, { idexalos: config });
+      return true;
+    }
+
+    if (hasIdexalOsTarget) {
+      return false;
+    }
+
+    if (isLocalWorkspace && isDesktopRuntime() && root) {
+      const result = await workspaceIdexalOsWrite({
+        workspacePath: root,
+        config: config as never,
+      });
+      const typed = result as { ok: boolean; stderr?: string; stdout?: string };
+      if (!typed.ok) {
+        throw new Error(
+          typed.stderr || typed.stdout || "Failed to write .opencode/idexal-os.json",
+        );
+      }
+      return true;
+    }
+
+    return false;
+  };
+
+  const cloudImportWorkspaceKey = () => JSON.stringify([
+    currentWorkspaceKey(),
+    options.selectedWorkspaceDisplay().workspaceType,
+    options.providerBaseUrl(),
+    options.idexalOsServer.getSnapshot().idexalOsServerClient?.baseUrl,
+  ]);
+
+  const refreshImportedCloudProviders = async (refreshOptions?: { strict?: boolean; verifiedScope?: number }) => {
+    try {
+      if (serverHandlesProviderSync()) {
+        const delivery = syncDenSessionDelivery();
+        const contextKey = getCloudProviderSyncContextKey();
+        const idexalOsClient = options.idexalOsServer.getSnapshot().idexalOsServerClient;
+        if (!idexalOsClient) throw new Error("idexal Os server unavailable.");
+        const status = await idexalOsClient.getCloudProviderSyncStatus();
+        if (!isCurrentDenSessionDelivery(delivery) || contextKey !== getCloudProviderSyncContextKey()) return state.importedCloudProviders;
+        const next = Object.fromEntries(status.providers.map((provider) => [provider.cloudProviderId, provider]));
+        if (status.hasSession && refreshOptions?.verifiedScope === readGatewayUsageScope().generation) {
+          verifiedGatewayUsageContext = contextKey;
+        }
+        mutateState((current) => ({
+          ...current, importedCloudProviders: next,
+          gatewayUsageProviderScope: status.hasSession && verifiedGatewayUsageContext === contextKey
+            ? refreshOptions?.verifiedScope ?? current.gatewayUsageProviderScope : null,
+          cloudProviderServerSync: {
+            ...(status.lastRun === undefined || status.lastRun === null ? {} : { lastRun: status.lastRun }),
+            ...(() => {
+              const verifiedAt = status.lastRun && (status.lastRun.status === "applied" || status.lastRun.status === "noop") ? status.lastRun.at : current.cloudProviderServerSync?.lastVerifiedAt;
+              return verifiedAt === undefined ? {} : { lastVerifiedAt: verifiedAt };
+            })(),
+            reloadPending: status.reloadPending,
+            skippedProviders: Object.fromEntries((status.hasSession ? status.skippedProviders.filter((provider) => provider.reason !== "member_auth_required" || verifiedGatewayUsageContext === contextKey) : []).map((provider) => [provider.credentialSetId ? `${provider.cloudProviderId}:${provider.credentialSetId}` : provider.cloudProviderId, provider])),
+          },
+        }));
+        return next;
+      }
+      // Legacy renderer-side import path (remote/hostless workspaces): the
+      // server sync facts do not apply here.
+      if (state.cloudProviderServerSync !== null) {
+        setStateField("cloudProviderServerSync", null);
+      }
+      const generation = cloudOrgProvidersGeneration;
+      const contextKey = getCloudProviderSyncContextKey();
+      const workspaceKey = cloudImportWorkspaceKey();
+      const config = await readWorkspaceIdexalOsConfigRecord();
+      const cloudImports = readWorkspaceCloudImports(config);
+      const next = cloudImports.providers;
+      if (
+        disposed || generation !== cloudOrgProvidersGeneration ||
+        contextKey !== getCloudProviderSyncContextKey() || workspaceKey !== cloudImportWorkspaceKey()
+      ) {
+        const cleanupGeneration = cloudOrgProvidersGeneration;
+        const isCurrent = () => !disposed && cleanupGeneration === cloudOrgProvidersGeneration &&
+          workspaceKey === cloudImportWorkspaceKey() && !readDenSettings().authToken?.trim() && !serverHandlesProviderSync();
+        for (const importedProvider of Object.values(next)) {
+          if (!isCurrent()) break;
+          await removeCloudProviderInternal(importedProvider.cloudProviderId, {
+            silent: true, importedProvider, isCurrent,
+          }).catch(() => undefined);
+          if (!isCurrent()) break;
+          removeProviderFromState(importedProvider.providerId);
+          if (readStoredDefaultModel().providerID === importedProvider.providerId) {
+            writeStoredDefaultModel(DEFAULT_MODEL);
+          }
+        }
+        return state.importedCloudProviders;
+      }
+      // Guard: don't overwrite non-empty import state with an empty read.
+      // This prevents a transient server unavailability (e.g. during engine
+      // restart) from clearing a just-completed import from the badge.
+      const hasNext = Object.keys(next).length > 0;
+      const hasCurrent = Object.keys(state.importedCloudProviders).length > 0;
+      if (hasNext || !hasCurrent) {
+        setStateField("importedCloudProviders", next);
+      }
+      return next;
+    } catch (error) {
+      if (refreshOptions?.strict) {
+        throw error;
+      }
+      // Preserve existing state on read failure to avoid losing import state.
+      return state.importedCloudProviders;
+    }
+  };
+
+  const persistImportedCloudProviders = async (
+    nextProviders: Record<string, CloudImportedProvider>,
+    isCurrent = () => true,
+  ) => {
+    const config = await readWorkspaceIdexalOsConfigRecord();
+    if (!isCurrent()) return;
+    const cloudImports = readWorkspaceCloudImports(config);
+    const nextCloudImports = {
+      ...cloudImports,
+      providers: nextProviders,
+    };
+    const nextConfig = withWorkspaceCloudImports(config, {
+      ...nextCloudImports,
+    });
+    const persisted = await writeWorkspaceIdexalOsConfigRecord(nextConfig, isCurrent);
+    if (!isCurrent()) return;
+    if (!persisted) {
+      throw new Error(
+        "idexal Os server unavailable. Connect to manage imported cloud providers.",
+      );
+    }
+    setStateField("importedCloudProviders", nextProviders);
+  };
+
+  const readProjectConfigFile = async () => {
+    const root = options.selectedWorkspaceRoot().trim();
+    const isLocalWorkspace =
+      options.selectedWorkspaceDisplay().workspaceType === "local";
+    const { idexalOsClient, idexalOsWorkspaceId, hasIdexalOsTarget, canUseIdexalOsServer } =
+      await resolveIdexalOsConfigTarget("read");
+
+    if (canUseIdexalOsServer && idexalOsClient && idexalOsWorkspaceId) {
+      return await idexalOsClient.readOpencodeConfigFile(idexalOsWorkspaceId, "project");
+    }
+
+    if (hasIdexalOsTarget) {
+      throw new Error("idexal Os server config API is unavailable for this workspace.");
+    }
+
+    if (isLocalWorkspace && isDesktopRuntime() && root) {
+      return await readOpencodeConfig("project", root);
+    }
+
+    return null;
+  };
+
+  const writeProjectConfigFile = async (content: string, isCurrent = () => true) => {
+    const root = options.selectedWorkspaceRoot().trim();
+    const isLocalWorkspace =
+      options.selectedWorkspaceDisplay().workspaceType === "local";
+    const { idexalOsClient, idexalOsWorkspaceId, hasIdexalOsTarget, canUseIdexalOsServer } =
+      await resolveIdexalOsConfigTarget("write");
+    if (!isCurrent()) return false;
+
+    if (canUseIdexalOsServer && idexalOsClient && idexalOsWorkspaceId) {
+      const result = await idexalOsClient.writeOpencodeConfigFile(
+        idexalOsWorkspaceId,
+        "project",
+        content,
+      ) as { ok: boolean; stderr?: string; stdout?: string };
+      if (!result.ok) {
+        throw new Error(result.stderr || result.stdout || "Failed to write opencode.jsonc");
+      }
+      return true;
+    }
+
+    if (hasIdexalOsTarget) {
+      throw new Error("idexal Os server config API is unavailable for this workspace.");
+    }
+
+    if (isLocalWorkspace && isDesktopRuntime() && root) {
+      const result = await writeOpencodeConfig("project", root, content) as { ok: boolean; stderr?: string; stdout?: string };
+      if (!result.ok) {
+        throw new Error(result.stderr || result.stdout || "Failed to write opencode.jsonc");
+      }
+      return true;
+    }
+
+    return false;
+  };
+
+  /**
+   * Upsert/delete cloud-managed provider entries in the workspace's runtime
+   * opencode config (server-side SQLite merged into OPENCODE_CONFIG). Record
+   * values upsert, explicit `null` deletes — per-key on the server, so there
+   * is no read-modify-write race and no edit of the user's opencode.jsonc.
+   */
+  const patchRuntimeProviders = async (update: Record<string, unknown>, isCurrent = () => true) => {
+    const { idexalOsClient, idexalOsWorkspaceId, canUseIdexalOsServer } =
+      await resolveIdexalOsConfigTarget("write");
+    if (!isCurrent()) return;
+    if (!canUseIdexalOsServer || !idexalOsClient || !idexalOsWorkspaceId) {
+      throw new Error("idexal Os server unavailable. Connect to manage cloud providers.");
+    }
+    await idexalOsClient.patchConfig(idexalOsWorkspaceId, {
+      opencode: { provider: update },
+    });
+  };
+
+  const patchRuntimeProviderAndImportedCloudProviders = async (
+    providerUpdate: Record<string, unknown>,
+    nextProviders: Record<string, CloudImportedProvider>,
+  ) => {
+    const { idexalOsClient, idexalOsWorkspaceId, canUseIdexalOsServer } =
+      await resolveIdexalOsConfigTarget("write");
+    if (!canUseIdexalOsServer || !idexalOsClient || !idexalOsWorkspaceId) {
+      throw new Error("idexal Os server unavailable. Connect to manage cloud providers.");
+    }
+    const config = await readWorkspaceIdexalOsConfigRecord();
+    const cloudImports = readWorkspaceCloudImports(config);
+    const nextConfig = withWorkspaceCloudImports(config, {
+      ...cloudImports,
+      providers: nextProviders,
+    });
+    await idexalOsClient.patchConfig(idexalOsWorkspaceId, {
+      opencode: { provider: providerUpdate },
+      idexalos: nextConfig,
+    });
+    setStateField("importedCloudProviders", nextProviders);
+  };
+
+  /**
+   * Best-effort migration: pre-runtime builds wrote cloud provider blocks
+   * into the project opencode.jsonc. Strip them so the runtime entry is the
+   * single owner (and stale blocks from older builds stop shadowing state).
+   */
+  const stripLegacyCloudProviderBlocks = async (providerIds: Array<string | null | undefined>, isCurrent = () => true) => {
+    const ids = [...new Set(providerIds.flatMap((id) => (id?.trim() ? [id.trim()] : [])))];
+    if (ids.length === 0) return;
+    try {
+      await updateProjectConfigFile((raw) => {
+        let next = raw;
+        for (const id of ids) {
+          next = formatConfigWithoutCloudProvider(next, id, options.disabledProviders());
+        }
+        return next;
+      }, undefined, isCurrent);
+    } catch {
+      // Legacy cleanup only — the runtime entry already owns the provider.
+    }
+  };
+
+  const updateProjectConfigFile = async (
+    updater: (raw: string) => string,
+    fallbackUpdate?: (config: Record<string, unknown>) => Record<string, unknown>,
+    isCurrent = () => true,
+  ) => {
+    const configFile = await readProjectConfigFile() as { content?: string } | null;
+    if (!isCurrent()) return false;
+    if (configFile) {
+      const raw = configFile.content?.trim()
+        ? configFile.content
+        : '{\n  "$schema": "https://opencode.ai/config.json"\n}\n';
+      const next = updater(raw);
+      if (configsAreSemanticallyEqual(raw, next)) {
+        return false;
+      }
+      return await writeProjectConfigFile(next, isCurrent);
+    }
+
+    if (!fallbackUpdate) {
+      return false;
+    }
+
+    const c = options.client();
+    const idexalOsSnapshot = options.idexalOsServer.getSnapshot();
+    const workspaceId = options.runtimeWorkspaceId();
+    const workspaceType = options.selectedWorkspaceDisplay().workspaceType;
+    const canUseManagedRuntime = Boolean(idexalOsSnapshot.idexalOsServerClient && workspaceId?.trim() && workspaceType === "local");
+    if (!c && !canUseManagedRuntime) {
+      throw new Error(t("providers.not_connected"));
+    }
+    const config = c ? unwrap(await c.config.get()) : {};
+    const next = fallbackUpdate(config);
+    await updateManagedDisabledProviders({
+      opencodeClient: c,
+      idexalOsClient: idexalOsSnapshot.idexalOsServerClient,
+      workspaceId,
+      workspaceType,
+      disabledProviders: next.disabled_providers,
+      currentConfig: config,
+      removeFallbackKeyWhenEmpty: true,
+    });
+    return true;
+  };
+
+  const normalizeDisabledProviders = (value: unknown) =>
+    Array.isArray(value)
+      ? [
+          ...new Set(
+            value
+              .filter((entry): entry is string => typeof entry === "string")
+              .map((entry) => entry.trim())
+              .filter(Boolean),
+          ),
+        ]
+      : [];
+
+  const formatConfigWithProviderDisabledState = (
+    raw: string,
+    providerId: string,
+    disabled: boolean,
+  ) => {
+    const resolvedProviderId = providerId.trim();
+    let updated = raw.trim()
+      ? raw
+      : '{\n  "$schema": "https://opencode.ai/config.json"\n}\n';
+    const parsed = parse(updated) as Record<string, unknown> | undefined;
+    const currentDisabled = normalizeDisabledProviders(parsed?.disabled_providers);
+    const nextDisabled = disabled
+      ? [...currentDisabled.filter((entry) => entry !== resolvedProviderId), resolvedProviderId]
+      : currentDisabled.filter((entry) => entry !== resolvedProviderId);
+
+    const disabledEdits = modify(
+      updated,
+      ["disabled_providers"],
+      nextDisabled.length ? nextDisabled : undefined,
+      { formattingOptions: { insertSpaces: true, tabSize: 2 } },
+    );
+    updated = applyEdits(updated, disabledEdits);
+    return updated.endsWith("\n") ? updated : `${updated}\n`;
+  };
+
+  const ensureProjectProviderDisabledState = async (
+    providerId: string,
+    disabled: boolean,
+  ) => {
+    const resolvedProviderId = providerId.trim();
+    if (!resolvedProviderId) {
+      throw new Error(t("providers.provider_id_required"));
+    }
+
+    const currentDisabled = normalizeDisabledProviders(options.disabledProviders());
+    const nextDisabled = disabled
+      ? [...currentDisabled.filter((entry) => entry !== resolvedProviderId), resolvedProviderId]
+      : currentDisabled.filter((entry) => entry !== resolvedProviderId);
+
+    if (
+      nextDisabled.length === currentDisabled.length &&
+      nextDisabled.every((entry, index) => entry === currentDisabled[index])
+    ) {
+      return false;
+    }
+
+    // Prefer runtime OPENCODE_CONFIG injection (server SQLite) so OpenCode Zen
+    // and other built-in/env-backed providers can be disabled without editing
+    // the user's opencode.jsonc. Fall back to project config only when the
+    // managed runtime endpoint is unavailable.
+    const c = options.client();
+    const idexalOsSnapshot = options.idexalOsServer.getSnapshot();
+    const workspaceId = options.runtimeWorkspaceId();
+    const workspaceType = options.selectedWorkspaceDisplay().workspaceType;
+    // Before the first workspace exists the client reaches the engine root,
+    // whose config belongs to no workspace a person will open. Leave project
+    // provider rules alone until there is a workspace to hold them.
+    if (!workspaceId?.trim() && !options.selectedWorkspaceRoot().trim()) {
+      return false;
+    }
+    const canUseManagedRuntime = Boolean(
+      idexalOsSnapshot.idexalOsServerClient && workspaceId?.trim() && workspaceType === "local",
+    );
+
+    if (canUseManagedRuntime || c) {
+      const result = await updateManagedDisabledProviders({
+        opencodeClient: c,
+        idexalOsClient: idexalOsSnapshot.idexalOsServerClient,
+        workspaceId,
+        workspaceType,
+        disabledProviders: nextDisabled,
+        removeFallbackKeyWhenEmpty: true,
+        markReloadRequired: () => options.markOpencodeConfigReloadRequired(),
+      });
+      options.setDisabledProviders(result.disabledProviders);
+      options.markOpencodeConfigReloadRequired();
+      refreshSnapshot();
+      emitChange();
+      return true;
+    }
+
+    const updatedConfig = await updateProjectConfigFile(
+      (raw) => formatConfigWithProviderDisabledState(raw, resolvedProviderId, disabled),
+      (config) => {
+        const nextConfig = { ...config };
+        if (nextDisabled.length) {
+          nextConfig.disabled_providers = nextDisabled;
+        } else {
+          delete nextConfig.disabled_providers;
+        }
+        return nextConfig;
+      },
+    );
+
+    if (!updatedConfig) {
+      throw new Error("Could not update disabled providers for this workspace.");
+    }
+
+    options.setDisabledProviders(nextDisabled);
+    options.markOpencodeConfigReloadRequired();
+    refreshSnapshot();
+    emitChange();
+    return true;
+  };
+
+  const assertProviderAllowedByDesktopPolicy = (providerId: string) => {
+    const restrictToCloud = options.checkDesktopAppRestriction({ restriction: "allowCustomProviders" });
+    if (
+      isDesktopProviderBlocked({
+        providerId,
+        checkRestriction: options.checkDesktopAppRestriction,
+      })
+    ) {
+      throw new Error(`${providerId} is blocked by your organization desktop policy.`);
+    }
+    if (
+      !isProviderAllowedByDesktopPolicy({
+        providerId,
+        restrictToCloud,
+        checkRestriction: options.checkDesktopAppRestriction,
+      })
+    ) {
+      throw new Error(t("providers.custom_providers_disabled"));
+    }
+  };
+
+  // Sweep all cloud-managed provider entries (keys matching /^lpr_/) from
+  // both the runtime config and opencode.jsonc, regardless of
+  // importedCloudProviders state. Returns the list of provider IDs that were
+  // removed so callers can also clear their auth credentials.
+  const sweepOrphanCloudProvidersFromConfig = async (): Promise<string[]> => {
+    const orphanIds = new Set<string>();
+
+    // Runtime-managed orphans (`lpr_*` keys in the workspace runtime config).
+    try {
+      const { idexalOsClient, idexalOsWorkspaceId, canUseIdexalOsServer } =
+        await resolveIdexalOsConfigTarget("write");
+      if (canUseIdexalOsServer && idexalOsClient && idexalOsWorkspaceId) {
+        const merged = await idexalOsClient.getConfig(idexalOsWorkspaceId);
+        const runtimeProvider = isRecord(merged.opencode) ? merged.opencode.provider : null;
+        const runtimeOrphans = isRecord(runtimeProvider)
+          ? Object.keys(runtimeProvider).filter((key) => /^lpr_/i.test(key))
+          : [];
+        if (runtimeOrphans.length > 0) {
+          await patchRuntimeProviders(
+            Object.fromEntries(runtimeOrphans.map((id) => [id, null])),
+          );
+          for (const id of runtimeOrphans) orphanIds.add(id);
+        }
+      }
+    } catch {
+      // Best-effort; the legacy file sweep below still runs.
+    }
+
+    // Legacy `opencode.jsonc` blocks written by pre-runtime builds.
+    const configFile = await readProjectConfigFile().catch(() => null) as { content?: string } | null;
+    if (configFile?.content?.trim()) {
+      const parsed = parse(configFile.content);
+      const providerSection =
+        parsed && typeof parsed === "object" && !Array.isArray(parsed)
+          ? (parsed as Record<string, unknown>).provider
+          : null;
+      const fileOrphans =
+        providerSection && typeof providerSection === "object" && !Array.isArray(providerSection)
+          ? Object.keys(providerSection as Record<string, unknown>).filter((key) => /^lpr_/i.test(key))
+          : [];
+      if (fileOrphans.length > 0) {
+        await updateProjectConfigFile((raw) => {
+          let next = raw;
+          for (const id of fileOrphans) {
+            next = formatConfigWithoutCloudProvider(next, id, options.disabledProviders());
+          }
+          return next;
+        });
+        for (const id of fileOrphans) orphanIds.add(id);
+      }
+    }
+
+    return [...orphanIds];
+  };
+
+  const assertCloudProviderImportSafe = async (
+    provider: DenOrgLlmProviderConnection,
+  ) => {
+    const localProviderId = getCloudManagedProviderId(provider);
+    const existingImported = state.importedCloudProviders[provider.id] ?? null;
+    // `lpr_*` / `idexalos` keys are owned by the cloud-import system. When the
+    // import baseline was lost or diverged (e.g. it lives in a different file
+    // than the provider block, or a prior reconcile failed mid-flight), an
+    // existing cloud-managed block must be treated as a re-import to reconcile,
+    // not blocked. Only guard against clobbering a user's manual provider.
+    const cloudManagedKey = isCloudManagedProviderKey(localProviderId);
+    if (
+      existingImported &&
+      existingImported.providerId !== localProviderId &&
+      Object.values(state.importedCloudProviders).some(
+        (entry) => entry.providerId === localProviderId && entry.cloudProviderId !== provider.id,
+      )
+    ) {
+      throw new CloudProviderImportConflictError(
+        `${localProviderId} is already imported from another cloud provider. Remove it before importing this one.`,
+      );
+    }
+
+    if (
+      !existingImported &&
+      !cloudManagedKey &&
+      options.providerConnectedIds().includes(localProviderId)
+    ) {
+      throw new CloudProviderImportConflictError(
+        `${localProviderId} is already connected in this workspace. Disconnect it before importing the cloud-managed version.`,
+      );
+    }
+
+    const configFile = await readProjectConfigFile() as { content?: string } | null;
+    if (
+      !configFile?.content?.trim() ||
+      existingImported ||
+      (cloudManagedKey && localProviderId !== "idexalos")
+    ) {
+      return;
+    }
+
+    const parsed = parse(configFile.content);
+    const providerSection =
+      parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>).provider
+        : null;
+    if (
+      providerSection &&
+      typeof providerSection === "object" &&
+      !Array.isArray(providerSection) &&
+      localProviderId in (providerSection as Record<string, unknown>)
+    ) {
+      throw new CloudProviderImportConflictError(
+        `${localProviderId} already has a provider block in opencode.jsonc. Remove it before importing the cloud-managed version.`,
+      );
+    }
+  };
+
+  const getCloudOrgProvidersKey = () => {
+    const settings = readDenSettings();
+    return [
+      settings.baseUrl,
+      settings.activeOrgId?.trim() ?? "",
+      settings.authToken?.trim() ?? "",
+    ].join("::");
+  };
+
+  const refreshCloudOrgProviders = async (optionsArg?: { force?: boolean }) => {
+    const settings = readDenSettings();
+    const loadKey = getCloudOrgProvidersKey();
+    const token = settings.authToken?.trim() ?? "";
+    const orgId = settings.activeOrgId?.trim() ?? "";
+
+    if (!optionsArg?.force && cloudOrgProvidersLoadKey === loadKey) {
+      return state.cloudOrgProviders;
+    }
+
+    if (cloudOrgProvidersInFlight && cloudOrgProvidersInFlightKey === loadKey) {
+      return cloudOrgProvidersInFlight;
+    }
+
+    if (!token || !orgId) {
+      cloudOrgProvidersGeneration += 1;
+      setStateField("cloudOrgProviders", []);
+      cloudOrgProvidersLoadKey = loadKey;
+      return [];
+    }
+
+    const client = createDenClient({
+      baseUrl: settings.baseUrl,
+      token,
+    });
+    const generation = ++cloudOrgProvidersGeneration;
+    const request = client
+      .listOrgLlmProviders(orgId)
+      .then((providers) => {
+        if (
+          generation !== cloudOrgProvidersGeneration ||
+          getCloudOrgProvidersKey() !== loadKey
+        ) {
+          return state.cloudOrgProviders;
+        }
+        setStateField("cloudOrgProviders", providers);
+        cloudOrgProvidersLoadKey = loadKey;
+        return providers;
+      })
+      .catch((error) => {
+        if (
+          generation === cloudOrgProvidersGeneration &&
+          getCloudOrgProvidersKey() === loadKey
+        ) {
+          setStateField("cloudOrgProviders", []);
+          cloudOrgProvidersLoadKey = "";
+        }
+        throw error;
+      })
+      .finally(() => {
+        if (
+          generation === cloudOrgProvidersGeneration &&
+          cloudOrgProvidersInFlightKey === loadKey
+        ) {
+          cloudOrgProvidersInFlight = null;
+          cloudOrgProvidersInFlightKey = "";
+        }
+      });
+
+    cloudOrgProvidersInFlight = request;
+    cloudOrgProvidersInFlightKey = loadKey;
+    return request;
+  };
+
+  // Track whether the provider list has been loaded at least once.
+  // The first load (app startup) populates the initial state — we don't
+  // want to fire "new provider" events for providers that were already
+  // there. After the first load, any new provider IS genuinely new.
+  let providerListInitialized = false;
+
+  const applyProviderListState = (value: ProviderListResponse, opts?: { suppressNewProviderEvent?: boolean }) => {
+    const prevConnected = new Set(options.providerConnectedIds());
+    const nextConnected = value.connected ?? [];
+    const nextAll = value.all ?? [];
+    options.setProviders(nextAll);
+    options.setProviderDefaults(value.default ?? {});
+    options.setProviderConnectedIds(nextConnected);
+    refreshSnapshot();
+    emitChange();
+
+    if (!providerListInitialized) {
+      providerListInitialized = true;
+      return;
+    }
+
+    // Detect newly connected providers and fire a global event so
+    // the NewProvidersListener records a notification — regardless of
+    // which route is active.
+    if (!opts?.suppressNewProviderEvent) {
+      const newIds = nextConnected.filter((id) => !prevConnected.has(id));
+      if (newIds.length > 0) {
+        const infos = newIds.map((id) => {
+          const provider = nextAll.find((p) => (p.id ?? "") === id);
+          const models = provider?.models ?? {};
+          const firstModelId = Object.keys(models)[0];
+          return {
+            id,
+            name: provider?.name ?? id,
+            providerId: id,
+            firstModelId,
+            firstModelName: firstModelId
+              ? (models[firstModelId]?.name ?? firstModelId)
+              : undefined,
+          };
+        });
+        dispatchNewProviders({ providers: infos, source: "local_config" });
+      }
+    }
+  };
+
+  const removeProviderFromState = (providerId: string) => {
+    const resolved = providerId.trim();
+    if (!resolved) return;
+    options.setProviders(options.providers().filter((provider) => provider.id !== resolved));
+    options.setProviderConnectedIds(
+      options.providerConnectedIds().filter((id) => id !== resolved),
+    );
+    options.setProviderDefaults(
+      Object.fromEntries(
+        Object.entries(options.providerDefaults()).filter(([id]) => id !== resolved),
+      ),
+    );
+    refreshSnapshot();
+    emitChange();
+  };
+
+  const assertNoClientError = (result: unknown) => {
+    const maybe = result as { error?: unknown } | null | undefined;
+    if (!maybe || maybe.error === undefined) return;
+    throw new Error(describeProviderError(maybe.error, t("providers.request_failed")));
+  };
+
+  const removeProviderAuthCredentials = async (providerId: string) => {
+    const c = options.client();
+    if (!c) {
+      throw new Error(t("providers.not_connected"));
+    }
+
+    const authClient = c.auth as unknown as {
+      remove?: (options: { providerID: string }) => Promise<unknown>;
+      set?: (options: { providerID: string; auth: unknown }) => Promise<unknown>;
+    };
+    if (typeof authClient.remove === "function") {
+      const result = await authClient.remove({ providerID: providerId });
+      assertNoClientError(result);
+      return;
+    }
+
+    const rawClient = (c as unknown as {
+      client?: { delete?: (options: { url: string }) => Promise<unknown> };
+    }).client;
+    if (rawClient?.delete) {
+      await rawClient.delete({ url: `/auth/${encodeURIComponent(providerId)}` });
+      return;
+    }
+
+    if (typeof authClient.set === "function") {
+      const result = await authClient.set({ providerID: providerId, auth: null });
+      assertNoClientError(result);
+      return;
+    }
+
+    throw new Error(t("providers.removal_unsupported"));
+  };
+
+  const describeProviderError = (error: unknown, fallback: string) => {
+    const readString = (value: unknown, max = 700) => {
+      if (typeof value !== "string") return null;
+      const trimmed = value.trim();
+      if (!trimmed) return null;
+      if (trimmed.length <= max) return trimmed;
+      return `${trimmed.slice(0, Math.max(0, max - 3))}...`;
+    };
+
+    const records: Record<string, unknown>[] = [];
+    const root = error && typeof error === "object" ? (error as Record<string, unknown>) : null;
+    if (root) {
+      records.push(root);
+      if (root.data && typeof root.data === "object") {
+        records.push(root.data as Record<string, unknown>);
+      }
+      if (root.cause && typeof root.cause === "object") {
+        const cause = root.cause as Record<string, unknown>;
+        records.push(cause);
+        if (cause.data && typeof cause.data === "object") {
+          records.push(cause.data as Record<string, unknown>);
+        }
+      }
+    }
+
+    const firstString = (keys: string[]) => {
+      for (const record of records) {
+        for (const key of keys) {
+          const value = readString(record[key]);
+          if (value) return value;
+        }
+      }
+      return null;
+    };
+
+    const firstNumber = (keys: string[]) => {
+      for (const record of records) {
+        for (const key of keys) {
+          const value = record[key];
+          if (typeof value === "number" && Number.isFinite(value)) return value;
+        }
+      }
+      return null;
+    };
+
+    const status = firstNumber(["statusCode", "status"]);
+    const provider = firstString(["providerID", "providerId", "provider"]);
+    const code = firstString(["code", "errorCode"]);
+    const response = firstString(["responseBody", "body", "response"]);
+    const raw =
+      (error instanceof Error ? readString(error.message) : null) ||
+      firstString(["message", "detail", "reason", "error"]) ||
+      (typeof error === "string" ? readString(error) : null);
+
+    const generic = raw && /^unknown\s+error$/i.test(raw);
+    const heading = (() => {
+      if (status === 401 || status === 403) return t("providers.auth_failed");
+      if (status === 429) return t("providers.rate_limit_exceeded");
+      if (provider) return t("providers.provider_error", { provider });
+      return fallback;
+    })();
+
+    const lines = [heading];
+    if (raw && !generic && raw !== heading) lines.push(raw);
+    if (status && !heading.includes(String(status))) lines.push(`Status: ${status}`);
+    if (provider && !heading.includes(provider)) lines.push(`Provider: ${provider}`);
+    if (code) lines.push(`Code: ${code}`);
+    if (response) lines.push(`Response: ${response}`);
+    if (lines.length > 1) return lines.join("\n");
+
+    if (raw && !generic) return raw;
+    if (error && typeof error === "object") {
+      const serialized = safeStringify(error);
+      if (serialized && serialized !== "{}") return serialized;
+    }
+    return fallback;
+  };
+
+  const buildProviderAuthMethods = (
+    methods: Record<string, ProviderAuthMethod[]>,
+    availableProviders: ProviderAuthProvider[],
+  ) => {
+    const restrictToCloud = options.checkDesktopAppRestriction({ restriction: "allowCustomProviders" });
+    const merged = Object.fromEntries(
+      Object.entries(methods ?? {}).map(([id, providerMethods]) => [
+        id,
+        (providerMethods ?? []).map((method, methodIndex) => ({
+          ...method,
+          methodIndex,
+        })),
+      ]),
+    ) as Record<string, ProviderAuthMethod[]>;
+
+    for (const provider of availableProviders ?? []) {
+      const id = provider.id?.trim();
+      if (!id) continue;
+      if (
+        !isProviderAllowedByDesktopPolicy({
+          providerId: id,
+          restrictToCloud,
+          checkRestriction: options.checkDesktopAppRestriction,
+        })
+      ) {
+        continue;
+      }
+      if (!Array.isArray(provider.env) || provider.env.length === 0) continue;
+      const existing = merged[id] ?? [];
+      if (existing.some((method) => method.type === "api")) continue;
+      merged[id] = [...existing, { type: "api", label: t("providers.api_key_label") }];
+    }
+
+    const availableProvidersById = new Map((availableProviders ?? []).map((provider) => [provider.id, provider]));
+    for (const [id, providerMethods] of Object.entries(merged)) {
+      if (
+        !isProviderAllowedByDesktopPolicy({
+          providerId: id,
+          restrictToCloud,
+          checkRestriction: options.checkDesktopAppRestriction,
+        })
+      ) {
+        delete merged[id];
+        continue;
+      }
+      const provider = availableProvidersById.get(id);
+      const normalizedId = id.trim().toLowerCase();
+      const normalizedName = provider?.name?.trim().toLowerCase() ?? "";
+      const isOpenAiProvider = normalizedId === "openai" || normalizedName === "openai";
+      if (!isOpenAiProvider) continue;
+      merged[id] = providerMethods.filter((method) => {
+        if (method.type !== "oauth") return true;
+        // Browser mode can't complete the ChatGPT sign-in flows, so only API keys
+        // are offered off-desktop.
+        if (!isDesktopRuntime()) return false;
+        const label = method.label.toLowerCase();
+        return !/headless|device/.test(label);
+      });
+    }
+
+    return merged;
+  };
+
+  // Best effort: without the catalog the modal still offers connected
+  // providers, sign-in methods and cloud providers.
+  const loadProviderCatalog = async (client: Client) => {
+    try {
+      const catalog = filterProviderList(
+        await ensureProviderCatalogQuery(getReactQueryClient(), {
+          client,
+          baseUrl: options.providerBaseUrl(),
+          directory: options.selectedWorkspaceRoot(),
+        }),
+        options.disabledProviders(),
+      );
+      providerCatalog = catalog.all ?? [];
+    } catch {
+      providerCatalog = [];
+    }
+  };
+
+  const loadProviderAuthMethods = async () => {
+    const c = options.client();
+    if (!c) {
+      throw new Error(t("providers.not_connected"));
+    }
+    const [methods] = await Promise.all([
+      c.provider.auth().then(unwrap),
+      loadProviderCatalog(c),
+    ]);
+    return buildProviderAuthMethods(
+      methods as Record<string, ProviderAuthMethod[]>,
+      getProviderAuthProviders(),
+    );
+  };
+
+  async function startProviderAuth(
+    providerId?: string,
+    methodIndex?: number,
+  ): Promise<ProviderOAuthStartResult> {
+    setStateField("providerAuthError", null);
+    const c = options.client();
+    if (!c) {
+      throw new Error(t("providers.not_connected"));
+    }
+    try {
+      const cachedMethods = state.providerAuthMethods;
+      const authMethods = Object.keys(cachedMethods).length
+        ? cachedMethods
+        : await loadProviderAuthMethods();
+      const providerIds = Object.keys(authMethods).sort();
+      if (!providerIds.length) {
+        throw new Error(t("providers.no_providers_available"));
+      }
+
+      const resolved = providerId?.trim() ?? "";
+      if (!resolved) {
+        throw new Error(t("providers.provider_id_required"));
+      }
+      assertProviderAllowedByDesktopPolicy(resolved);
+
+      const methods = authMethods[resolved];
+      if (!methods || !methods.length) {
+        throw new Error(`${t("providers.unknown_provider")}: ${resolved}`);
+      }
+
+      const oauthIndex =
+        methodIndex !== undefined
+          ? methodIndex
+          : methods.find((method) => method.type === "oauth")?.methodIndex ?? -1;
+      if (oauthIndex === -1) {
+        throw new Error(
+          `${t("providers.no_oauth_prefix")} ${resolved}. ${t("providers.use_api_key_suffix")}`,
+        );
+      }
+
+      const selectedMethod = methods.find((method) => method.methodIndex === oauthIndex);
+      if (!selectedMethod || selectedMethod.type !== "oauth") {
+        throw new Error(`${t("providers.not_oauth_flow_prefix")} ${resolved}.`);
+      }
+
+      const auth = unwrap(
+        await c.provider.oauth.authorize({ providerID: resolved, method: oauthIndex }),
+      );
+      return { methodIndex: oauthIndex, authorization: auth };
+    } catch (error) {
+      const message = describeProviderError(error, t("providers.connect_failed"));
+      setStateField("providerAuthError", message);
+      throw error instanceof Error ? error : new Error(message);
+    }
+  }
+
+  const isIncompatiblePermissionsConfigError = (error: unknown, depth = 0): boolean => {
+    if (depth > 5) return false;
+    if (typeof error === "string") {
+      try {
+        const parsed: unknown = JSON.parse(error);
+        return isIncompatiblePermissionsConfigError(parsed, depth + 1);
+      } catch {
+        return error.includes("V2 permissions are not supported by OpenCode V1");
+      }
+    }
+    if (!isRecord(error)) return false;
+    return isIncompatiblePermissionsConfigError(error.message, depth + 1)
+      || isIncompatiblePermissionsConfigError(error.data, depth + 1)
+      || (Array.isArray(error.issues) && error.issues.some(
+        (issue) => isRecord(issue) && isIncompatiblePermissionsConfigError(issue.message, depth + 1),
+      ));
+  };
+
+  let providerRefreshGeneration = 0;
+
+  async function refreshProviders(
+    optionsArg?: {
+      dispose?: boolean;
+      force?: boolean;
+      /**
+       * Reload even when the engine reports a live catalog. Adding a provider
+       * changes the config the catalog was built from, so the running instance
+       * has to be disposed for the new provider and its models to appear.
+       */
+      forceDispose?: boolean;
+      /**
+       * The caller just rewrote engine config (for example disabled_providers).
+       * Reload even inside the 10s dispose throttle; otherwise the read below
+       * returns the pre-change config and undoes the change in the UI.
+       */
+      configChanged?: boolean;
+    },
+    isCurrent = () => !disposed,
+  ) {
+    const c = options.client();
+    if (!c || !isCurrent()) return null;
+    const generation = ++providerRefreshGeneration;
+    const baseUrl = options.providerBaseUrl();
+    const directory = options.selectedWorkspaceRoot();
+    const isRefreshCurrent = () => !disposed && isCurrent()
+      && generation === providerRefreshGeneration
+      && baseUrl === options.providerBaseUrl()
+      && directory === options.selectedWorkspaceRoot();
+    const force = Boolean(optionsArg?.dispose || optionsArg?.force || state.providerLoadState.error);
+    setStateField("providerLoadState", { status: "loading", error: state.providerLoadState.error });
+
+    const serverClient = options.idexalOsServer.getSnapshot().idexalOsServerClient;
+    const liveCatalog = optionsArg?.dispose && serverClient
+      ? await serverClient.getEngineV2PreviewStatus().then(status => status.enabled && status.chatRouting).catch(() => false)
+      : false;
+    if (optionsArg?.dispose && (!liveCatalog || optionsArg?.forceDispose)) {
+      const now = Date.now();
+      const shouldDispose = Boolean(optionsArg?.configChanged)
+        || now - lastGlobalProviderDisposeRefreshAt >= 10_000;
+      const shouldUseServerReload = !(
+        isDesktopRuntime() && options.selectedWorkspaceDisplay().workspaceType === "local"
+      );
+      // Prefer the idexal Os server engine reload: it disposes the engine AND
+      // re-registers runtime-DB MCPs, so non-primary workspaces and pending
+      // changes are picked up instead of silently dropping (toggles "turn
+      // off").
+      let reloaded = false;
+      if (shouldDispose) {
+        lastGlobalProviderDisposeRefreshAt = now;
+        if (shouldUseServerReload) {
+          try {
+            const idexalOsSnapshot = options.idexalOsServer.getSnapshot();
+            const idexalOsClient = idexalOsSnapshot.idexalOsServerClient;
+            if (idexalOsSnapshot.idexalOsServerStatus === "connected" && idexalOsClient) {
+              const workspaceId =
+                options.runtimeWorkspaceId()?.trim() ||
+                (await options.ensureRuntimeWorkspaceId?.())?.trim() ||
+                "";
+              if (workspaceId) {
+                try {
+                  await idexalOsClient.reloadEngine(workspaceId);
+                } catch (error) {
+                  const unreachable =
+                    error instanceof IdexalOsServerError && error.code === "opencode_engine_unreachable";
+                  if (!unreachable || !isDesktopRuntime()) {
+                    throw error;
+                  }
+                  await engineRestart({});
+                }
+                reloaded = true;
+              }
+            }
+          } catch {
+            // fall back to a direct engine dispose below
+          }
+        }
+
+        if (!reloaded) {
+          try {
+            unwrap(await c.instance.dispose());
+          } catch {
+            // ignore dispose failures and try reading current state anyway
+          }
+        }
+      }
+
+      try {
+        await waitForHealthy(options.client() ?? c, { timeoutMs: 8000, pollMs: 250 });
+      } catch {
+        // ignore health wait failures and still attempt provider reads
+      }
+    }
+
+    if (!isRefreshCurrent()) return null;
+    const activeClient = options.client() ?? c;
+    try {
+      const disabledProviders = await readManagedDisabledProviders({
+        opencodeClient: activeClient,
+        idexalOsClient: options.idexalOsServer.getSnapshot().idexalOsServerClient,
+        workspaceId: options.runtimeWorkspaceId(),
+        workspaceType: options.selectedWorkspaceDisplay().workspaceType,
+      });
+      if (!isRefreshCurrent()) return null;
+      const updated = filterProviderList(
+        await ensureProviderListQuery(getReactQueryClient(), {
+          client: activeClient,
+          baseUrl,
+          directory,
+          force,
+        }),
+        disabledProviders,
+      );
+      if (!isRefreshCurrent()) return null;
+      options.setDisabledProviders(disabledProviders);
+      applyProviderListState(updated);
+      setStateField("providerLoadState", { status: "ready", error: null });
+      return updated;
+    } catch (error) {
+      if (isRefreshCurrent()) {
+        setStateField("providerLoadState", {
+          status: "error",
+          error: t(isIncompatiblePermissionsConfigError(error)
+            ? "settings.provider_load_incompatible_permissions"
+            : "settings.provider_load_error"),
+        });
+      }
+      return null;
+    }
+  }
+
+  async function completeProviderAuthOAuth(
+    providerId: string,
+    methodIndex: number,
+    code?: string,
+  ) {
+    setStateField("providerAuthError", null);
+    const c = options.client();
+    if (!c) {
+      throw new Error(t("providers.not_connected"));
+    }
+
+    const resolved = providerId?.trim();
+    if (!resolved) {
+      throw new Error(t("providers.provider_id_required"));
+    }
+    assertProviderAllowedByDesktopPolicy(resolved);
+
+    if (!Number.isInteger(methodIndex) || methodIndex < 0) {
+      throw new Error(t("providers.oauth_method_required"));
+    }
+
+    const waitForProviderConnection = async (timeoutMs = 15000, pollMs = 2000) => {
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < timeoutMs) {
+        try {
+          const updated = await refreshProviders({ dispose: true });
+          const connected = new Set(updated?.connected ?? []);
+          if (connected.has(resolved)) {
+            return true;
+          }
+        } catch {
+          // ignore and retry
+        }
+        await new Promise((resolve) => setTimeout(resolve, pollMs));
+      }
+      return false;
+    };
+
+    const isPendingOauthError = (error: unknown) => {
+      const text = error instanceof Error ? error.message : String(error ?? "");
+      return /request timed out/i.test(text) || /ProviderAuthOauthMissing/i.test(text);
+    };
+
+    try {
+      if (resolved.toLowerCase() === DESKTOP_RESTRICTION_OPENCODE_PROVIDER_ID) {
+        await ensureProjectProviderDisabledState(resolved, false);
+      }
+      const trimmedCode = code?.trim();
+      const result = await c.provider.oauth.callback({
+        providerID: resolved,
+        method: methodIndex,
+        code: trimmedCode || undefined,
+      });
+      assertNoClientError(result);
+      const updated = await refreshProviders({ dispose: true });
+      const connectedNow = Array.isArray(updated?.connected) && updated.connected.includes(resolved);
+      if (connectedNow) {
+        return { connected: true, message: `${t("status.connected")} ${resolved}` };
+      }
+      const connected = await waitForProviderConnection();
+      if (connected) {
+        return { connected: true, message: `${t("status.connected")} ${resolved}` };
+      }
+      return { connected: false, pending: true };
+    } catch (error) {
+      if (isPendingOauthError(error)) {
+        const updated = await refreshProviders({ dispose: true });
+        if (Array.isArray(updated?.connected) && updated.connected.includes(resolved)) {
+          return { connected: true, message: `${t("status.connected")} ${resolved}` };
+        }
+        const connected = await waitForProviderConnection();
+        if (connected) {
+          return { connected: true, message: `${t("status.connected")} ${resolved}` };
+        }
+        return { connected: false, pending: true };
+      }
+      const message = describeProviderError(error, t("providers.oauth_failed"));
+      setStateField("providerAuthError", message);
+      throw error instanceof Error ? error : new Error(message);
+    }
+  }
+
+  async function submitProviderApiKey(providerId: string, apiKey: string) {
+    setStateField("providerAuthError", null);
+    const c = options.client();
+    if (!c) {
+      throw new Error(t("providers.not_connected"));
+    }
+
+    const trimmed = apiKey.trim();
+    if (!trimmed) {
+      throw new Error(t("providers.api_key_required"));
+    }
+    assertProviderAllowedByDesktopPolicy(providerId);
+
+    setStateField("providerAuthBusy", true);
+    try {
+      if (providerId.trim().toLowerCase() === DESKTOP_RESTRICTION_OPENCODE_PROVIDER_ID) {
+        await ensureProjectProviderDisabledState(providerId, false);
+      }
+      await c.auth.set({ providerID: providerId, auth: { type: "api", key: trimmed } });
+      await refreshProviders({ dispose: true });
+      return `${t("status.connected")} ${providerId}`;
+    } catch (error) {
+      const message = describeProviderError(error, t("providers.save_api_key_failed"));
+      setStateField("providerAuthError", message);
+      throw error instanceof Error ? error : new Error(message);
+    } finally {
+      setStateField("providerAuthBusy", false);
+    }
+  }
+
+  /**
+   * Person-added custom provider: an OpenAI- or Anthropic-compatible endpoint
+   * whose base URL, key and model IDs come from the connect dialog. The block
+   * goes into the runtime config (engine-global, never the person's
+   * opencode.jsonc) and the key goes into auth storage. Save the key first:
+   * the engine's provider mirror reads auth storage when the config changes,
+   * so writing config first would push the provider without its key.
+   */
+  async function addCustomProvider(input: CustomProviderInput) {
+    setStateField("providerAuthError", null);
+    const c = options.client();
+    if (!c) {
+      throw new Error(t("providers.not_connected"));
+    }
+
+    const name = input.name.trim();
+    if (!name) {
+      throw new Error(t("providers.custom_name_required"));
+    }
+    const baseUrlError = customProviderBaseUrlError(input.baseUrl);
+    if (baseUrlError) {
+      throw new Error(t(baseUrlError === "required"
+        ? "providers.custom_base_url_required"
+        : "providers.custom_base_url_invalid"));
+    }
+    const models = parseCustomProviderModelIds(input.models);
+    if (models.length === 0) {
+      throw new Error(t("providers.custom_models_required"));
+    }
+
+    const providerId = customProviderIdForName(name, [
+      ...options.providers().map((provider) => provider.id),
+      ...state.cloudOrgProviders.map((provider) => provider.id),
+      ...options.disabledProviders(),
+    ]);
+    assertProviderAllowedByDesktopPolicy(providerId);
+
+    setStateField("providerAuthBusy", true);
+    try {
+      const config = buildCustomProviderConfig({
+        family: input.family,
+        name,
+        baseUrl: input.baseUrl.trim(),
+        models,
+      });
+      // Key before config: the v2 provider bridge reads auth storage when it
+      // mirrors the new provider block, and would otherwise push no key.
+      await c.auth.set({
+        providerID: providerId,
+        auth: { type: "api", key: input.apiKey?.trim() ?? "" },
+      });
+      const { idexalOsClient, idexalOsWorkspaceId, canUseIdexalOsServer } =
+        await resolveIdexalOsConfigTarget("write");
+      if (canUseIdexalOsServer && idexalOsClient && idexalOsWorkspaceId) {
+        await patchRuntimeProviders({ [providerId]: config });
+      } else if (!(await updateProjectConfigFile(
+        (raw) => formatConfigWithCustomProvider(raw, providerId, config),
+      ))) {
+        throw new Error(t("providers.custom_add_failed"));
+      }
+      await refreshProviders({
+        dispose: true,
+        configChanged: true,
+        force: true,
+        forceDispose: true,
+      });
+      refreshSnapshot();
+      emitChange();
+      return { providerId };
+    } catch (error) {
+      const message = describeProviderError(error, t("providers.custom_add_failed"));
+      setStateField("providerAuthError", message);
+      throw error instanceof Error ? error : new Error(message);
+    } finally {
+      setStateField("providerAuthBusy", false);
+    }
+  }
+
+  async function connectCloudProviderInternal(
+    cloudProviderId: string,
+    optionsArg?: { silent?: boolean },
+  ) {
+    if (!optionsArg?.silent) {
+      setStateField("providerAuthError", null);
+    }
+    const c = options.client();
+    if (!c) {
+      throw new Error(t("providers.not_connected"));
+    }
+
+    const settings = readDenSettings();
+    const token = settings.authToken?.trim() ?? "";
+    const orgId = settings.activeOrgId?.trim() ?? "";
+    if (!token || !orgId) {
+      throw new Error("Sign in to idexal Os Cloud and choose an organization first.");
+    }
+
+    try {
+      const den = createDenClient({
+        baseUrl: settings.baseUrl,
+        token,
+      });
+      const provider = await den.getOrgLlmProviderConnection(orgId, cloudProviderId);
+      const localProviderId = getCloudManagedProviderId(provider);
+      assertProviderAllowedByDesktopPolicy(localProviderId);
+      const existingImported = state.importedCloudProviders[cloudProviderId] ?? null;
+      const { envEntries, primaryApiKey } = resolveCloudProviderCredentials(provider);
+      const env = getCloudProviderEnv(provider.providerConfig);
+      if (!primaryApiKey && env.length > 0) {
+        throw new CloudProviderNeedsCredentialError(
+          `${provider.name} does not have a stored organization credential yet.`,
+        );
+      }
+
+      await assertCloudProviderImportSafe(provider);
+
+      if (envEntries.length > 0) {
+        const idexalOsClient = options.idexalOsServer.getSnapshot().idexalOsServerClient;
+        if (!idexalOsClient) {
+          throw new CloudProviderNeedsServerError(
+            `${provider.name} needs environment variables (${envEntries
+              .map((entry) => entry.key)
+              .join(", ")}) but the idexal Os server is not available.`,
+          );
+        }
+        await idexalOsClient.upsertUserEnv(envEntries);
+      }
+      if (primaryApiKey) {
+        await c.auth.set({
+          providerID: localProviderId,
+          auth: { type: "api", key: primaryApiKey },
+        });
+        await mirrorCloudProviderEnv(provider, primaryApiKey, envEntries);
+      }
+      if (existingImported?.providerId && existingImported.providerId !== localProviderId) {
+        try {
+          await removeProviderAuthCredentials(existingImported.providerId);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error ?? "");
+          if (!/not found|unknown auth|404/i.test(message.toLowerCase())) {
+            throw error;
+          }
+        }
+      }
+      const nextImportedProviders = {
+        ...state.importedCloudProviders,
+        [provider.id]: {
+          cloudProviderId: provider.id,
+          providerId: localProviderId,
+          // Track the provider id as shipped by the server at import time
+          // so we can detect local/remote drift later (see dev #1510 "key
+          // cloud providers by cloud id"). On first import both match.
+          sourceProviderId: provider.providerId,
+          name: provider.name,
+          source: provider.source,
+          updatedAt: provider.updatedAt ?? null,
+          modelIds: getProviderModelIds(provider),
+          pinnedModelIds: provider.pinnedModelIds?.filter((id) => getProviderModelIds(provider).includes(id)) ?? [],
+          modelConfigVersion: CLOUD_MODEL_CONFIG_VERSION,
+          importedAt: Date.now(),
+        },
+      };
+      // Cloud providers are runtime-managed: upsert (and delete a renamed
+      // predecessor) via one server config write, together with the import
+      // baseline, instead of editing the user's opencode.jsonc.
+      await patchRuntimeProviderAndImportedCloudProviders(
+        buildRuntimeProviderPatch(provider, localProviderId, existingImported?.providerId ?? null),
+        nextImportedProviders,
+      );
+      await stripLegacyCloudProviderBlocks([localProviderId, existingImported?.providerId]);
+
+      const nextDisabledProviders = options
+        .disabledProviders()
+        .filter((id) => id !== localProviderId && id !== existingImported?.providerId);
+      options.setDisabledProviders(nextDisabledProviders);
+      if (!optionsArg?.silent) {
+        options.markOpencodeConfigReloadRequired();
+        await refreshProviders({ dispose: true });
+      }
+      refreshSnapshot();
+      emitChange();
+      return `${t("status.connected")} ${provider.name}`;
+    } catch (error) {
+      const message = describeProviderError(error, "Failed to connect organization provider.");
+      if (!optionsArg?.silent) {
+        setStateField("providerAuthError", message);
+      }
+      throw error instanceof Error ? error : new Error(message);
+    }
+  }
+
+  const describeCloudProviderSyncError = (error: unknown): CloudProviderSyncError => ({
+    kind: error instanceof CloudProviderImportConflictError
+      ? "conflict"
+      : error instanceof CloudProviderNeedsCredentialError
+        ? "needs_credential"
+        : error instanceof CloudProviderNeedsServerError
+          ? "needs_server"
+          : "error",
+    message: describeProviderError(error, "Cloud provider sync failed."),
+  });
+
+  const setCloudProviderSyncError = (
+    cloudProviderId: string,
+    error: CloudProviderSyncError | null,
+  ) => {
+    const current = state.lastSyncError[cloudProviderId];
+    if (!error && !current) return;
+    if (error && current?.kind === error.kind && current.message === error.message) return;
+    const next = { ...state.lastSyncError };
+    if (error) {
+      next[cloudProviderId] = error;
+    } else {
+      delete next[cloudProviderId];
+    }
+    setStateField("lastSyncError", next);
+  };
+
+  async function connectCloudProvider(cloudProviderId: string) {
+    try {
+      const result = await connectCloudProviderInternal(cloudProviderId);
+      setCloudProviderSyncError(cloudProviderId, null);
+      return result;
+    } catch (error) {
+      setCloudProviderSyncError(cloudProviderId, describeCloudProviderSyncError(error));
+      throw error;
+    }
+  }
+
+  async function removeCloudProviderInternal(
+    cloudProviderId: string,
+    optionsArg?: { silent?: boolean; importedProvider?: CloudImportedProvider; isCurrent?: () => boolean },
+  ) {
+    const isCurrent = optionsArg?.isCurrent ?? (() => true);
+    const assertCurrent = () => {
+      if (!isCurrent()) throw new Error("Cloud provider cleanup context changed.");
+    };
+    assertCurrent();
+    if (!optionsArg?.silent) {
+      setStateField("providerAuthError", null);
+    }
+    const imported = optionsArg?.importedProvider ?? state.importedCloudProviders[cloudProviderId];
+    if (!imported) {
+      throw new Error("This cloud provider has not been imported into the workspace.");
+    }
+
+    try {
+      try {
+        await removeProviderAuthCredentials(imported.providerId);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error ?? "");
+        if (!/not found|unknown auth|404/i.test(message.toLowerCase())) {
+          throw error;
+        }
+      }
+      // Runtime-managed: delete the provider entry via the server's per-key
+      // merge (`null` deletes), then strip any legacy opencode.jsonc block
+      // left by pre-runtime builds. Both are idempotent.
+      assertCurrent();
+      await patchRuntimeProviders({ [imported.providerId]: null }, isCurrent);
+      assertCurrent();
+      await stripLegacyCloudProviderBlocks([imported.providerId], isCurrent);
+      assertCurrent();
+
+      const nextImportedProviders = { ...state.importedCloudProviders };
+      delete nextImportedProviders[cloudProviderId];
+      await persistImportedCloudProviders(nextImportedProviders, isCurrent);
+      assertCurrent();
+
+      options.setDisabledProviders(
+        options.disabledProviders().filter((id) => id !== imported.providerId),
+      );
+      options.markOpencodeConfigReloadRequired();
+      refreshSnapshot();
+      emitChange();
+      return `${t("providers.disconnected_prefix")} ${imported.name}`;
+    } catch (error) {
+      const message = describeProviderError(error, t("providers.disconnect_failed"));
+      if (!optionsArg?.silent) {
+        setStateField("providerAuthError", message);
+      }
+      throw error instanceof Error ? error : new Error(message);
+    }
+  }
+
+  async function removeCloudProvider(cloudProviderId: string) {
+    return await removeCloudProviderInternal(cloudProviderId);
+  }
+
+  const logCloudProviderSyncError = (reason: CloudProviderSyncReason, error: unknown) => {
+    const message = describeProviderError(error, "Cloud provider sync failed.");
+    console.warn(`[cloud-provider-sync:${reason}] ${message}`);
+    return message;
+  };
+
+  const recordCloudProviderSyncError = (
+    cloudProviderId: string,
+    reason: CloudProviderSyncReason,
+    error: unknown,
+  ) => {
+    const syncError = describeCloudProviderSyncError(error);
+    setCloudProviderSyncError(cloudProviderId, syncError);
+    console.warn(`[cloud-provider-sync:${reason}] ${syncError.message}`);
+    return syncError.message;
+  };
+
+  const getCloudProviderSyncContextKey = () => {
+    const settings = readDenSettings();
+    return [
+      settings.baseUrl,
+      settings.activeOrgId?.trim() ?? "",
+      settings.authToken?.trim() ?? "",
+      options.selectedWorkspaceDisplay().workspaceType,
+      options.selectedWorkspaceRoot().trim(),
+      options.runtimeWorkspaceId() ?? "",
+      options.client() ? "connected" : "disconnected",
+      getDenSessionDeliveryKey(),
+    ].join("::");
+  };
+
+  const hasCloudProviderSyncPrerequisites = () => {
+    const settings = readDenSettings();
+    const workspaceTarget =
+      options.selectedWorkspaceRoot().trim() || options.runtimeWorkspaceId() || "";
+    // A server that materializes providers itself writes them into its
+    // managed engine, which runs before the first workspace exists. Only the
+    // legacy renderer import needs a workspace to patch.
+    return Boolean(
+      options.client() &&
+        settings.authToken?.trim() &&
+        settings.activeOrgId?.trim() &&
+        (workspaceTarget || serverHandlesProviderSync()),
+    );
+  };
+
+  const publishSettingsCloudProviderSyncError = (
+    reason: CloudProviderSyncReason,
+    message: string,
+  ) => {
+    if (reason !== "settings_cloud_opened") return;
+    // A sync that loses its session while logout is clearing account state is
+    // cancellation, not a user-actionable provider failure.
+    setStateField(
+      "providerAuthError",
+      hasCloudProviderSyncPrerequisites() ? message : null,
+    );
+  };
+
+  const preselectEntitledOrgDefaultModel = (
+    providerList: ProviderListResponse | null | undefined,
+  ) => {
+    const replacement = resolveEntitledOrgDefaultModel(
+      providerListModelEntitlementOptions(providerList),
+      {
+        currentDefault: readStoredDefaultModel(),
+        restrictToCloud: options.checkDesktopAppRestriction({ restriction: "allowCustomProviders" }),
+        checkRestriction: options.checkDesktopAppRestriction,
+      },
+    );
+    if (replacement && !hasPendingGatewayModelSelection()) writeStoredDefaultModel(replacement);
+  };
+
+  const refreshProvidersAfterCloudSync = async (optionsArg: {
+    dispose?: boolean;
+    force?: boolean;
+  }, isCurrent = () => !disposed) => {
+    const providerList = await refreshProviders(optionsArg, isCurrent);
+    if (!isCurrent()) return null;
+    preselectEntitledOrgDefaultModel(providerList);
+    return providerList;
+  };
+
+  async function performCloudProviderSync(reason: CloudProviderSyncReason) {
+    const usageScope = readGatewayUsageScope();
+    const usageContext = getCloudProviderSyncContextKey();
+    if (!hasCloudProviderSyncPrerequisites()) {
+      return;
+    }
+
+    // Imports, baseline reads, and persistence all go through the idexal Os
+    // server target (patchRuntimeProviders throws without it). Running before
+    // the target resolves made the baseline read fall back to an empty source
+    // and re-import every org provider — engine dispose churn on settings open.
+    const [readTarget, target] = await Promise.all([
+      resolveIdexalOsConfigTarget("read"),
+      resolveIdexalOsConfigTarget("write"),
+    ]);
+    if (
+      !readTarget.canUseIdexalOsServer ||
+      !target.canUseIdexalOsServer ||
+      !target.idexalOsClient ||
+      !target.idexalOsWorkspaceId
+    ) {
+      return;
+    }
+
+    let importedProviders: Record<string, CloudImportedProvider>;
+    try {
+      importedProviders = await refreshImportedCloudProviders({ strict: true });
+    } catch (error) {
+      logCloudProviderSyncError(reason, error);
+      return;
+    }
+    const liveProviders = await refreshCloudOrgProviders({ force: true });
+    const liveProviderMap = new Map(liveProviders.map((provider) => [provider.id, provider]));
+    const failures: string[] = [];
+    const processedLiveProviderIds = new Set<string>();
+    let configChanged = false;
+    const restrictToCloud = options.checkDesktopAppRestriction({ restriction: "allowCustomProviders" });
+
+    const canSyncProvider = (provider: DenOrgLlmProvider) =>
+      isProviderAllowedByDesktopPolicy({
+        providerId: getCloudManagedProviderId(provider),
+        restrictToCloud,
+        checkRestriction: options.checkDesktopAppRestriction,
+      });
+
+    const shouldSkipTerminalConflict = (cloudProviderId: string) =>
+      reason !== "manual" && state.lastSyncError[cloudProviderId]?.kind === "conflict";
+
+    for (const importedProvider of Object.values(importedProviders)) {
+      const liveProvider = liveProviderMap.get(importedProvider.cloudProviderId);
+      if (!liveProvider) {
+        try {
+          await removeCloudProviderInternal(importedProvider.cloudProviderId, { silent: true });
+          setCloudProviderSyncError(importedProvider.cloudProviderId, null);
+          configChanged = true;
+        } catch (error) {
+          failures.push(recordCloudProviderSyncError(importedProvider.cloudProviderId, reason, error));
+        }
+        continue;
+      }
+
+      processedLiveProviderIds.add(liveProvider.id);
+
+      if (!canSyncProvider(liveProvider) || shouldSkipTerminalConflict(liveProvider.id)) {
+        continue;
+      }
+
+      if (!isCloudProviderOutOfSync(liveProvider, importedProvider)) {
+        setCloudProviderSyncError(liveProvider.id, null);
+        continue;
+      }
+      if (!liveProvider.hasApiKey && getCloudProviderEnv(liveProvider.providerConfig).length > 0) {
+        setCloudProviderSyncError(liveProvider.id, {
+          kind: "needs_credential",
+          message: `${liveProvider.name} does not have a stored organization credential yet.`,
+        });
+        continue;
+      }
+
+      try {
+        // Reconcile in place with a single idempotent rewrite. Re-importing
+        // via connectCloudProviderInternal fetches the fresh Den model list
+        // and fully replaces the `lpr_*` provider block (added/changed/removed
+        // models) while keeping the import baseline. The previous
+        // remove-then-reconnect dance could leave the block deleted if the
+        // reconnect aborted on a stale in-memory connected-providers guard,
+        // so the workspace kept the first-import snapshot forever (#2346).
+        await connectCloudProviderInternal(liveProvider.id, { silent: true });
+        setCloudProviderSyncError(liveProvider.id, null);
+        configChanged = true;
+      } catch (error) {
+        failures.push(recordCloudProviderSyncError(liveProvider.id, reason, error));
+      }
+    }
+
+    const nextImportedProviders = state.importedCloudProviders;
+    const newlyImported: Array<{ id: string; name: string; providerId: string; firstModelId?: string; firstModelName?: string }> = [];
+    for (const liveProvider of liveProviders) {
+      if (processedLiveProviderIds.has(liveProvider.id)) {
+        continue;
+      }
+      if (nextImportedProviders[liveProvider.id]) {
+        continue;
+      }
+      if (!canSyncProvider(liveProvider) || shouldSkipTerminalConflict(liveProvider.id)) {
+        continue;
+      }
+      if (!liveProvider.hasApiKey && getCloudProviderEnv(liveProvider.providerConfig).length > 0) {
+        setCloudProviderSyncError(liveProvider.id, {
+          kind: "needs_credential",
+          message: `${liveProvider.name} does not have a stored organization credential yet.`,
+        });
+        continue;
+      }
+
+      try {
+        await connectCloudProviderInternal(liveProvider.id, { silent: true });
+        setCloudProviderSyncError(liveProvider.id, null);
+        configChanged = true;
+        const firstModel = liveProvider.models[0] ?? null;
+        newlyImported.push({
+          id: liveProvider.id,
+          name: liveProvider.name,
+          providerId: liveProvider.providerId,
+          firstModelId: firstModel?.id,
+          firstModelName: firstModel?.name ?? firstModel?.id,
+        });
+      } catch (error) {
+        failures.push(recordCloudProviderSyncError(liveProvider.id, reason, error));
+      }
+    }
+
+    const refreshedCatalog = await refreshProvidersAfterCloudSync(
+      configChanged ? { dispose: true } : { force: true },
+    ).catch(() => null);
+    if (refreshedCatalog && failures.length === 0 && usageScope === readGatewayUsageScope()
+      && usageContext === getCloudProviderSyncContextKey()
+      && Object.values(state.importedCloudProviders).every((provider) => liveProviderMap.has(provider.cloudProviderId))) {
+      verifiedGatewayUsageContext = usageContext;
+      setStateField("gatewayUsageProviderScope", usageScope.generation);
+    }
+
+    // Notify the UI about newly imported providers so the global toast
+    // can be shown regardless of which route is active.
+    if (newlyImported.length > 0) {
+      dispatchNewProviders({
+        providers: newlyImported,
+        source: reason === "sign_in" ? "sign_in" : "cloud_sync",
+      });
+    }
+
+    if (failures.length > 0) {
+      throw new Error(failures.join("\n"));
+    }
+  }
+
+  function isGatewayModelAvailable(provider: GatewayConnectProvider, model: { providerID: string; modelID: string }) {
+    return isGatewayModelReady(provider, model, state)
+      && isProviderAllowedByDesktopPolicy({ providerId: model.providerID,
+        restrictToCloud: options.checkDesktopAppRestriction({ restriction: "allowCustomProviders" }),
+        checkRestriction: options.checkDesktopAppRestriction })
+      && options.providerConnectedIds().includes(model.providerID)
+      && !options.disabledProviders().includes(model.providerID)
+      && options.providers().some((entry) => entry.id === model.providerID && Boolean(entry.models[model.modelID]));
+  }
+
+  async function startGatewayProviderOAuth(providerId: string, credentialSetId?: string, signal?: AbortSignal) {
+    const orgId = readDenSettings().activeOrgId;
+    const client = options.idexalOsServer.getSnapshot().idexalOsServerClient;
+    if (!orgId || !client) throw new Error("Sign in to idexal Os before connecting this provider.");
+    if (getIdexalOsGatewayOrigin()) throw new Error("Open My Model Connections in Den to connect your account, then refresh models here.");
+    const contextKey = getCloudProviderSyncContextKey();
+    const isCurrent = () => !disposed && !signal?.aborted && contextKey === getCloudProviderSyncContextKey();
+    if (!isCurrent() || !await pushDenSession() || !isCurrent()) {
+      throw new Error("The active account or organization changed, or its session could not be delivered. Retry sign-in.");
+    }
+    const delivery = syncDenSessionDelivery();
+    if (!delivery || !isCurrent()) throw new Error("The active account changed. Retry sign-in.");
+    const requestSignal = signal ? AbortSignal.any([signal, delivery.controller.signal]) : delivery.controller.signal;
+    const result = await client.startGatewayProviderOAuth(providerId, orgId, credentialSetId, requestSignal);
+    if (!isCurrent()) throw new Error("The active account or organization changed. Retry sign-in.");
+    return result;
+  }
+
+  async function runCloudProviderSync(reason: CloudProviderSyncReason): Promise<void | { outcome: "handled_server_side" | "handled_live" }> {
+    if (disposed) return;
+    const delivery = syncDenSessionDelivery();
+    const contextKey = getCloudProviderSyncContextKey();
+    const usageScope = readGatewayUsageScope();
+    const isCurrent = () => !disposed && usageScope === readGatewayUsageScope()
+      && contextKey === getCloudProviderSyncContextKey();
+    const refreshUsageOnly = () => {
+      if (!usageScope.token || !usageScope.organizationId) return Promise.resolve();
+      return enqueueGlobalCloudProviderSync(
+        `usage:${contextKey}`,
+        async () => { void refreshGatewayUsageAfterCloudSync(usageScope); },
+        isCurrent,
+      ).catch(() => {});
+    };
+    if (!hasCloudProviderSyncPrerequisites()) {
+      await refreshUsageOnly();
+      if (!isCurrent()) return;
+      if (reason === "settings_cloud_opened") {
+        setStateField("providerAuthError", null);
+      }
+      // The trusted local server needs the session before the engine or
+      // workspace is ready. Provider materialization still waits for both.
+      if (delivery && !getIdexalOsGatewayOrigin()) {
+        try {
+          await pushDenSession("identity");
+        } catch (error) {
+          if (isCurrentDenSessionDelivery(delivery)) logCloudProviderSyncError(reason, error);
+        }
+      }
+      return;
+    }
+    if (getIdexalOsGatewayOrigin()) {
+      await refreshUsageOnly();
+      if (!isCurrent()) return;
+      if (!loggedGatewayCloudProviderSyncSkip) {
+        loggedGatewayCloudProviderSyncSkip = true;
+        console.info(
+          `[cloud-provider-sync:${reason}] Provider materialization is handled server-side in gateway mode.`,
+        );
+      }
+      if (reason === "manual" || reason === "settings_cloud_opened") {
+        await refreshProvidersAfterCloudSync({ force: true }, isCurrent);
+      }
+      return { outcome: "handled_server_side" };
+    }
+
+    if (serverHandlesProviderSync()) {
+      const isCurrent = () => isCurrentDenSessionDelivery(delivery) && usageScope === readGatewayUsageScope()
+        && contextKey === getCloudProviderSyncContextKey();
+      try {
+        const result = await enqueueGlobalCloudProviderSync(
+          `server:${contextKey}`,
+          async () => {
+            if (!isCurrent()) return;
+            const idexalOsClient = options.idexalOsServer.getSnapshot().idexalOsServerClient;
+            if (!idexalOsClient) throw new Error("idexal Os server unavailable.");
+            // An old server session can still return noop after a failed token
+            // refresh. Delivery must succeed before every run, not just no_session.
+            if (!await pushDenSession() || !isCurrent()) return;
+            // Session delivery above must continue even when V2 owns provider
+            // reconciliation. Do not wake the legacy config writer in that mode.
+            if (isOpencodeV2BaseUrl(options.providerBaseUrl())) {
+              const status = await idexalOsClient.getEngineV2PreviewStatus().catch(() => null);
+              if (!isCurrent()) return;
+              const baseUrl = options.providerBaseUrl();
+              const queryClient = getReactQueryClient();
+              const key = liveProviderSyncStatusQueryKey(baseUrl);
+              const previouslyLive = usesLiveProviderSync({ baseUrl, status: queryClient.getQueryData<LiveProviderSyncStatus>(key) });
+              if (status) queryClient.setQueryData(key, status);
+              if (usesLiveProviderSync({ baseUrl, status })) {
+                // Registration may have emitted native events before the app
+                // knew who owned sync. Reconcile once when ownership is learned.
+                if (!previouslyLive) dispatchProviderCatalogChanged({
+                  baseUrl, directory: options.selectedWorkspaceRoot(), reason: "reconnect",
+                });
+                void refreshGatewayUsageAfterCloudSync(usageScope);
+                return { status: "live" as const };
+              }
+            }
+            let result = await idexalOsClient.runCloudProviderSyncNow(reason, delivery?.controller.signal);
+            if (!isCurrent()) return;
+            if (result.status === "no_session") {
+              if (!await pushDenSession("sync", true) || !isCurrent()) return;
+              result = await idexalOsClient.runCloudProviderSyncNow(reason, delivery?.controller.signal);
+            }
+            if (isCurrent()) void refreshGatewayUsageAfterCloudSync(usageScope);
+            return result;
+          },
+          isCurrent,
+        );
+        if (!isCurrent()) return;
+        if (!result) throw new Error("Cloud provider sync returned no result.");
+        if (result.status === "live") return { outcome: "handled_live" };
+        // Re-derive the imported records (and reloadPending/skips) from the
+        // server's status after EVERY server-handled pass. Without this the
+        // Cloud Providers rows kept whatever the one-shot start() read found
+        // (usually nothing) and sat on "Syncing" forever even though the
+        // server had long since applied the sync (#3671, UI layer).
+        if (result.status === "failed" || result.status === "no_session") {
+          verifiedGatewayUsageContext = "";
+          setStateField("gatewayUsageProviderScope", null);
+        }
+        await refreshImportedCloudProviders({
+          verifiedScope: result.status === "applied" || result.status === "noop" ? usageScope.generation : undefined,
+        });
+        if (!isCurrent()) return;
+        if (result.status === "failed" || result.status === "no_session") {
+          const message = logCloudProviderSyncError(
+            reason,
+            new Error(result.message ?? "Cloud provider sync failed."),
+          );
+          publishSettingsCloudProviderSyncError(reason, message);
+          return;
+        }
+        // The server may already be synchronized while this route still holds
+        // a removed managed-model default. Always reread the live catalog and
+        // reconcile that preference so Settings diagnostics recover in place,
+        // including after a noop server sync.
+        await refreshProvidersAfterCloudSync({ force: true }, isCurrent);
+        if (!isCurrent()) return;
+        return { outcome: "handled_server_side" };
+      } catch (error) {
+        if (!isCurrent()) return;
+        const message = logCloudProviderSyncError(reason, error);
+        publishSettingsCloudProviderSyncError(reason, message);
+        return;
+      }
+    }
+
+    await enqueueGlobalCloudProviderSync(
+      `client:${contextKey}`,
+      async () => {
+        try {
+          await performCloudProviderSync(reason);
+        } finally {
+          if (isCurrent()) void refreshGatewayUsageAfterCloudSync(usageScope);
+        }
+      },
+      isCurrent,
+    ).catch((error) => {
+      if (!isCurrent()) return;
+      const message = logCloudProviderSyncError(reason, error);
+      publishSettingsCloudProviderSyncError(reason, message);
+    });
+  }
+
+  async function disconnectProvider(providerId: string) {
+    setStateField("providerAuthError", null);
+    const c = options.client();
+    if (!c) {
+      throw new Error(t("providers.not_connected"));
+    }
+
+    const resolved = providerId.trim();
+    if (!resolved) {
+      throw new Error(t("providers.provider_id_required"));
+    }
+
+    const trackedImport = Object.values(state.importedCloudProviders).find(
+      (entry) => entry.providerId === resolved,
+    );
+    if (trackedImport) {
+      return await removeCloudProvider(trackedImport.cloudProviderId);
+    }
+
+    const workspaceKey = currentWorkspaceKey();
+    const baseUrl = options.providerBaseUrl();
+    const isCurrentWorkspace = () => !disposed
+      && workspaceKey === currentWorkspaceKey()
+      && baseUrl === options.providerBaseUrl();
+    const requireDiscovery = (updated: ProviderListResponse | null, requireDisconnected = false) => {
+      if (!isCurrentWorkspace() || !updated || !Array.isArray(updated.all) || !Array.isArray(updated.connected)
+        || (requireDisconnected && updated.connected.includes(resolved))) {
+        throw new Error(t("providers.disconnect_unverified"));
+      }
+      return updated;
+    };
+    const engineUnavailable = (error: unknown) => {
+      const message = describeProviderError(error, "").toLowerCase();
+      return /opencode_unreachable|engine is unavailable|fetch failed|timed? ?out|econn|ehost|eai_again|socket hang up/.test(message);
+    };
+    // Credentials are already gone at these call sites. A restarting engine
+    // must not turn that success into "Request failed / timed out"; the next
+    // catalog refresh hides the provider once the engine answers.
+    const refreshForDisconnect = async (
+      load: () => Promise<ProviderListResponse | null>,
+      requireDisconnected = false,
+    ): Promise<ProviderListResponse | "offline"> => {
+      try {
+        return requireDiscovery(await load(), requireDisconnected);
+      } catch (error) {
+        if (!engineUnavailable(error)) throw error;
+        return "offline";
+      }
+    };
+    const offlineDisconnectMessage = (providerId: string) =>
+      `${t("providers.disconnected_prefix")} ${providerId}. ${t("providers.disconnect_offline")}`;
+
+    try {
+      // A person-added custom provider is a block this app wrote (runtime
+      // config, or the project opencode.jsonc fallback) plus a stored key.
+      // Removing only the key would leave a broken definition in every list,
+      // so delete the block and the key together.
+      if (resolved.startsWith(CUSTOM_PROVIDER_ID_PREFIX)) {
+        let configChanged = false;
+        try {
+          const { idexalOsClient, idexalOsWorkspaceId, canUseIdexalOsServer } =
+            await resolveIdexalOsConfigTarget("write");
+          if (canUseIdexalOsServer && idexalOsClient && idexalOsWorkspaceId) {
+            await patchRuntimeProviders({ [resolved]: null }, isCurrentWorkspace);
+            configChanged = true;
+          }
+        } catch {
+          // Not in the runtime config; the project-config fallback covers it.
+        }
+        try {
+          const removedFromProject = await updateProjectConfigFile(
+            (raw) => formatConfigWithoutCustomProvider(raw, resolved, options.disabledProviders()),
+            undefined,
+            isCurrentWorkspace,
+          );
+          configChanged = configChanged || removedFromProject;
+        } catch {
+          // Best effort; credential removal below still runs.
+        }
+        try {
+          await removeProviderAuthCredentials(resolved);
+        } catch {
+          // A keyless endpoint stores an empty key; there may be nothing to remove.
+        }
+        if (await refreshForDisconnect(
+          () => refreshProviders(
+            { dispose: true, configChanged, force: true, forceDispose: true },
+            isCurrentWorkspace,
+          ),
+          true,
+        ) === "offline") {
+          removeProviderFromState(resolved);
+          return offlineDisconnectMessage(resolved);
+        }
+        removeProviderFromState(resolved);
+        return `${t("providers.disconnected_prefix")} ${resolved}`;
+      }
+
+      // OpenCode Zen is built-in / env-backed. Credential removal alone leaves
+      // it connected — disable it via runtime OPENCODE_CONFIG injection.
+      if (resolved.toLowerCase() === DESKTOP_RESTRICTION_OPENCODE_PROVIDER_ID) {
+        try {
+          await removeProviderAuthCredentials(resolved);
+        } catch {
+          // Zen may have no stored credentials; disable still applies.
+        }
+        if (!isCurrentWorkspace()) throw new Error(t("providers.disconnect_unverified"));
+        const configChanged = await ensureProjectProviderDisabledState(resolved, true);
+        if (await refreshForDisconnect(
+          () => refreshProviders({ dispose: true, configChanged }, isCurrentWorkspace),
+          true,
+        ) === "offline") {
+          removeProviderFromState(resolved);
+          return offlineDisconnectMessage(resolved);
+        }
+        removeProviderFromState(resolved);
+        return `${t("providers.disconnected_prefix")} ${resolved}`;
+      }
+
+      await removeProviderAuthCredentials(resolved);
+      const updated = await refreshForDisconnect(() => refreshProviders({ dispose: true }, isCurrentWorkspace));
+      if (updated === "offline") {
+        removeProviderFromState(resolved);
+        return offlineDisconnectMessage(resolved);
+      }
+      if (updated.connected.includes(resolved)) {
+        const stillConnected = updated.all.find((provider) => provider.id === resolved);
+        if (stillConnected && stillConnected.source !== "env") {
+          // The provider definition lives in an opencode config file (for
+          // example ~/.config/opencode/opencode.json), so credential removal
+          // alone can never disconnect it. Disable it via disabled_providers,
+          // exactly like the built-in OpenCode Zen branch above, instead of
+          // leaving the Disconnect button a silent no-op.
+          const configChanged = await ensureProjectProviderDisabledState(resolved, true);
+          if (await refreshForDisconnect(
+            () => refreshProviders({ dispose: true, configChanged }, isCurrentWorkspace),
+            true,
+          ) === "offline") {
+            removeProviderFromState(resolved);
+            return offlineDisconnectMessage(resolved);
+          }
+          removeProviderFromState(resolved);
+          return `${t("providers.disconnected_prefix")} ${resolved}`;
+        }
+        // Provider is still connected via env var. Just remove stored
+        // credentials; the environment stays operator-owned, so do NOT add
+        // it to disabled_providers.
+        return `Removed stored credentials for ${resolved}${t("providers.still_connected_suffix")}`;
+      }
+      removeProviderFromState(resolved);
+      return `${t("providers.disconnected_prefix")} ${resolved}`;
+    } catch (error) {
+      const message = describeProviderError(error, t("providers.disconnect_failed"));
+      setStateField("providerAuthError", message);
+      throw error instanceof Error ? error : new Error(message);
+    }
+  }
+
+  /**
+   * Undo a Disconnect that hid a provider through `disabled_providers` (for
+   * example OpenCode Zen, which has no credentials to remove). Once hidden the
+   * engine drops it from every list, so this is the only way back in the UI.
+   */
+  async function enableProvider(providerId: string) {
+    setStateField("providerAuthError", null);
+    const resolved = providerId.trim();
+    if (!resolved) {
+      throw new Error(t("providers.provider_id_required"));
+    }
+    assertProviderAllowedByDesktopPolicy(resolved);
+    const workspaceKey = currentWorkspaceKey();
+    const baseUrl = options.providerBaseUrl();
+    const isCurrentWorkspace = () => !disposed
+      && workspaceKey === currentWorkspaceKey()
+      && baseUrl === options.providerBaseUrl();
+    try {
+      const configChanged = await ensureProjectProviderDisabledState(resolved, false);
+      await refreshProviders({ dispose: true, configChanged }, isCurrentWorkspace);
+      return `${t("providers.enabled_prefix")} ${resolved}`;
+    } catch (error) {
+      const message = describeProviderError(error, t("providers.enable_failed"));
+      setStateField("providerAuthError", message);
+      throw error instanceof Error ? error : new Error(message);
+    }
+  }
+
+  function isProviderAddRestricted(providerId?: string | null) {
+    return isProviderAddRestrictedByDesktopPolicy({
+      providerId,
+      checkRestriction: options.checkDesktopAppRestriction,
+    });
+  }
+
+  async function openProviderAuthModal(optionsArg?: {
+    returnFocusTarget?: ProviderReturnFocusTarget;
+    preferredProviderId?: string;
+  }) {
+    if (isProviderAddRestricted(optionsArg?.preferredProviderId)) {
+      const message = t("providers.custom_providers_disabled");
+      mutateState((current) => ({
+        ...current,
+        providerAuthReturnFocusTarget: "none",
+        providerAuthPreferredProviderId: null,
+        providerAuthBusy: false,
+        providerAuthModalOpen: false,
+        providerAuthError: message,
+      }));
+      throw new Error(message);
+    }
+
+    mutateState((current) => ({
+      ...current,
+      providerAuthReturnFocusTarget: optionsArg?.returnFocusTarget ?? "none",
+      providerAuthPreferredProviderId: optionsArg?.preferredProviderId?.trim() || null,
+      providerAuthBusy: true,
+      providerAuthError: null,
+    }));
+
+    try {
+      const methods = await loadProviderAuthMethods();
+      mutateState((current) => ({
+        ...current,
+        providerAuthMethods: methods,
+        providerAuthModalOpen: true,
+      }));
+    } catch (error) {
+      const message = describeProviderError(error, t("providers.load_failed"));
+      mutateState((current) => ({
+        ...current,
+        providerAuthPreferredProviderId: null,
+        providerAuthReturnFocusTarget: "none",
+        providerAuthError: message,
+      }));
+      throw error;
+    } finally {
+      setStateField("providerAuthBusy", false);
+    }
+  }
+
+  function closeProviderAuthModal(optionsArg?: { restorePromptFocus?: boolean }) {
+    const shouldFocusPrompt =
+      optionsArg?.restorePromptFocus ?? state.providerAuthReturnFocusTarget === "composer";
+    mutateState((current) => ({
+      ...current,
+      providerAuthModalOpen: false,
+      providerAuthError: null,
+      providerAuthPreferredProviderId: null,
+      providerAuthReturnFocusTarget: "none",
+    }));
+    if (shouldFocusPrompt) {
+      options.focusPromptSoon?.();
+    }
+  }
+
+  const subscribe = (listener: () => void) => {
+    listeners.add(listener);
+    return () => {
+      listeners.delete(listener);
+    };
+  };
+
+  const currentWorkspaceKey = () =>
+    `${options.selectedWorkspaceRoot().trim()}::${options.runtimeWorkspaceId() ?? ""}`;
+
+  const syncFromOptions = () => {
+    if (disposed) return;
+    const delivery = syncDenSessionDelivery();
+    const workspaceKey = currentWorkspaceKey();
+    const workspaceChanged = workspaceKey !== lastWorkspaceKey;
+    lastWorkspaceKey = workspaceKey;
+    refreshSnapshot();
+    emitChange();
+    if (workspaceChanged) {
+      setStateField("lastSyncError", {});
+      void refreshImportedCloudProviders();
+    }
+    if (serverHandlesProviderSync()) {
+      const nextSyncContextKey = getCloudProviderSyncContextKey();
+      if (nextSyncContextKey === cloudProviderSyncContextKey) return;
+      cloudProviderSyncContextKey = nextSyncContextKey;
+      void runCloudProviderSync("app_launch").then((result) => {
+        if (!result && isCurrentDenSessionDelivery(delivery) && cloudProviderSyncContextKey === nextSyncContextKey) {
+          cloudProviderSyncContextKey = "";
+        }
+      });
+      return;
+    }
+    if (!hasCloudProviderSyncPrerequisites()) {
+      cloudProviderSyncContextKey = "";
+      return;
+    }
+
+    const nextSyncContextKey = getCloudProviderSyncContextKey();
+    if (nextSyncContextKey === cloudProviderSyncContextKey) {
+      return;
+    }
+
+    cloudProviderSyncContextKey = nextSyncContextKey;
+    void runCloudProviderSync("app_launch");
+  };
+
+  const start = () => {
+    if (started) return;
+    // StrictMode double-mount re-arms after dispose.
+    disposed = false;
+    started = true;
+    lastWorkspaceKey = currentWorkspaceKey();
+    if (typeof window !== "undefined") {
+      const handleDenSessionUpdate = (event: Event) => {
+        const detail = (event as CustomEvent<DenSessionUpdatedDetail>).detail;
+        if (detail?.status !== "success" && detail?.status !== "signed_out") return;
+
+        cloudOrgProvidersGeneration += 1;
+        cloudOrgProvidersLoadKey = "";
+        cloudOrgProvidersInFlightKey = "";
+        cloudOrgProvidersInFlight = null;
+
+        if (detail.status === "success") {
+          mutateState((current) => ({
+            ...current,
+            cloudOrgProviders: [],
+            providerAuthMethods: {},
+            providerAuthError: null,
+            cloudProviderServerSync: null,
+            lastSyncError: {},
+          }));
+          void refreshCloudOrgProviders({ force: true }).catch(() => undefined);
+          void runCloudProviderSync("sign_in");
+        } else {
+          invalidateDenSessionDelivery();
+          const connectedProviderIdsBeforeLogout = options.providerConnectedIds();
+          const logoutProviderIds = [...new Set([
+            ...Object.values(state.importedCloudProviders).map((provider) => provider.providerId),
+            ...state.cloudOrgProviders.map(getCloudManagedProviderId),
+          ])];
+          // Account-scoped catalog state must disappear synchronously. Config
+          // and credential cleanup continues below without leaving stale
+          // models visible while those best-effort operations finish.
+          clearProviderListQueries(getReactQueryClient());
+          for (const providerId of logoutProviderIds) {
+            removeProviderFromState(providerId);
+          }
+          if (
+            logoutProviderIds.some(
+              (providerId) => providerId === readStoredDefaultModel().providerID,
+            )
+          ) {
+            writeStoredDefaultModel(DEFAULT_MODEL);
+          }
+          mutateState((current) => ({
+            ...current,
+            cloudOrgProviders: [],
+            providerAuthMethods: {},
+            providerAuthError: null,
+            cloudProviderServerSync: null,
+            lastSyncError: {},
+          }));
+          if (serverHandlesProviderSync()) {
+            const workspaceKey = currentWorkspaceKey();
+            const generation = cloudOrgProvidersGeneration;
+            const isCurrent = () => !disposed && generation === cloudOrgProvidersGeneration && workspaceKey === currentWorkspaceKey();
+            setStateField("importedCloudProviders", {});
+            void (async () => {
+              const cleared = await options.idexalOsServer.getSnapshot().idexalOsServerClient?.deleteDenSession().then(() => true, () => false);
+              if (!isCurrent()) return;
+              // The server removes cloud-owned environment entries from disk,
+              // but a running OpenCode child retains its spawn environment.
+              // Explicit desktop sign-out must replace that process so an
+              // account-scoped provider cannot remain connected in the UI.
+              if (isDesktopRuntime()) {
+                await engineRestart({}).catch(() => undefined);
+              }
+              if (!cleared) return;
+              const providers = await refreshProviders({ force: true }, isCurrent);
+              const defaultProviderId = readStoredDefaultModel().providerID;
+              if (
+                providers &&
+                connectedProviderIdsBeforeLogout.includes(defaultProviderId) &&
+                isCloudManagedProviderKey(defaultProviderId) &&
+                !providers.connected.includes(defaultProviderId)
+              ) {
+                writeStoredDefaultModel(DEFAULT_MODEL);
+              }
+            })();
+            return;
+          }
+          // Sign-out: remove all cloud-imported providers from the workspace
+          // Capture the full import records BEFORE clearing state
+          const importedProviders = { ...state.importedCloudProviders };
+          const importedIds = Object.keys(importedProviders);
+
+          // Best-effort cleanup: remove each cloud provider from opencode.jsonc
+          // BEFORE clearing state so removeCloudProviderInternal can find the records
+          void (async () => {
+            for (const cloudId of importedIds) {
+              try {
+                await removeCloudProviderInternal(cloudId, { silent: true });
+              } catch {
+                // Ignore individual removal failures during sign-out cleanup
+              }
+            }
+            // Final sweep: remove any orphan `lpr_*` provider keys that remain
+            // in opencode.jsonc but weren't tracked in importedCloudProviders
+            // (e.g. from a previous failed cleanup or external edit).
+            try {
+              const orphans = await sweepOrphanCloudProvidersFromConfig();
+              for (const providerId of orphans) {
+                try {
+                  await removeProviderAuthCredentials(providerId);
+                } catch {
+                  // Ignore auth removal failures for orphans
+                }
+              }
+              if (orphans.length > 0) {
+                options.markOpencodeConfigReloadRequired();
+              }
+            } catch {
+              // Ignore sweep failures during sign-out cleanup
+            }
+            // Clear state AFTER cleanup so the records are available during removal
+            mutateState((current) => ({
+              ...current,
+              cloudOrgProviders: [],
+              providerAuthMethods: {},
+              providerAuthError: null,
+              importedCloudProviders: {},
+              cloudProviderServerSync: null,
+              lastSyncError: {},
+            }));
+            refreshSnapshot();
+            emitChange();
+          })();
+        }
+      };
+      window.addEventListener(
+        denSessionUpdatedEvent,
+        handleDenSessionUpdate as EventListener,
+      );
+      const handleDenSettingsChange = () => {
+        syncFromOptions();
+        void refreshCloudOrgProviders({ force: true }).catch(() => undefined);
+      };
+      window.addEventListener(
+        denSettingsChangedEvent,
+        handleDenSettingsChange,
+      );
+      denSessionCleanup = () => {
+        window.removeEventListener(
+          denSessionUpdatedEvent,
+          handleDenSessionUpdate as EventListener,
+        );
+        window.removeEventListener(
+          denSettingsChangedEvent,
+          handleDenSettingsChange,
+        );
+      };
+    }
+    // The member's assigned model catalog is organization-scoped, not
+    // workspace-scoped. Hydrate it independently so the model picker works on
+    // first launch before a workspace exists (workspace sync still handles
+    // credential materialization once a workspace is selected).
+    void refreshCloudOrgProviders().catch(() => undefined);
+    const importRefreshGeneration = cloudOrgProvidersGeneration;
+    const importRefreshContextKey = getCloudProviderSyncContextKey();
+    const importRefreshWorkspaceKey = cloudImportWorkspaceKey();
+    void refreshImportedCloudProviders().then((imported) => {
+      if (
+        disposed || importRefreshGeneration !== cloudOrgProvidersGeneration ||
+        importRefreshContextKey !== getCloudProviderSyncContextKey() || importRefreshWorkspaceKey !== cloudImportWorkspaceKey()
+      ) return;
+      if (serverHandlesProviderSync()) {
+        if (!readDenSettings().authToken?.trim()) {
+          void options.idexalOsServer.getSnapshot().idexalOsServerClient?.deleteDenSession().catch(() => undefined);
+        }
+        return;
+      }
+      // Startup cleanup: if no auth token, remove any cloud providers that
+      // were left behind. Handles orphans from a previous sign-out that
+      // didn't clean up (e.g. crash, force-quit, external edit).
+      if (!hasCloudProviderSyncPrerequisites()) {
+        void (async () => {
+          // First: remove anything tracked in import state
+          if (imported && Object.keys(imported).length > 0) {
+            for (const cloudId of Object.keys(imported)) {
+              try {
+                await removeCloudProviderInternal(cloudId, { silent: true });
+              } catch {}
+            }
+          }
+          // Then: sweep any `lpr_*` keys that remain in opencode.jsonc
+          try {
+            const orphans = await sweepOrphanCloudProvidersFromConfig();
+            for (const providerId of orphans) {
+              try {
+                await removeProviderAuthCredentials(providerId);
+              } catch {}
+            }
+            if (orphans.length > 0) {
+              options.markOpencodeConfigReloadRequired();
+            }
+          } catch {}
+          mutateState((current) => ({
+            ...current,
+            importedCloudProviders: {},
+            cloudProviderServerSync: null,
+          }));
+          refreshSnapshot();
+          emitChange();
+        })();
+      }
+    });
+    refreshSnapshot();
+    emitChange();
+  };
+
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    invalidateDenSessionDelivery();
+    started = false;
+    denSessionCleanup?.();
+    denSessionCleanup = null;
+    listeners.clear();
+  };
+
+  refreshSnapshot();
+
+  return {
+    subscribe,
+    getSnapshot: () => snapshot,
+    start,
+    dispose,
+    syncFromOptions,
+    refreshCloudOrgProviders,
+    refreshImportedCloudProviders: (input?: { strict?: boolean }) => refreshImportedCloudProviders({ strict: input?.strict }),
+    runCloudProviderSync,
+    startGatewayProviderOAuth,
+    isGatewayModelAvailable,
+    startProviderAuth,
+    refreshProviders,
+    completeProviderAuthOAuth,
+    submitProviderApiKey,
+    addCustomProvider,
+    connectCloudProvider,
+    removeCloudProvider,
+    disconnectProvider,
+    enableProvider,
+    ensureProjectProviderDisabledState,
+    isProviderAddRestricted,
+    openProviderAuthModal,
+    closeProviderAuthModal,
+  };
+}
+
+export function useProviderAuthStoreSnapshot(store: ProviderAuthStore) {
+  return useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+}

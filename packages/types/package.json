@@ -1,0 +1,412 @@
+{
+  "name": "@idexal/types",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./workbot-context": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/workbot-context.d.ts",
+        "default": "./src/workbot-context.ts"
+      },
+      "development": "./src/workbot-context.ts",
+      "default": "./src/workbot-context.ts"
+    },
+    "./google-drive-upload": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/google-drive-upload.d.ts",
+        "default": "./src/google-drive-upload.ts"
+      },
+      "development": "./src/google-drive-upload.ts",
+      "bun": "./src/google-drive-upload.ts",
+      "default": "./dist/google-drive-upload.js"
+    },
+    "./den/managed-deployments": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/managed-deployments.d.ts",
+        "default": "./src/den/managed-deployments.ts"
+      },
+      "development": "./src/den/managed-deployments.ts",
+      "default": "./src/den/managed-deployments.ts"
+    },
+    "./cloud-model-fast": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/cloud-model-fast.d.ts",
+        "default": "./src/cloud-model-fast.ts"
+      },
+      "development": "./src/cloud-model-fast.ts",
+      "bun": "./src/cloud-model-fast.ts",
+      "browser": "./src/cloud-model-fast.ts",
+      "default": "./dist/cloud-model-fast.js"
+    },
+    ".": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/index.d.ts",
+        "default": "./src/index.ts"
+      },
+      "development": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./agent-context-diagnostics": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/agent-context-diagnostics.d.ts",
+        "default": "./src/agent-context-diagnostics.ts"
+      },
+      "development": "./src/agent-context-diagnostics.ts",
+      "default": "./src/agent-context-diagnostics.ts"
+    },
+    "./idexal-os-affordance": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/idexal-os-affordance.d.ts",
+        "default": "./src/idexal-os-affordance.ts"
+      },
+      "development": "./src/idexal-os-affordance.ts",
+      "default": "./src/idexal-os-affordance.ts"
+    },
+    "./idexal-os-context": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/idexal-os-context.d.ts",
+        "default": "./src/idexal-os-context.ts"
+      },
+      "development": "./src/idexal-os-context.ts",
+      "default": "./src/idexal-os-context.ts"
+    },
+    "./idexal-os-provider": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/idexal-os-provider.d.ts",
+        "default": "./src/idexal-os-provider.ts"
+      },
+      "development": "./src/idexal-os-provider.ts",
+      "default": "./src/idexal-os-provider.ts"
+    },
+    "./automations": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/automations.d.ts",
+        "default": "./src/automations.ts"
+      },
+      "development": "./src/automations.ts",
+      "default": "./src/automations.ts"
+    },
+    "./automation-models": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/automation-models.d.ts",
+        "default": "./src/automation-models.ts"
+      },
+      "development": "./src/automation-models.ts",
+      "default": "./src/automation-models.ts"
+    },
+    "./automation-schedule": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/automation-schedule.d.ts",
+        "default": "./src/automation-schedule.ts"
+      },
+      "development": "./src/automation-schedule.ts",
+      "default": "./src/automation-schedule.ts"
+    },
+    "./workflows": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/workflows.d.ts",
+        "default": "./src/workflows.ts"
+      },
+      "development": "./src/workflows.ts",
+      "default": "./src/workflows.ts"
+    },
+    "./mcp-app-timing": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/mcp-app-timing.d.ts",
+        "default": "./src/mcp-app-timing.ts"
+      },
+      "development": "./src/mcp-app-timing.ts",
+      "bun": "./src/mcp-app-timing.ts",
+      "browser": "./src/mcp-app-timing.ts",
+      "default": "./dist/mcp-app-timing.js"
+    },
+    "./mcp-app": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/mcp-app.d.ts",
+        "default": "./src/mcp-app.ts"
+      },
+      "development": "./src/mcp-app.ts",
+      "default": "./src/mcp-app.ts"
+    },
+    "./skill-created-app": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/skill-created-app.d.ts",
+        "default": "./src/skill-created-app.ts"
+      },
+      "development": "./src/skill-created-app.ts",
+      "default": "./src/skill-created-app.ts"
+    },
+    "./connection-action-app": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/connection-action-app.d.ts",
+        "default": "./src/connection-action-app.ts"
+      },
+      "development": "./src/connection-action-app.ts",
+      "bun": "./src/connection-action-app.ts",
+      "browser": "./src/connection-action-app.ts",
+      "default": "./dist/connection-action-app.js"
+    },
+    "./den/desktop-app-restrictions": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/desktop-app-restrictions.d.ts",
+        "default": "./src/den/desktop-app-restrictions.ts"
+      },
+      "development": "./src/den/desktop-app-restrictions.ts",
+      "default": "./src/den/desktop-app-restrictions.ts"
+    },
+    "./den/permissions": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/permissions.d.ts",
+        "default": "./src/den/permissions.ts"
+      },
+      "development": "./src/den/permissions.ts",
+      "default": "./src/den/permissions.ts"
+    },
+    "./den/agent-permissions": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/agent-permissions.d.ts",
+        "default": "./src/den/agent-permissions.ts"
+      },
+      "development": "./src/den/agent-permissions.ts",
+      "default": "./src/den/agent-permissions.ts"
+    },
+    "./den/connector-permissions": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/connector-permissions.d.ts",
+        "default": "./src/den/connector-permissions.ts"
+      },
+      "development": "./src/den/connector-permissions.ts",
+      "default": "./src/den/connector-permissions.ts"
+    },
+    "./den/desktop-policies": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/desktop-policies.d.ts",
+        "default": "./src/den/desktop-policies.ts"
+      },
+      "development": "./src/den/desktop-policies.ts",
+      "default": "./src/den/desktop-policies.ts"
+    },
+    "./den/connect-diagnostics": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/connect-diagnostics.d.ts",
+        "default": "./src/den/connect-diagnostics.ts"
+      },
+      "development": "./src/den/connect-diagnostics.ts",
+      "default": "./src/den/connect-diagnostics.ts"
+    },
+    "./den/egress-diagnostics": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/egress-diagnostics.d.ts",
+        "default": "./src/den/egress-diagnostics.ts"
+      },
+      "development": "./src/den/egress-diagnostics.ts",
+      "default": "./src/den/egress-diagnostics.ts"
+    },
+    "./den/managed-models-policy": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/managed-models-policy.d.ts",
+        "default": "./src/den/managed-models-policy.ts"
+      },
+      "development": "./src/den/managed-models-policy.ts",
+      "default": "./src/den/managed-models-policy.ts"
+    },
+    "./den/deployment-capabilities": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/deployment-capabilities.d.ts",
+        "default": "./src/den/deployment-capabilities.ts"
+      },
+      "development": "./src/den/deployment-capabilities.ts",
+      "default": "./src/den/deployment-capabilities.ts"
+    },
+    "./den/audit": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/audit.d.ts",
+        "default": "./src/den/audit.ts"
+      },
+      "development": "./src/den/audit.ts",
+      "default": "./src/den/audit.ts"
+    },
+    "./den/gateway": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/gateway.d.ts",
+        "default": "./src/den/gateway.ts"
+      },
+      "development": "./src/den/gateway.ts",
+      "default": "./dist/den/gateway.js"
+    },
+    "./den/gateway-usage-limits": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/gateway-usage-limits.d.ts",
+        "default": "./src/den/gateway-usage-limits.ts"
+      },
+      "development": "./src/den/gateway-usage-limits.ts",
+      "bun": "./src/den/gateway-usage-limits.ts",
+      "default": "./dist/den/gateway-usage-limits.js"
+    },
+    "./den/gateway-usage": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/gateway-usage.d.ts",
+        "default": "./src/den/gateway-usage.ts"
+      },
+      "development": "./src/den/gateway-usage.ts",
+      "default": "./src/den/gateway-usage.ts"
+    },
+    "./den/inference": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/inference.d.ts",
+        "default": "./src/den/inference.ts"
+      },
+      "development": "./src/den/inference.ts",
+      "default": "./src/den/inference.ts"
+    },
+    "./den/microsoft-365": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/microsoft-365.d.ts",
+        "default": "./src/den/microsoft-365.ts"
+      },
+      "development": "./src/den/microsoft-365.ts",
+      "default": "./src/den/microsoft-365.ts"
+    },
+    "./den/organization-web-origins": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/organization-web-origins.d.ts",
+        "default": "./src/den/organization-web-origins.ts"
+      },
+      "development": "./src/den/organization-web-origins.ts",
+      "default": "./src/den/organization-web-origins.ts"
+    },
+    "./den/workbot-settings": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/workbot-settings.d.ts",
+        "default": "./src/den/workbot-settings.ts"
+      },
+      "development": "./src/den/workbot-settings.ts",
+      "default": "./src/den/workbot-settings.ts"
+    },
+    "./den/default-model": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/default-model.d.ts",
+        "default": "./src/den/default-model.ts"
+      },
+      "development": "./src/den/default-model.ts",
+      "default": "./src/den/default-model.ts"
+    },
+    "./den/credential-prompt": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/credential-prompt.d.ts",
+        "default": "./src/den/credential-prompt.ts"
+      },
+      "development": "./src/den/credential-prompt.ts",
+      "default": "./src/den/credential-prompt.ts"
+    },
+    "./den/mcp-connection-action": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/mcp-connection-action.d.ts",
+        "default": "./src/den/mcp-connection-action.ts"
+      },
+      "development": "./src/den/mcp-connection-action.ts",
+      "default": "./src/den/mcp-connection-action.ts"
+    },
+    "./workspace": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/workspace.d.ts",
+        "default": "./src/workspace.ts"
+      },
+      "development": "./src/workspace.ts",
+      "default": "./src/workspace.ts"
+    },
+    "./desktop-ipc": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/desktop-ipc.d.ts",
+        "default": "./src/desktop-ipc.ts"
+      },
+      "development": "./src/desktop-ipc.ts",
+      "default": "./src/desktop-ipc.ts"
+    },
+    "./connect-link": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/connect-link.d.ts",
+        "default": "./src/connect-link.ts"
+      },
+      "development": "./src/connect-link.ts",
+      "default": "./src/connect-link.ts"
+    },
+    "./url": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/url.d.ts",
+        "default": "./src/url.ts"
+      },
+      "development": "./src/url.ts",
+      "default": "./src/url.ts"
+    },
+    "./den/desktop-policies-runtime": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/desktop-policies.d.ts",
+        "default": "./src/den/desktop-policies.ts"
+      },
+      "development": "./src/den/desktop-policies.ts",
+      "bun": "./src/den/desktop-policies.ts",
+      "default": "./dist/den/desktop-policies.js"
+    },
+    "./den/agent-permissions-runtime": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/agent-permissions.d.ts",
+        "default": "./src/den/agent-permissions.ts"
+      },
+      "development": "./src/den/agent-permissions.ts",
+      "bun": "./src/den/agent-permissions.ts",
+      "default": "./dist/den/agent-permissions.js"
+    },
+    "./den/connector-permissions-runtime": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/connector-permissions.d.ts",
+        "default": "./src/den/connector-permissions.ts"
+      },
+      "development": "./src/den/connector-permissions.ts",
+      "bun": "./src/den/connector-permissions.ts",
+      "default": "./dist/den/connector-permissions.js"
+    },
+    "./den/admin-organization": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/admin-organization.d.ts",
+        "default": "./src/den/admin-organization.ts"
+      },
+      "development": "./src/den/admin-organization.ts",
+      "default": "./src/den/admin-organization.ts"
+    },
+    "./den/admin-free-auto": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/den/admin-free-auto.d.ts",
+        "default": "./src/den/admin-free-auto.ts"
+      },
+      "development": "./src/den/admin-free-auto.ts",
+      "default": "./src/den/admin-free-auto.ts"
+    },
+    "./managed-provider-config": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/managed-provider-config.d.ts",
+        "default": "./src/managed-provider-config.ts"
+      },
+      "development": "./src/managed-provider-config.ts",
+      "bun": "./src/managed-provider-config.ts",
+      "browser": "./src/managed-provider-config.ts",
+      "default": "./dist/managed-provider-config.js"
+    }
+  },
+  "files": [
+    "src",
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup && tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "@idexal/managed-deployments": "workspace:*",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "tsup": "^8.5.0",
+    "typescript": "^5.6.3"
+  }
+}

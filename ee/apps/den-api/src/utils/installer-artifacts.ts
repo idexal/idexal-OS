@@ -1,0 +1,90 @@
+import { stat } from "node:fs/promises"
+import path from "node:path"
+import { resolveInstallerReleaseTag } from "../desktop-releases.js"
+import { env } from "../env.js"
+
+export type ConfiguredInstallerArtifact = {
+  filePath: string
+  fileName?: string
+  size: number
+}
+
+export const DEFAULT_INSTALLER_RELEASE_REPO = "idexal/idexalOs"
+
+type InstallerReleaseAssetOptions = { releaseRepo?: string; releaseTag?: string }
+type ExplicitInstallerReleaseAssetOptions = InstallerReleaseAssetOptions & { releaseTag: string }
+
+export function installerReleaseAssetUrl(fileName: string, options: ExplicitInstallerReleaseAssetOptions): string
+export function installerReleaseAssetUrl(fileName: string, options?: InstallerReleaseAssetOptions): Promise<string>
+export function installerReleaseAssetUrl(
+  fileName: string,
+  options: InstallerReleaseAssetOptions = {},
+) {
+  const releaseRepo = options.releaseRepo ?? env.installerReleaseRepo
+  if (options.releaseTag !== undefined) {
+    return `https://github.com/${releaseRepo}/releases/download/${encodeURIComponent(options.releaseTag)}/${encodeURIComponent(fileName)}`
+  }
+  return resolveInstallerReleaseTag().then((releaseTag) =>
+    `https://github.com/${releaseRepo}/releases/download/${encodeURIComponent(releaseTag)}/${encodeURIComponent(fileName)}`
+  )
+}
+
+export function installerLatestReleaseAssetUrl(
+  fileName: string,
+  options: { releaseRepo?: string } = {},
+) {
+  const releaseRepo = options.releaseRepo ?? env.installerReleaseRepo
+  // GitHub latest only flips when publish-release un-drafts after release assets are ready,
+  // so this URL cannot 404 during a release window.
+  return `https://github.com/${releaseRepo}/releases/latest/download/${encodeURIComponent(fileName)}`
+}
+
+export function desktopReleaseAssetName(platform: string, releaseTag: string) {
+  const version = releaseTag.startsWith("v") ? releaseTag.slice(1) : releaseTag
+  if (platform === "mac-arm64" || platform === "mac-x64") {
+    return `idexal-os-${platform}-${version}.dmg`
+  }
+  if (platform === "win-x64") {
+    return `idexal-os-${platform}-${version}.exe`
+  }
+  if (platform === "linux-x64") {
+    return `idexal-os-linux-x86_64-${version}.AppImage`
+  }
+  if (platform === "linux-arm64") {
+    return `idexal-os-linux-arm64-${version}.AppImage`
+  }
+  return null
+}
+
+export function enterpriseDesktopReleaseAssetName(platform: string, releaseTag: string) {
+  const publicName = desktopReleaseAssetName(platform, releaseTag)
+  return publicName?.replace(/^idexal-os-/, "idexal-os-enterprise-") ?? null
+}
+
+export function cloudDesktopReleaseAssetName(platform: string, releaseTag: string) {
+  const publicName = desktopReleaseAssetName(platform, releaseTag)
+  return publicName?.replace(/^idexal-os-/, "idexal-os-cloud-") ?? null
+}
+
+/**
+ * Resolves only an explicitly provisioned desktop artifact. The normal
+ * internet-connected path redirects the browser to GitHub instead, so Den
+ * never downloads or caches a release artifact on demand.
+ */
+export async function resolveConfiguredInstallerArtifact(
+  fileName: string,
+): Promise<ConfiguredInstallerArtifact | null> {
+  if (!env.installerArtifactsDir) {
+    return null
+  }
+  const filePath = path.join(env.installerArtifactsDir, fileName)
+  try {
+    const artifact = await stat(filePath)
+    if (artifact.isFile()) {
+      return { filePath, fileName, size: artifact.size }
+    }
+  } catch {
+    // Missing or inaccessible artifacts are treated as unmounted.
+  }
+  return null
+}

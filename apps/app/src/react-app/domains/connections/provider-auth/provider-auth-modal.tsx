@@ -1,0 +1,1443 @@
+/** @jsxImportSource react */
+import {
+  ChevronLeft,
+  Loader2,
+  Plus,
+  RefreshCw,
+  Search,
+} from "lucide-react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react";
+
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { toast } from "@/components/ui/sonner";
+import { useIsMobile } from "@/hooks/use-mobile";
+import { openDesktopUrl } from "@/app/lib/desktop";
+import { isDesktopRuntime } from "@/app/utils";
+import { compareProviders } from "@/app/utils/providers";
+import { Button } from "@/components/ui/button";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { ProviderIcon } from "../../../design-system/provider-icon";
+import { OrganizationMark, ProviderSectionLabel, ProviderStatus, ProviderTile } from "../../settings/pages/provider-rows";
+import { autoProviderSubtitle } from "../../models/model-catalog";
+import type { SecretFieldHandle } from "@/components/secret-field";
+import { SecretTextInput } from "../../../design-system/secret-text-input";
+import { TextInput } from "../../../design-system/text-input";
+import {
+  customProviderBaseUrlError,
+  parseCustomProviderModelIds,
+  type CustomProviderFamily,
+  type CustomProviderInput,
+} from "./custom-provider-config";
+import {
+  probeCustomProviderModels,
+  testCustomProviderModel,
+  type CustomProviderProbeFailure,
+} from "./custom-provider-probe";
+import type {
+  ProviderAuthMethod,
+  ProviderAuthProvider,
+  ProviderOAuthStartResult,
+} from "./store";
+
+type ProviderAuthEntry = {
+  id: string;
+  name: string;
+  methods: ProviderAuthMethod[];
+  connected: boolean;
+  env: string[];
+};
+
+type ProviderOAuthSession = ProviderOAuthStartResult & {
+  providerId: string;
+  methodLabel: string;
+};
+
+export const PROVIDER_LABELS: Record<string, string> = {
+  idexalos: "idexal Os",
+  opencode: "idexal Os Zen",
+  openai: "OpenAI",
+  anthropic: "Anthropic",
+  google: "Google",
+  openrouter: "OpenRouter",
+};
+
+const IDEXAL_MODELS_PROVIDER_ID = "idexalos";
+
+export type ProviderAuthModalProps = {
+  open: boolean;
+  loading: boolean;
+  submitting: boolean;
+  error: string | null;
+  preferredProviderId?: string | null;
+  providers: ProviderAuthProvider[];
+  connectedProviderIds: string[];
+  /** Listed by the engine but without the person's own key (built-in Zen): offered under "Available to add". */
+  keylessProviderIds?: ReadonlySet<string>;
+  gatewayProviderIds?: ReadonlySet<string>;
+  authMethods: Record<string, ProviderAuthMethod[]>;
+  onSelect: (providerId: string, methodIndex?: number) => Promise<ProviderOAuthStartResult>;
+  onSubmitApiKey: (providerId: string, apiKey: string) => Promise<string | void>;
+  /** Add a person-defined OpenAI- or Anthropic-compatible provider. */
+  onSubmitCustomProvider?: (input: CustomProviderInput) => Promise<{ providerId: string } | void>;
+  onSubmitOAuth: (
+    providerId: string,
+    methodIndex: number,
+    code?: string,
+  ) => Promise<{ connected: boolean; pending?: boolean; message?: string }>;
+  onRefreshProviders?: () => Promise<unknown>;
+  idexalOsModelsState?: "included" | "off" | "unavailable";
+  organizationName?: string;
+  organizationProviderIds?: ReadonlySet<string>;
+  organizationProviderCount?: number;
+  onOpenDen?: () => void;
+  onClose: () => void;
+};
+
+export default function ProviderAuthModal(props: ProviderAuthModalProps) {
+  const [view, setView] = useState<
+    "list" | "method" | "api" | "oauth-code" | "oauth-auto" | "custom"
+  >("list");
+  const [selectedProviderId, setSelectedProviderId] = useState<string | null>(null);
+  // The key stays in the field until submit takes it; only emptiness is state.
+  const apiKeyField = useRef<SecretFieldHandle>(null);
+  const [hasApiKey, setHasApiKey] = useState(false);
+  const [customName, setCustomName] = useState("");
+  const [customBaseUrl, setCustomBaseUrl] = useState("");
+  const [customModels, setCustomModels] = useState("");
+  const [customFamily, setCustomFamily] = useState<CustomProviderFamily>("openai");
+  const [customProbeBusy, setCustomProbeBusy] = useState(false);
+  const [customProbeStatus, setCustomProbeStatus] = useState<{
+    tone: "ok" | "error" | "info";
+    text: string;
+  } | null>(null);
+  const customApiKeyField = useRef<SecretFieldHandle>(null);
+  const customProbeInFlightRef = useRef(false);
+  const customProbeSignatureRef = useRef("");
+  const [oauthCodeInput, setOauthCodeInput] = useState("");
+  const [oauthSession, setOauthSession] = useState<ProviderOAuthSession | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [activeEntryIndex, setActiveEntryIndex] = useState(0);
+  const [localError, setLocalError] = useState<string | null>(null);
+  const [pollingBusy, setPollingBusy] = useState(false);
+  const [oauthAutoBusy, setOauthAutoBusy] = useState(false);
+  const [oauthCodeCopied, setOauthCodeCopied] = useState(false);
+  const [oauthBrowserOpened, setOauthBrowserOpened] = useState(false);
+
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const isMobile = useIsMobile();
+  const titleRef = useRef<HTMLHeadingElement>(null);
+  const providerButtonsRef = useRef(new Map<string, HTMLButtonElement>());
+  const returnProviderIdRef = useRef<string | null>(null);
+  const previousViewRef = useRef(view);
+  const providerPollRef = useRef<number | null>(null);
+  const oauthAutoPollRef = useRef<number | null>(null);
+  const oauthCodeCopiedResetRef = useRef<number | null>(null);
+  const autoOpenedPreferredProviderIdRef = useRef<string | null>(null);
+
+  const formatProviderName = (id: string, fallback?: string) => {
+    const named = fallback?.trim();
+    if (named) return named;
+
+    const normalized = id.trim();
+    const mapped = PROVIDER_LABELS[normalized.toLowerCase()];
+    if (mapped) return mapped;
+
+    const cleaned = normalized.replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
+    if (!cleaned) return id;
+
+    return cleaned
+      .split(" ")
+      .flatMap((word) => {
+        if (!word) return [];
+        if (/\d/.test(word) || word.length <= 3) {
+          return [word.toUpperCase()];
+        }
+        const lower = word.toLowerCase();
+        return [lower.charAt(0).toUpperCase() + lower.slice(1)];
+      })
+      .join(" ");
+  };
+
+  const isOpenAiHeadlessMethod = (method: ProviderAuthMethod) => {
+    const label = method.label.toLowerCase();
+    return method.type === "oauth" && (label.includes("headless") || label.includes("device"));
+  };
+
+  const isOpenAiProvider = (id: string, fallbackName?: string) => {
+    const normalizedId = id.trim().toLowerCase();
+    const normalizedName = fallbackName?.trim().toLowerCase() ?? "";
+    return normalizedId === "openai" || normalizedName === "openai";
+  };
+
+  const isAnthropicProvider = (id: string, fallbackName?: string) => {
+    const normalizedId = id.trim().toLowerCase();
+    const normalizedName = fallbackName?.trim().toLowerCase() ?? "";
+    return normalizedId === "anthropic" || normalizedName === "anthropic";
+  };
+
+  const isOpencodeZenProvider = (id: string) => id.trim().toLowerCase() === "opencode";
+
+  const OPENCODE_ZEN_KEY_URL = "https://opencode.ai/auth";
+
+  const openExternalUrl = async (url: string) => {
+    if (!url) return;
+    if (isDesktopRuntime()) {
+      await openDesktopUrl(url);
+      return;
+    }
+    window.open(url, "_blank", "noopener,noreferrer");
+  };
+
+  const isClaudeProMaxMethod = (method: ProviderAuthMethod) => {
+    const label = method.label.toLowerCase();
+    return method.type === "oauth" && (label.includes("pro/max") || label.includes("create an api key"));
+  };
+
+  const entries = useMemo<ProviderAuthEntry[]>(() => {
+    const methods = props.authMethods ?? {};
+    const connected = new Set(props.connectedProviderIds ?? []);
+    const providers = props.providers ?? [];
+
+    const providersById = new Map(providers.map((provider) => [provider.id, provider]));
+    const nextEntries = Object.keys(methods)
+      .filter((id) => !props.gatewayProviderIds?.has(id))
+      .flatMap((id) => {
+        const provider = providersById.get(id);
+        const entryMethods = (methods[id] ?? []).filter((method) => {
+          if (isAnthropicProvider(id, provider?.name) && isClaudeProMaxMethod(method)) {
+            return false;
+          }
+          if (!isOpenAiProvider(id, provider?.name)) return true;
+          if (method.type !== "oauth") return true;
+          return !isOpenAiHeadlessMethod(method);
+        });
+        if (entryMethods.length === 0) return [];
+        return [{
+          id,
+          name: formatProviderName(id, provider?.name),
+          methods: entryMethods,
+          connected: connected.has(id) && !props.keylessProviderIds?.has(id),
+          env: Array.isArray(provider?.env) ? provider.env : [],
+        } satisfies ProviderAuthEntry];
+      })
+      .sort(compareProviders);
+
+    return nextEntries.filter((entry) => entry.id !== IDEXAL_MODELS_PROVIDER_ID && entry.id !== "idexal-os-free");
+  }, [props.authMethods, props.connectedProviderIds, props.gatewayProviderIds, props.keylessProviderIds, props.providers]);
+
+  const selectedEntry = useMemo(
+    () => entries.find((entry) => entry.id === selectedProviderId) ?? null,
+    [entries, selectedProviderId],
+  );
+
+  const resolvedView = selectedEntry || view === "custom" ? view : "list";
+  const errorMessage = localError ?? props.error;
+
+  // Connected providers lead the list so the two groups render as one flat
+  // array — keyboard navigation keeps indexing straight into display order.
+  const filteredEntries = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    const matched = query
+      ? entries.filter((entry) => {
+          const methodText = entry.methods.map((method) => method.label || (method.type === "oauth" ? "OAuth" : "API key")).join(" ");
+          return `${entry.name} ${entry.id} ${methodText}`.toLowerCase().includes(query);
+        })
+      : entries;
+    return [
+      ...matched.filter((entry) => entry.connected),
+      ...matched.filter((entry) => !entry.connected),
+    ];
+  }, [entries, searchQuery]);
+
+  const connectedCount = useMemo(
+    () => filteredEntries.filter((entry) => entry.connected).length,
+    [filteredEntries],
+  );
+
+  const oauthInstructions = oauthSession?.authorization.instructions?.trim() ?? "";
+  const isOpenAiHeadlessSession = Boolean(
+    oauthSession && oauthSession.providerId === "openai" && oauthSession.methodLabel.toLowerCase().includes("headless"),
+  );
+  const shouldStartOauthAutoPolling =
+    props.open &&
+    resolvedView === "oauth-auto" &&
+    oauthSession &&
+    (!isOpenAiHeadlessSession || oauthBrowserOpened);
+
+  const oauthDisplayCode = useMemo(() => {
+    if (!oauthInstructions) return "";
+    const matched = oauthInstructions.match(/[A-Z0-9]{4}-[A-Z0-9]{4,5}/)?.[0];
+    if (matched) return matched;
+    if (oauthInstructions.includes(":")) {
+      return oauthInstructions.split(":").slice(1).join(":").trim();
+    }
+    return oauthInstructions;
+  }, [oauthInstructions]);
+
+  const methodLabel = (method: ProviderAuthMethod) =>
+    method.label || (method.type === "oauth" ? "OAuth" : "API key");
+
+  const actionDisabled = props.loading || props.submitting;
+
+  const resetState = () => {
+    if (oauthCodeCopiedResetRef.current !== null && typeof window !== "undefined") {
+      window.clearTimeout(oauthCodeCopiedResetRef.current);
+      oauthCodeCopiedResetRef.current = null;
+    }
+    setView("list");
+    setSelectedProviderId(null);
+    apiKeyField.current?.clear();
+    setHasApiKey(false);
+    customApiKeyField.current?.clear();
+    setCustomName("");
+    setCustomBaseUrl("");
+    setCustomModels("");
+    setCustomFamily("openai");
+    setOauthCodeInput("");
+    setOauthSession(null);
+    setSearchQuery("");
+    setActiveEntryIndex(0);
+    setLocalError(null);
+    setOauthCodeCopied(false);
+    setOauthBrowserOpened(false);
+  };
+
+  const stopProviderPolling = () => {
+    if (providerPollRef.current !== null) {
+      window.clearInterval(providerPollRef.current);
+      providerPollRef.current = null;
+    }
+  };
+
+  const stopOauthAutoPolling = () => {
+    if (oauthAutoPollRef.current !== null) {
+      window.clearInterval(oauthAutoPollRef.current);
+      oauthAutoPollRef.current = null;
+    }
+  };
+
+  const handleClose = () => {
+    void props.onRefreshProviders?.();
+    stopOauthAutoPolling();
+    stopProviderPolling();
+    resetState();
+    props.onClose();
+  };
+
+  useEffect(() => {
+    if (!props.open) {
+      autoOpenedPreferredProviderIdRef.current = null;
+      resetState();
+    }
+  }, [props.open]);
+
+  useEffect(() => {
+    if (!props.open || resolvedView !== "list") return;
+    const total = filteredEntries.length;
+    if (total <= 0) {
+      setActiveEntryIndex(0);
+      return;
+    }
+    setActiveEntryIndex((current) => Math.max(0, Math.min(current, total - 1)));
+  }, [filteredEntries.length, props.open, resolvedView]);
+
+  useLayoutEffect(() => {
+    const previous = previousViewRef.current;
+    previousViewRef.current = resolvedView;
+    if (!props.open || previous === resolvedView) return;
+    const providerButton = returnProviderIdRef.current
+      ? providerButtonsRef.current.get(returnProviderIdRef.current) : null;
+    const target = resolvedView === "list" ? providerButton ?? titleRef.current : titleRef.current;
+    target?.focus({ preventScroll: true });
+  }, [props.open, resolvedView]);
+
+  useEffect(() => {
+    if (!props.open || props.loading || resolvedView !== "list") return;
+
+    const preferredId = props.preferredProviderId?.trim().toLowerCase() ?? "";
+    if (!preferredId || autoOpenedPreferredProviderIdRef.current === preferredId) return;
+
+    const entry = entries.find((item) => item.id.trim().toLowerCase() === preferredId);
+    if (!entry) return;
+
+    autoOpenedPreferredProviderIdRef.current = preferredId;
+    queueMicrotask(() => {
+      handleEntrySelect(entry);
+    });
+  }, [
+    entries,
+    props.loading,
+    props.open,
+    props.preferredProviderId,
+    resolvedView,
+  ]);
+
+  useEffect(() => {
+    return () => {
+      stopOauthAutoPolling();
+      stopProviderPolling();
+      if (oauthCodeCopiedResetRef.current !== null) {
+        window.clearTimeout(oauthCodeCopiedResetRef.current);
+        oauthCodeCopiedResetRef.current = null;
+      }
+    };
+  }, []);
+
+  const isOauthView = resolvedView === "oauth-code" || resolvedView === "oauth-auto";
+  const activeProviderId = oauthSession?.providerId ?? selectedProviderId;
+  const isActiveProviderConnected =
+    !!activeProviderId && (props.connectedProviderIds ?? []).includes(activeProviderId);
+
+  const pollProviders = async () => {
+    const id = activeProviderId;
+    if (!id || pollingBusy) return;
+    setPollingBusy(true);
+    try {
+      await props.onRefreshProviders?.();
+    } finally {
+      setPollingBusy(false);
+    }
+    if ((props.connectedProviderIds ?? []).includes(id)) {
+      handleClose();
+    }
+  };
+
+  const startProviderPolling = () => {
+    if (typeof window === "undefined") return;
+    if (providerPollRef.current !== null) return;
+    void pollProviders();
+    providerPollRef.current = window.setInterval(() => {
+      void pollProviders();
+    }, 2000);
+  };
+
+  useEffect(() => {
+    if (!props.open || !isOauthView) {
+      stopProviderPolling();
+      return;
+    }
+    if (isActiveProviderConnected) {
+      handleClose();
+      return;
+    }
+    startProviderPolling();
+  }, [isActiveProviderConnected, isOauthView, props.open]);
+
+  const openOauthUrl = async (url: string) => {
+    if (!url) return;
+    if (isDesktopRuntime()) {
+      await openDesktopUrl(url);
+      setOauthBrowserOpened(true);
+      return;
+    }
+    window.open(url, "_blank", "noopener,noreferrer");
+    setOauthBrowserOpened(true);
+  };
+
+  const copyOauthDisplayCode = async () => {
+    const code = oauthDisplayCode.trim();
+    if (!code) return;
+    if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
+      setLocalError("Clipboard is unavailable in this environment.");
+      return;
+    }
+    await navigator.clipboard.writeText(code);
+    setOauthCodeCopied(true);
+    if (typeof window === "undefined") return;
+    if (oauthCodeCopiedResetRef.current !== null) {
+      window.clearTimeout(oauthCodeCopiedResetRef.current);
+    }
+    oauthCodeCopiedResetRef.current = window.setTimeout(() => {
+      setOauthCodeCopied(false);
+      oauthCodeCopiedResetRef.current = null;
+    }, 2000);
+  };
+
+  const submitOauth = async (providerId: string, methodIndex: number, code?: string) => {
+    const trimmedCode = code?.trim();
+    setLocalError(null);
+    try {
+      return await props.onSubmitOAuth(providerId, methodIndex, trimmedCode || undefined);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to complete OAuth";
+      setLocalError(message);
+      throw error instanceof Error ? error : new Error(message);
+    }
+  };
+
+  const attemptOauthAutoCompletion = async () => {
+    const session = oauthSession;
+    if (!session || oauthAutoBusy) return;
+    setOauthAutoBusy(true);
+    try {
+      const result = await submitOauth(session.providerId, session.methodIndex);
+      if (result?.connected) {
+        stopOauthAutoPolling();
+      }
+    } finally {
+      setOauthAutoBusy(false);
+    }
+  };
+
+  const startOauthAutoPolling = () => {
+    if (typeof window === "undefined") return;
+    if (oauthAutoPollRef.current !== null) return;
+    void attemptOauthAutoCompletion();
+    oauthAutoPollRef.current = window.setInterval(() => {
+      void attemptOauthAutoCompletion();
+    }, 2000);
+  };
+
+  useEffect(() => {
+    if (!shouldStartOauthAutoPolling) {
+      stopOauthAutoPolling();
+      return;
+    }
+    startOauthAutoPolling();
+  }, [shouldStartOauthAutoPolling]);
+
+  const startOauth = async (entry: ProviderAuthEntry, methodIndex?: number) => {
+    if (actionDisabled) return;
+    if (!Number.isInteger(methodIndex) || methodIndex === undefined) {
+      setLocalError(`No OAuth flow available for ${entry.name}.`);
+      return;
+    }
+    setLocalError(null);
+    setOauthCodeInput("");
+    setOauthSession(null);
+    setOauthCodeCopied(false);
+    setOauthBrowserOpened(false);
+    try {
+      const started = await props.onSelect(entry.id, methodIndex);
+      const selectedMethod = entry.methods.find((method) => method.methodIndex === methodIndex);
+      if (!selectedMethod) {
+        throw new Error(`Selected auth method is unavailable for ${entry.name}.`);
+      }
+      const nextSession: ProviderOAuthSession = {
+        providerId: entry.id,
+        methodIndex: started.methodIndex,
+        methodLabel: selectedMethod.label,
+        authorization: started.authorization,
+      };
+      setOauthSession(nextSession);
+
+      if (started.authorization.method === "code") {
+        await openOauthUrl(started.authorization.url);
+        setView("oauth-code");
+        return;
+      }
+
+      if (!isOpenAiHeadlessMethod(selectedMethod)) {
+        await openOauthUrl(started.authorization.url);
+      }
+
+      setView("oauth-auto");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to start OAuth";
+      setLocalError(message);
+    }
+  };
+
+  const handleMethodSelect = async (method: ProviderAuthMethod, entry = selectedEntry) => {
+    if (!entry || actionDisabled) return;
+    setLocalError(null);
+
+    if (method.type === "oauth") {
+      await startOauth(entry, method.methodIndex);
+      return;
+    }
+
+    if (method.type === "cloud") return;
+
+    setView("api");
+  };
+
+  const handleEntrySelect = (entry: ProviderAuthEntry) => {
+    if (actionDisabled) return;
+    setLocalError(null);
+    setSelectedProviderId(entry.id);
+    returnProviderIdRef.current = entry.id;
+
+    if (entry.methods.length === 1) {
+      void handleMethodSelect(entry.methods[0], entry);
+      return;
+    }
+
+    if (entry.methods.length > 1) {
+      setView("method");
+      return;
+    }
+
+    setLocalError(`No authentication methods available for ${entry.name}.`);
+  };
+
+  const handleApiSubmit = async () => {
+    if (!selectedEntry || actionDisabled) return;
+
+    const trimmed = (apiKeyField.current?.take() ?? "").trim();
+    if (!trimmed) {
+      setLocalError("API key is required.");
+      return;
+    }
+
+    setLocalError(null);
+    try {
+      await props.onSubmitApiKey(selectedEntry.id, trimmed);
+      toast.success(`${selectedEntry.name} connected`, {
+        description: "API key saved locally by idexal Os.",
+      });
+      // Close the modal after a successful save
+      props.onClose();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to save API key";
+      setLocalError(message);
+    }
+  };
+
+  const handleCustomOpen = () => {
+    if (actionDisabled) return;
+    setLocalError(null);
+    setCustomProbeStatus(null);
+    customProbeSignatureRef.current = "";
+    setView("custom");
+  };
+
+  const customModelIds = parseCustomProviderModelIds(customModels);
+  const customCanSubmit = Boolean(
+    customName.trim() && customBaseUrl.trim() && customModelIds.length > 0,
+  );
+
+  const customProbeFailureText = (failure: CustomProviderProbeFailure) =>
+    failure.status === null
+      ? failure.message
+      : `HTTP ${failure.status} — ${failure.message}`;
+
+  /**
+   * List the endpoint's models and, in doing so, validate the key. Auto-runs
+   * once per address/key combination when a field loses focus; the button is
+   * the explicit retry. A failure never blocks manual model IDs.
+   */
+  const runCustomProbe = async (options?: { auto?: boolean }) => {
+    if (actionDisabled || customProbeInFlightRef.current) return;
+    const baseUrl = customBaseUrl.trim();
+    const urlError = customProviderBaseUrlError(baseUrl);
+    if (urlError) {
+      if (!options?.auto) {
+        setCustomProbeStatus({
+          tone: "error",
+          text: urlError === "required"
+            ? "Enter the API address first."
+            : "Enter a valid http(s) API address.",
+        });
+      }
+      return;
+    }
+    const apiKey = customApiKeyField.current?.read() ?? "";
+    const signature = `${customFamily}|${baseUrl}|${apiKey}`;
+    if (options?.auto && customProbeSignatureRef.current === signature) return;
+    customProbeSignatureRef.current = signature;
+    customProbeInFlightRef.current = true;
+    setCustomProbeBusy(true);
+    setCustomProbeStatus({ tone: "info", text: "Checking the address and key..." });
+    try {
+      const result = await probeCustomProviderModels({ family: customFamily, baseUrl, apiKey });
+      if (!result.ok) {
+        setCustomProbeStatus({ tone: "error", text: `Check failed — ${customProbeFailureText(result)}` });
+        return;
+      }
+      if (result.models.length === 0) {
+        setCustomProbeStatus({
+          tone: "info",
+          text: "The endpoint answered but listed no models. Add model IDs manually.",
+        });
+        return;
+      }
+      setCustomModels((current) => {
+        const existing = parseCustomProviderModelIds(current);
+        const merged = [...existing, ...result.models.filter((id) => !existing.includes(id))];
+        return merged.join("\n");
+      });
+      setCustomProbeStatus({
+        tone: "ok",
+        text: `Connection works — found ${result.models.length} model${result.models.length === 1 ? "" : "s"}.`,
+      });
+    } catch (error) {
+      setCustomProbeStatus({
+        tone: "error",
+        text: `Check failed — ${error instanceof Error ? error.message : "Could not reach the endpoint."}`,
+      });
+    } finally {
+      customProbeInFlightRef.current = false;
+      setCustomProbeBusy(false);
+    }
+  };
+
+  /** One tiny completion on the first listed model, to prove it answers. */
+  const runCustomModelTest = async () => {
+    if (actionDisabled || customProbeInFlightRef.current) return;
+    const baseUrl = customBaseUrl.trim();
+    if (customProviderBaseUrlError(baseUrl)) {
+      setCustomProbeStatus({ tone: "error", text: "Enter a valid http(s) API address first." });
+      return;
+    }
+    const model = customModelIds[0];
+    if (!model) {
+      setCustomProbeStatus({ tone: "error", text: "Add a model ID first." });
+      return;
+    }
+    const apiKey = customApiKeyField.current?.read() ?? "";
+    customProbeInFlightRef.current = true;
+    setCustomProbeBusy(true);
+    setCustomProbeStatus({ tone: "info", text: `Testing ${model}...` });
+    const startedAt = Date.now();
+    try {
+      const result = await testCustomProviderModel({ family: customFamily, baseUrl, apiKey, model });
+      if (result.ok) {
+        setCustomProbeStatus({
+          tone: "ok",
+          text: `Model ${model} answered in ${Date.now() - startedAt} ms.`,
+        });
+      } else {
+        setCustomProbeStatus({
+          tone: "error",
+          text: `Model ${model} failed — ${customProbeFailureText(result)}`,
+        });
+      }
+    } catch (error) {
+      setCustomProbeStatus({
+        tone: "error",
+        text: `Model ${model} failed — ${error instanceof Error ? error.message : "Could not reach the endpoint."}`,
+      });
+    } finally {
+      customProbeInFlightRef.current = false;
+      setCustomProbeBusy(false);
+    }
+  };
+
+  const handleCustomSubmit = async () => {
+    if (actionDisabled) return;
+    const name = customName.trim();
+    const baseUrl = customBaseUrl.trim();
+    const models = parseCustomProviderModelIds(customModels);
+    if (!name) {
+      setLocalError("Enter a name for the provider.");
+      return;
+    }
+    const urlError = customProviderBaseUrlError(baseUrl);
+    if (urlError === "required") {
+      setLocalError("Enter the provider's API address.");
+      return;
+    }
+    if (urlError === "invalid") {
+      setLocalError("Enter a valid http(s) API address.");
+      return;
+    }
+    if (models.length === 0) {
+      setLocalError("Add at least one model ID.");
+      return;
+    }
+    if (!props.onSubmitCustomProvider) {
+      setLocalError("Custom providers are unavailable here.");
+      return;
+    }
+
+    setLocalError(null);
+    try {
+      await props.onSubmitCustomProvider({
+        family: customFamily,
+        name,
+        baseUrl,
+        apiKey: customApiKeyField.current?.take() ?? "",
+        models,
+      });
+      toast.success(`${name} added`, {
+        description: "Its models are ready in the model picker.",
+      });
+      props.onClose();
+    } catch (error) {
+      setLocalError(error instanceof Error ? error.message : "Failed to add the provider");
+    }
+  };
+
+  const handleOauthCodeSubmit = async () => {
+    if (!selectedEntry || !oauthSession || actionDisabled) return;
+
+    const trimmed = oauthCodeInput.trim();
+    if (!trimmed) {
+      setLocalError("Authorization code is required.");
+      return;
+    }
+
+    await submitOauth(selectedEntry.id, oauthSession.methodIndex, trimmed);
+  };
+
+  const handleBack = () => {
+    if (resolvedView === "oauth-code" || resolvedView === "oauth-auto") {
+      if ((selectedEntry?.methods.length ?? 0) > 1) {
+        setView("method");
+      } else {
+        resetState();
+      }
+      setOauthSession(null);
+      setOauthCodeInput("");
+      setOauthCodeCopied(false);
+      setOauthBrowserOpened(false);
+      setLocalError(null);
+      return;
+    }
+
+    if (resolvedView === "api" && (selectedEntry?.methods.length ?? 0) > 1) {
+      setView("method");
+      apiKeyField.current?.clear();
+    setHasApiKey(false);
+      setLocalError(null);
+      return;
+    }
+    resetState();
+  };
+
+  const submittingLabel = () => {
+    if (!props.submitting) return null;
+    if (resolvedView === "api") return "Saving API key...";
+    if (resolvedView === "custom") return "Adding provider...";
+    if (resolvedView === "oauth-code") return "Verifying authorization code...";
+    if (resolvedView === "oauth-auto") return "Waiting for OAuth confirmation...";
+    return "Opening authentication...";
+  };
+
+  const stepEntryIndex = (delta: number) => {
+    const total = filteredEntries.length;
+    if (total <= 0) {
+      setActiveEntryIndex(0);
+      return;
+    }
+    setActiveEntryIndex((current) => {
+      const normalized = ((current % total) + total) % total;
+      return (normalized + delta + total) % total;
+    });
+  };
+
+  const handleListKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (resolvedView !== "list") return;
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      stepEntryIndex(1);
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      stepEntryIndex(-1);
+      return;
+    }
+    if (event.key === "Enter") {
+      const nativeEvent = event.nativeEvent as globalThis.KeyboardEvent & { keyCode?: number };
+      if (nativeEvent.isComposing || nativeEvent.keyCode === 229) {
+        return;
+      }
+      const entry = filteredEntries[activeEntryIndex];
+      if (!entry) return;
+      event.preventDefault();
+      handleEntrySelect(entry);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      handleClose();
+    }
+  };
+
+  const methodDescription = (entry: ProviderAuthEntry, method: ProviderAuthMethod) => {
+    const label = methodLabel(method).toLowerCase();
+    if (isOpenAiProvider(entry.id, entry.name) && (label.includes("headless") || label.includes("device"))) {
+      return "Use OpenAI's device flow when the local browser callback is unreliable.";
+    }
+    if (method.type === "oauth") {
+      return "Continue in the browser and let idexal Os finish the connection automatically.";
+    }
+    if (method.type === "cloud") return "Managed by your organization.";
+    if (isOpencodeZenProvider(entry.id)) {
+      return "Sign in to idexal Os Zen with an API key to unlock paid models alongside the free tier.";
+    }
+    return "Paste a secret key that idexal Os stores locally on this device.";
+  };
+
+  const searchText = searchQuery.trim().toLowerCase();
+  const showIncludedAuto = Boolean(props.idexalOsModelsState || props.connectedProviderIds.includes("idexal-os-free"))
+    && (!searchText || "idexalos models auto free".includes(searchText));
+
+  const entrySubtitle = (entry: ProviderAuthEntry) => {
+    if (entry.connected) return entry.methods.some((method) => method.type === "oauth") ? "Signed in on this device" : "API key on this device";
+    const oauth = entry.methods.some((method) => method.type === "oauth");
+    const apiKey = entry.methods.some((method) => method.type === "api");
+    const signIn = isOpenAiProvider(entry.id, entry.name) ? "Sign in with ChatGPT" : isAnthropicProvider(entry.id, entry.name) ? "Sign in with Claude" : "Sign in";
+    const how = oauth && apiKey ? `${signIn} or paste an API key` : oauth ? `${signIn} in the browser` : "Paste an API key";
+    return props.organizationProviderIds?.has(entry.id) ? `${how} · also available from ${props.organizationName || "your organization"}` : how;
+  };
+
+  const renderEntry = (entry: ProviderAuthEntry, index: number) => {
+    const active = index === activeEntryIndex;
+    return (
+      <button
+        key={entry.id}
+        type="button"
+        data-provider-id={entry.id}
+        ref={(element) => {
+          if (element) providerButtonsRef.current.set(entry.id, element);
+          else providerButtonsRef.current.delete(entry.id);
+        }}
+        className={`group flex w-full items-center gap-3 rounded-xl px-2 py-2 text-left transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-60 ${active ? "bg-dls-hover" : "hover:bg-dls-hover/60"}`}
+        disabled={actionDisabled}
+        aria-current={active ? "true" : undefined}
+        onMouseEnter={() => setActiveEntryIndex(index)}
+        onFocus={() => setActiveEntryIndex(index)}
+        onClick={() => handleEntrySelect(entry)}
+      >
+        <ProviderTile providerId={entry.id} name={entry.name} size="sm" />
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm font-medium text-dls-text">{entry.name}</div>
+          <div className="line-clamp-2 text-xs text-muted-foreground">{entrySubtitle(entry)}</div>
+        </div>
+        {entry.connected ? null : (
+          <span className={`shrink-0 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${active ? "bg-dls-text text-dls-surface" : "text-muted-foreground"}`}>
+            Connect
+          </span>
+        )}
+      </button>
+    );
+  };
+
+  return (
+    <Dialog
+      open={props.open}
+      onOpenChange={(open) => {
+        if (!open) handleClose();
+      }}
+    >
+      <DialogContent
+        initialFocus={() => isMobile ? titleRef.current : searchInputRef.current ?? titleRef.current}
+        className="flex max-h-[min(680px,calc(100dvh-2rem))] min-h-0 w-[calc(100vw-2rem)] max-w-[34rem] flex-col overflow-hidden sm:max-w-[34rem]">
+        <DialogHeader className="pr-8">
+          <DialogTitle ref={titleRef} tabIndex={-1}>Connect a provider</DialogTitle>
+          <DialogDescription className="text-pretty">
+            Adds a key to this device only.{props.organizationName ? ` Providers from ${props.organizationName} are already included and managed in Den.` : ""}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="flex min-h-0 flex-1 flex-col gap-4">
+          {errorMessage ? (
+            <div className="rounded-xl border border-red-7/30 bg-red-1/40 px-3 py-2 text-xs text-red-11">
+              {errorMessage}
+            </div>
+          ) : props.loading ? (
+            <div className="rounded-xl border border-gray-6 bg-gray-1/60 px-4 py-3 text-sm text-gray-10 animate-pulse">
+              Loading providers…
+            </div>
+          ) : null}
+
+          {!props.loading ? (
+            <div className="-mr-1 min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
+              {resolvedView === "list" ? (
+                <div className="space-y-4" role="presentation" onKeyDown={handleListKeyDown}>
+                  <div className="sticky top-0 z-10 bg-background pb-1">
+                    <Search size={16} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" aria-hidden />
+                    <input
+                      ref={searchInputRef}
+                      type="search"
+                      aria-label="Search providers"
+                      placeholder="Filter providers by name or ID"
+                      value={searchQuery}
+                      onChange={(event) => {
+                        setSearchQuery(event.currentTarget.value);
+                        setActiveEntryIndex(0);
+                      }}
+                      autoComplete="off"
+                      autoCapitalize="off"
+                      spellCheck={false}
+                      disabled={actionDisabled}
+                      className="h-10 w-full rounded-xl border border-dls-border bg-dls-surface pl-9 pr-3 text-base text-dls-text placeholder:text-muted-foreground transition-colors focus:border-gray-8 focus:outline-none lg:text-[13px]"
+                    />
+                  </div>
+
+                  {showIncludedAuto || connectedCount ? (
+                    <div role="group" aria-labelledby="connect-provider-device">
+                      <ProviderSectionLabel id="connect-provider-device" count={connectedCount + Number(showIncludedAuto)}>On this device</ProviderSectionLabel>
+                      {showIncludedAuto ? (
+                        <div className="flex items-center gap-3 rounded-xl px-2 py-2" data-testid="included-idexal-os-provider">
+                          <ProviderTile providerId="idexalos" size="sm" />
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-sm font-medium text-dls-text">idexal Os Models</div>
+                            <div className="line-clamp-2 text-xs text-muted-foreground">{autoProviderSubtitle()}</div>
+                          </div>
+                          {props.idexalOsModelsState === "off" || props.idexalOsModelsState === "unavailable" ? (
+                            <ProviderStatus tone="neutral">{props.idexalOsModelsState === "off" ? "Turned off" : "Unavailable"}</ProviderStatus>
+                          ) : null}
+                        </div>
+                      ) : null}
+                      {filteredEntries.slice(0, connectedCount).map((entry, index) => renderEntry(entry, index))}
+                    </div>
+                  ) : null}
+
+                  {filteredEntries.length > connectedCount ? (
+                    <div role="group" aria-labelledby="connect-provider-available">
+                      <ProviderSectionLabel id="connect-provider-available" count={filteredEntries.length - connectedCount}>Available to add</ProviderSectionLabel>
+                      {filteredEntries.slice(connectedCount).map((entry, offset) => renderEntry(entry, connectedCount + offset))}
+                    </div>
+                  ) : null}
+
+                  <button
+                    type="button"
+                    className="group flex w-full items-center gap-3 rounded-xl px-2 py-2 text-left transition-colors duration-150 hover:bg-dls-hover/60 disabled:cursor-not-allowed disabled:opacity-60"
+                    disabled={actionDisabled}
+                    onClick={handleCustomOpen}
+                    data-testid="add-custom-provider"
+                  >
+                    <span className="flex size-9 shrink-0 items-center justify-center rounded-[11px] border border-dls-border bg-dls-surface">
+                      <Plus size={16} className="text-muted-foreground" aria-hidden />
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-medium text-dls-text">Add a custom provider</span>
+                      <span className="line-clamp-2 text-xs text-muted-foreground">OpenAI- or Anthropic-compatible API at your own address</span>
+                    </span>
+                    <span className="shrink-0 rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground">Set up</span>
+                  </button>
+
+                  {!filteredEntries.length && !showIncludedAuto ? (
+                    <div className="px-2 py-6 text-center text-sm text-muted-foreground">
+                      {entries.length ? "No providers match your search." : "No providers available."}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {resolvedView === "method" && selectedEntry ? (
+                <div className="rounded-xl border border-gray-6/40 bg-gray-2/50 shadow-sm p-5 space-y-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <div className="text-sm font-medium text-gray-12">{selectedEntry.name}</div>
+                      <div className="text-xs text-gray-10 mt-1">Choose how you'd like to connect.</div>
+                    </div>
+                    <Button variant="outline" onClick={handleBack} disabled={actionDisabled}>
+                      Back
+                    </Button>
+                  </div>
+                  <div className="grid gap-2">
+                    {selectedEntry.methods.map((method) => (
+                      <button
+                        key={`${selectedEntry.id}-${method.type}-${method.methodIndex ?? method.label}`}
+                        type="button"
+                        className={`w-full rounded-xl border px-4 py-3.5 text-left transition-all duration-200 disabled:opacity-60 disabled:cursor-not-allowed ${
+                          method.type === "oauth"
+                            ? "border-indigo-5/40 bg-indigo-3/20 hover:bg-indigo-4/30 shadow-sm"
+                            : "border-gray-5/50 bg-gray-2 hover:bg-gray-3/50 shadow-sm"
+                        }`}
+                        onClick={() => void handleMethodSelect(method)}
+                        disabled={actionDisabled}
+                      >
+                        <div className="text-sm font-medium text-gray-12">{methodLabel(method)}</div>
+                        <div className="mt-1 text-xs text-gray-10">{methodDescription(selectedEntry, method)}</div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {resolvedView === "custom" ? (
+                <div className="space-y-4">
+                  <TextInput
+                    label="Provider name"
+                    placeholder="My provider"
+                    value={customName}
+                    onChange={(event) => {
+                      setCustomName(event.currentTarget.value);
+                      if (localError) setLocalError(null);
+                    }}
+                    autoFocus
+                    disabled={actionDisabled}
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  <div>
+                    <div className="mb-1 text-xs font-medium text-dls-secondary">API type</div>
+                    <ToggleGroup
+                      aria-label="API type"
+                      value={[customFamily]}
+                      onValueChange={(values) => {
+                        const next = values[0];
+                        if (next === "openai" || next === "anthropic") {
+                          setCustomFamily(next);
+                          setCustomProbeStatus(null);
+                          customProbeSignatureRef.current = "";
+                        }
+                      }}
+                      variant="outline"
+                      spacing={0}
+                      className="w-full"
+                    >
+                      <ToggleGroupItem value="openai" className="flex-1 basis-0">OpenAI-compatible</ToggleGroupItem>
+                      <ToggleGroupItem value="anthropic" className="flex-1 basis-0">Anthropic-compatible</ToggleGroupItem>
+                    </ToggleGroup>
+                  </div>
+                  <TextInput
+                    label="API address"
+                    placeholder="https://api.example.com/v1"
+                    hint="The endpoint your provider gave you, including any version path."
+                    value={customBaseUrl}
+                    onChange={(event) => {
+                      setCustomBaseUrl(event.currentTarget.value);
+                      setCustomProbeStatus(null);
+                      customProbeSignatureRef.current = "";
+                      if (localError) setLocalError(null);
+                    }}
+                    onBlur={() => void runCustomProbe({ auto: true })}
+                    disabled={actionDisabled}
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  <SecretTextInput
+                    id="provider-auth-custom-api-key"
+                    label="API key"
+                    placeholder="sk-..."
+                    hint="Optional for a local endpoint that needs no key."
+                    handleRef={customApiKeyField}
+                    onValueChange={(next) => {
+                      setCustomProbeStatus(null);
+                      customProbeSignatureRef.current = "";
+                      if (next && localError) setLocalError(null);
+                    }}
+                    onBlur={() => void runCustomProbe({ auto: true })}
+                    disabled={actionDisabled}
+                  />
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => void runCustomProbe()}
+                        disabled={actionDisabled || customProbeBusy || !customBaseUrl.trim()}
+                      >
+                        {customProbeBusy ? (
+                          <Loader2 className="size-3.5 animate-spin" aria-hidden />
+                        ) : (
+                          <RefreshCw className="size-3.5" aria-hidden />
+                        )}
+                        Check key & fetch models
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => void runCustomModelTest()}
+                        disabled={actionDisabled || customProbeBusy || customModelIds.length === 0}
+                      >
+                        Test first model
+                      </Button>
+                    </div>
+                    {customProbeStatus ? (
+                      <div
+                        className={
+                          customProbeStatus.tone === "ok"
+                            ? "text-xs text-emerald-11"
+                            : customProbeStatus.tone === "error"
+                              ? "text-xs text-red-11"
+                              : "text-xs text-dls-secondary"
+                        }
+                        role="status"
+                        aria-live="polite"
+                      >
+                        {customProbeStatus.text}
+                      </div>
+                    ) : null}
+                  </div>
+                  <label className="block">
+                    <div className="mb-1 text-xs font-medium text-dls-secondary">Models</div>
+                    <textarea
+                      rows={3}
+                      aria-label="Models"
+                      placeholder={"model-id\nanother-model"}
+                      value={customModels}
+                      onChange={(event) => {
+                        setCustomModels(event.currentTarget.value);
+                        if (localError) setLocalError(null);
+                      }}
+                      disabled={actionDisabled}
+                      autoComplete="off"
+                      autoCapitalize="off"
+                      spellCheck={false}
+                      className="w-full resize-y rounded-lg border border-dls-border bg-dls-surface px-3 py-2 text-sm text-dls-text shadow-sm placeholder:text-dls-secondary focus:outline-none focus:ring-2 focus:ring-[rgba(var(--dls-accent-rgb),0.2)]"
+                    />
+                    <div className="mt-1 text-xs text-dls-secondary">One model ID per line.</div>
+                  </label>
+                </div>
+              ) : null}
+
+              {resolvedView === "api" && selectedEntry ? (
+                <div className="space-y-4">
+                  <div className="flex items-center gap-3">
+                    <div className="flex size-9 shrink-0 items-center justify-center rounded-[11px] border border-gray-5/60 bg-gray-1 shadow-sm overflow-hidden">
+                      <ProviderIcon providerId={selectedEntry.id} size={20} className="text-gray-12" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium text-gray-12 truncate">{selectedEntry.name}</div>
+                      <div className="text-[11px] text-gray-9 font-mono truncate">{selectedEntry.id}</div>
+                    </div>
+                  </div>
+                  <div className="text-xs text-gray-10">
+                    {isOpencodeZenProvider(selectedEntry.id)
+                      ? "Sign in to idexal Os Zen with an API key from opencode.ai/auth."
+                      : "Paste your API key to connect."}
+                  </div>
+                  {isOpencodeZenProvider(selectedEntry.id) ? (
+                    <div className="rounded-lg border border-indigo-5/30 bg-indigo-3/15 px-3 py-2.5 text-xs text-indigo-12 space-y-1.5">
+                      <div>
+                        idexal Os Zen gives you access to the best coding models. Free models keep working without a key.
+                      </div>
+                      <button
+                        type="button"
+                        className="text-indigo-11 hover:text-indigo-12 underline underline-offset-2 font-medium"
+                        onClick={() => void openExternalUrl(OPENCODE_ZEN_KEY_URL)}
+                      >
+                        Get an API key →
+                      </button>
+                    </div>
+                  ) : null}
+                  <SecretTextInput
+                    id="provider-auth-api-key"
+                    label="API key"
+                    placeholder={isOpencodeZenProvider(selectedEntry.id) ? "ock_..." : "sk-..."}
+                    handleRef={apiKeyField}
+                    onValueChange={(next) => {
+                      setHasApiKey(next);
+                      if (next && localError) setLocalError(null);
+                    }}
+                    onSubmit={() => void handleApiSubmit()}
+                    disabled={actionDisabled}
+                  />
+                  {selectedEntry.env.length > 0 ? (
+                    <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-gray-9">
+                      Env vars:
+                      {selectedEntry.env.map((envVar) => (
+                        <span
+                          key={envVar}
+                          className="rounded-md bg-gray-3/40 px-1.5 py-0.5 font-mono text-[10px] text-gray-11"
+                        >
+                          {envVar}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+
+
+              {resolvedView === "oauth-code" && selectedEntry && oauthSession ? (
+                <div className="rounded-xl border border-gray-6/40 bg-gray-2/50 shadow-sm p-5 space-y-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <div className="text-sm font-medium text-gray-12">{selectedEntry.name}</div>
+                      <div className="text-xs text-gray-10 mt-1">Finish OAuth by pasting the authorization code.</div>
+                    </div>
+                    <Button variant="outline" onClick={handleBack} disabled={actionDisabled}>
+                      Back
+                    </Button>
+                  </div>
+                  <div className="text-xs text-gray-9">
+                    Complete sign-in in your browser, then paste the code here.
+                  </div>
+                  {oauthInstructions ? (
+                    <div className="rounded-lg border border-gray-6/60 bg-gray-1/60 px-3 py-2 text-[11px] text-gray-9 font-mono break-all">
+                      {oauthInstructions}
+                    </div>
+                  ) : null}
+                  <TextInput
+                    className="text-base lg:text-sm"
+                    label="Authorization code"
+                    type="text"
+                    placeholder="Paste code"
+                    value={oauthCodeInput}
+                    onChange={(event) => {
+                      setOauthCodeInput(event.currentTarget.value);
+                      if (localError) setLocalError(null);
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Enter") return;
+                      event.preventDefault();
+                      void handleOauthCodeSubmit();
+                    }}
+                    autoComplete="off"
+                    autoCapitalize="off"
+                    spellCheck={false}
+                    disabled={actionDisabled}
+                  />
+                  <div className="flex items-center justify-between gap-3">
+                    <Button
+                      variant="outline"
+                      onClick={() => {
+                        void openOauthUrl(oauthSession.authorization.url ?? "");
+                      }}
+                    >
+                      Open browser again
+                    </Button>
+                    <Button
+                      onClick={() => void handleOauthCodeSubmit()}
+                      disabled={actionDisabled || !oauthCodeInput.trim()}
+                    >
+                      {props.submitting ? "Verifying..." : "Complete connection"}
+                    </Button>
+                  </div>
+                </div>
+              ) : null}
+
+              {resolvedView === "oauth-auto" && selectedEntry && oauthSession ? (
+                <div className="rounded-xl border border-gray-6/40 bg-gray-2/50 shadow-sm p-5 space-y-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <div className="text-sm font-medium text-gray-12">{selectedEntry.name}</div>
+                      <div className="text-xs text-gray-10 mt-1">Waiting for browser confirmation.</div>
+                    </div>
+                    <Button variant="outline" onClick={handleBack} disabled={actionDisabled}>
+                      Back
+                    </Button>
+                  </div>
+                  {isOpenAiHeadlessSession ? (
+                    <div className="space-y-2 text-xs text-gray-9">
+                      <div>You'll need to sign in to your OpenAI account and provide the code below.</div>
+                      <div>The first time you do this you'll need to enable Device auth in your account settings.</div>
+                      <div>ChatGPT &gt; Account Settings &gt; Security &gt; Enable device code authorization</div>
+                      <div>When you're ready, copy the code below, and click &quot;Open Browser&quot;.</div>
+                    </div>
+                  ) : (
+                    <div className="text-xs text-gray-9">
+                      Sign in in the browser tab we just opened. We will complete the connection automatically.
+                    </div>
+                  )}
+                  {oauthDisplayCode ? (
+                    <div className="rounded-xl border border-gray-6/70 bg-gray-2/40 p-3 flex items-center gap-3">
+                      <div className="flex-1 min-w-0">
+                        <div className="text-[10px] uppercase tracking-wide text-gray-8">Confirmation code</div>
+                        <div className="text-sm text-gray-12 font-mono break-all">{oauthDisplayCode}</div>
+                      </div>
+                      <Button variant="outline" size="sm" className="shrink-0" onClick={() => void copyOauthDisplayCode()}>
+                        {oauthCodeCopied ? "Copied" : "Copy"}
+                      </Button>
+                    </div>
+                  ) : null}
+                  {isOpenAiHeadlessSession && !oauthBrowserOpened ? (
+                    <div className="flex items-center gap-2 text-xs text-gray-9">
+                      <span>Authorization checks will start after you click Open Browser.</span>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-2 text-xs text-gray-9">
+                      <Loader2 size={14} className={props.submitting || pollingBusy || oauthAutoBusy ? "animate-spin" : ""} />
+                      <span>Checking connection status automatically…</span>
+                    </div>
+                  )}
+                  <div className="flex items-center justify-between gap-3">
+                    <Button
+                      variant="outline"
+                      onClick={() => {
+                        void openOauthUrl(oauthSession.authorization.url ?? "");
+                      }}
+                    >
+                      {isOpenAiHeadlessSession
+                        ? oauthBrowserOpened
+                          ? "Reopen Browser"
+                          : "Open Browser"
+                        : "Open browser again"}
+                    </Button>
+                    <div className="text-[11px] text-gray-9 text-right">
+                      This window will close once the provider is connected.
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+
+        {resolvedView === "list" ? (
+          <DialogFooter className="shrink-0 flex-row items-center justify-between gap-3 sm:flex-row sm:justify-between">
+            {props.organizationProviderCount !== undefined ? (
+              <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+                {props.organizationName ? <OrganizationMark name={props.organizationName} size="sm" /> : null}
+                <span className="truncate" title={`${props.organizationProviderCount === 1 ? "1 provider" : `${props.organizationProviderCount} providers`} already included by ${props.organizationName || "your organization"}`}>{props.organizationProviderCount} included by {props.organizationName || "your organization"}</span>
+                {props.onOpenDen ? <><span aria-hidden>·</span><button type="button" className="shrink-0 font-medium text-dls-text underline-offset-2 hover:underline" onClick={props.onOpenDen}>Manage in Den</button></> : null}
+              </div>
+            ) : <span className="text-xs text-muted-foreground">{props.submitting ? submittingLabel() : "Keys stay on this device."}</span>}
+            <div className="hidden shrink-0 items-center gap-1 sm:flex" aria-hidden>
+              {["↑↓", "↵", "esc"].map((key) => <kbd key={key} className="rounded-md border border-dls-border bg-dls-surface px-1.5 py-0.5 font-sans text-[11px] text-muted-foreground">{key}</kbd>)}
+            </div>
+          </DialogFooter>
+        ) : (
+        <DialogFooter className="shrink-0 flex-col gap-3 sm:flex-col sm:justify-start">
+          <div className="min-h-[16px] text-xs text-gray-10">
+            {props.submitting ? submittingLabel() : null}
+          </div>
+          {/* One action bar per view: Back returns to the list, Close dismisses,
+              and the view's primary action sits last. */}
+          <div className="flex w-full items-center gap-2">
+            {resolvedView === "api" && selectedEntry ? (
+              <Button variant="outline" onClick={handleBack} disabled={actionDisabled}>
+                <ChevronLeft className="size-4" />
+                Back
+              </Button>
+            ) : null}
+            {resolvedView === "custom" ? (
+              <Button variant="outline" onClick={handleBack} disabled={actionDisabled}>
+                <ChevronLeft className="size-4" />
+                Back
+              </Button>
+            ) : null}
+            <div className="flex-1" />
+            <DialogClose
+              disabled={actionDisabled}
+              render={<Button variant="outline" disabled={actionDisabled} />}
+            >
+              Close
+            </DialogClose>
+            {resolvedView === "api" && selectedEntry ? (
+              <Button onClick={handleApiSubmit} disabled={actionDisabled || !hasApiKey}>
+                {props.submitting ? (
+                  <>
+                    <Loader2 className="size-4 animate-spin" />
+                    Saving…
+                  </>
+                ) : (
+                  "Save key"
+                )}
+              </Button>
+            ) : null}
+            {resolvedView === "custom" ? (
+              <Button onClick={() => void handleCustomSubmit()} disabled={actionDisabled || !customCanSubmit}>
+                {props.submitting ? (
+                  <>
+                    <Loader2 className="size-4 animate-spin" />
+                    Adding…
+                  </>
+                ) : (
+                  "Add provider"
+                )}
+              </Button>
+            ) : null}
+          </div>
+        </DialogFooter>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}

@@ -1,0 +1,67 @@
+---
+title: "Languages"
+sidebarTitle: "Languages"
+description: "Change the idexal Os app language, see which languages ship today, and help improve or add translations."
+keywords: ["language", "languages", "translation", "translate", "i18n", "locale", "localization", "change language"]
+---
+
+idexal Os's desktop app is available in 10 languages. You can switch languages at any time, and anyone can improve a translation or add a new language.
+
+<Frame>
+  <iframe
+    width="100%"
+    height="400"
+    src="https://www.youtube.com/embed/orGF117Snu8"
+    title="idexal Os missing languages overview"
+    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+    allowFullScreen
+  />
+</Frame>
+
+## Change the app language
+
+1. Open **Settings › Appearance**.
+2. Under **Language**, choose your language.
+
+## Languages available today
+
+| Language | Shown in the app as | Code |
+| --- | --- | --- |
+| English | English | `en` |
+| Japanese | 日本語 | `ja` |
+| Chinese (Simplified) | 简体中文 | `zh` |
+| Vietnamese | Tiếng Việt | `vi` |
+| Portuguese (Brazil) | Português (BR) | `pt-BR` |
+| Thai | ไทย | `th` |
+| French | Français | `fr` |
+| Catalan | Català | `ca` |
+| Spanish | Español | `es` |
+| Russian | Русский | `ru` |
+
+If a phrase hasn't been translated yet, the app shows it in English.
+
+## Improve a translation
+
+Each language has its own file in [`apps/app/src/i18n/locales`](https://github.com/idexal/idexalOs/tree/dev/apps/app/src/i18n/locales), such as `fr.ts` or `es.ts`. Most fixes are text changes in one file. Open a pull request with your change.
+
+## Add a new language
+
+These steps are for contributors comfortable editing code.
+
+1. Create `apps/app/src/i18n/locales/<code>.ts`, using `en.ts` as the starting point.
+2. In `apps/app/src/i18n/index.ts`, register the language:
+   - Add the import.
+   - Add the code to the `Language` type and the `LANGUAGES` list.
+   - Add an entry to `LANGUAGE_OPTIONS` with the English name and the name in that language.
+   - Add the translations to `TRANSLATIONS`.
+   - Add the code to `pluralRulesByLanguage`.
+   - If the language doesn't mark plurals on nouns (like Japanese or Chinese), add it to `PLURAL_SUFFIX_EMPTY_LANGUAGES`.
+3. In `scripts/i18n-audit.mjs`, add the code to `LOCALES`. If the language needs plural forms beyond "one" and "other" and isn't already listed in `PLURAL_FORMS`, add it there.
+4. Check for missing text and plural forms:
+
+```bash
+node scripts/i18n-audit.mjs --missing
+node scripts/i18n-audit.mjs --plurals
+```
+
+To follow localization work or request a language, see the [i18n roadmap](https://github.com/idexal/idexalOs/issues/1385).

@@ -1,0 +1,1029 @@
+import { timingSafeEqual } from "node:crypto"
+import { and, asc, eq, inArray, isNull } from "@idexal-ee/den-db/drizzle"
+import { WorkerTable, WorkerTokenTable } from "@idexal-ee/den-db/schema"
+import { createDenTypeId } from "@idexal-ee/utils/typeid"
+import type { Hono, MiddlewareHandler } from "hono"
+import { describeRoute } from "hono-openapi"
+import { z } from "zod"
+import { cloudHostingAvailable } from "../../capability-sources/cloud-hosting.js"
+import { db } from "../../db.js"
+import { env, type DenOrgMode } from "../../env.js"
+import { orgMemberRoute } from "../../middleware/index.js"
+import { jsonResponse, notFoundSchema, unauthorizedSchema } from "../../openapi.js"
+import { materializeCloudWorkerProviders } from "../../llm/cloud-provider-materialization.js"
+import {
+  getIdexalOsWebRuntimeAccess,
+  idexalOsWebAccessRequiredPayload,
+  type IdexalOsWebRuntimeAccessResolver,
+} from "../../idexal-os-web-runtime-access.js"
+import { CLOUD_INSTANCE_BACKEND, CLOUD_INSTANCE_NAME } from "../../workers/cloud-constants.js"
+import { currentInstanceName } from "@idexal-ee/cloud-runtime/orchestrator"
+import {
+  cloudRuntimeAvailable,
+  cloudRuntimeOrchestratorConfig,
+  cloudRuntimeStore,
+  currentCloudImageVersion,
+  getCloudRuntime,
+  type CloudRuntimeAvailabilityOptions,
+} from "../../workers/cloud-runtime.js"
+import { recoverClaimedCloudWorker as defaultRecoverCloudWorker, wakeCloudWorker as defaultWakeCloudWorker } from "../../workers/cloud-lifecycle.js"
+import {
+  hasActiveCloudAutomationRun as defaultHasActiveCloudAutomationRun,
+  resolveCloudWorkerInterruptibility,
+  type ProbeCloudWorkerActivity,
+} from "../../workers/cloud-activity.js"
+import {
+  probeCloudRuntimeSignedPreview,
+  resolveCloudRuntimeAccess,
+  resolveCloudRuntimeState,
+  type CloudRuntimeSandboxInspection,
+  type CloudRuntimeSandboxRecord,
+  type CloudRuntimeState,
+  type CloudRuntimeStore,
+  type CloudRuntimeWorker,
+} from "../../workers/worker-access.js"
+import { appLogger } from "../../observability/logger.js"
+import {
+  cloudStartupFailureFromWorker,
+  cloudStartupFailureUpdate,
+  publicCloudStartupFailure,
+  type PublicCloudStartupFailure,
+} from "../../workers/cloud-failure.js"
+import type { OrgRouteVariables } from "../org/shared.js"
+import { continueCloudProvisioning, token } from "../workers/shared.js"
+
+type CloudRouteOptions = CloudRuntimeAvailabilityOptions & {
+  memberRoute?: MiddlewareHandler<{ Variables: OrgRouteVariables }>
+  orgMode?: DenOrgMode
+  idexalOsWebEnabled?: boolean
+  gatewayKey?: string
+  continueProvisioning?: typeof continueCloudProvisioning
+  refreshSignedPreview?: RefreshSignedPreview
+  cloudWorkerStore?: CloudWorkerStore
+  ensureCloudWorker?: EnsureCloudWorker
+  getSandboxRecord?: GetSandboxRecord
+  inspectSandbox?: InspectSandbox
+  probeSignedPreview?: ProbeSignedPreview
+  wakeCloudWorker?: WakeCloudWorker
+  recoverCloudWorker?: WakeCloudWorker
+  flushWorkerCheckpoint?: FlushWorkerCheckpoint
+  stopCloudWorker?: StopCloudWorker
+  probeActivity?: ProbeCloudWorkerActivity
+  hasActiveAutomationRun?: HasActiveAutomationRun
+  unreachableGraceMs?: number
+  unreachableMisses?: number
+  materializeProviders?: typeof materializeCloudWorkerProviders
+  getIdexalOsWebAccess?: IdexalOsWebRuntimeAccessResolver
+  now?: () => number
+}
+
+type CloudWorker = CloudRuntimeWorker
+type CloudSandboxRecord = CloudRuntimeSandboxRecord
+type CloudSandboxInspection = CloudRuntimeSandboxInspection
+type OrgId = typeof WorkerTable.$inferSelect.org_id
+type UserId = NonNullable<typeof WorkerTable.$inferSelect.created_by_user_id>
+type WorkerId = typeof WorkerTable.$inferSelect.id
+type CloudRouteUser = {
+  id: UserId
+  name?: string | null
+  email?: string | null
+}
+type CloudInstanceResponse = {
+  status: "provisioning" | "waking" | "ready" | "failed"
+  url: string | null
+  failure?: PublicCloudStartupFailure
+}
+type CloudInstanceMemberResponse = CloudInstanceResponse & {
+  imageVersion?: string | null
+  instanceName?: string | null
+  latestVersion?: string | null
+}
+type CloudGatewayInstanceResponse = CloudInstanceResponse & {
+  clientToken: string | null
+  hostToken: string | null
+  expiresAt: string | null
+  providerSync?: { status: "degraded"; reason?: "unsupported" }
+}
+type CloudInstanceUpdateResponse =
+  | { ok: true; status: "update_requested" }
+  | { ok: false; error: "already_current" | "flush_failed" | "busy" | "activity_unknown" }
+type CloudWorkerStore = CloudRuntimeStore & {
+  getCloudWorker: (input: { orgId: OrgId; userId: UserId }) => Promise<CloudWorker | null>
+  insertCloudWorkerWithTokens: (input: {
+    workerId: WorkerId
+    orgId: OrgId
+    userId: UserId
+    name: string
+    hostToken: string
+    clientToken: string
+    activityToken: string
+  }) => Promise<void>
+  deleteCreateRaceLoser: (workerId: WorkerId) => Promise<void>
+}
+type EnsureCloudWorker = (input: {
+  orgId: OrgId
+  createdByUserId: UserId
+  name: string
+  continueProvisioning: typeof continueCloudProvisioning
+  store: CloudWorkerStore
+}) => Promise<CloudWorker>
+type GetSandboxRecord = (workerId: CloudWorker["id"]) => Promise<CloudSandboxRecord | null>
+type RefreshSignedPreview = (workerId: CloudWorker["id"]) => Promise<CloudSandboxRecord | null>
+type InspectSandbox = (workerId: CloudWorker["id"]) => Promise<CloudSandboxInspection>
+type ProbeSignedPreview = typeof probeCloudRuntimeSignedPreview
+type WakeCloudWorker = (workerId: CloudWorker["id"]) => Promise<void>
+type FlushWorkerCheckpoint = (workerId: CloudWorker["id"]) => Promise<boolean>
+type StopCloudWorker = (workerId: CloudWorker["id"]) => Promise<unknown>
+type HasActiveAutomationRun = (workerId: CloudWorker["id"]) => Promise<boolean>
+
+type UpdateResultRecord = {
+  rowsAffected?: unknown
+  affectedRows?: unknown
+}
+
+const cloudInstanceResponseSchema = z.object({
+  status: z.enum(["provisioning", "waking", "ready", "failed"]),
+  url: z.string().url().nullable(),
+  imageVersion: z.string().nullable().optional(),
+  instanceName: z.string().nullable().optional(),
+  latestVersion: z.string().nullable().optional(),
+  failure: z.object({
+    code: z.string(),
+    stage: z.enum(["provisioning", "recovery", "runtime"]),
+    reference: z.string(),
+    occurredAt: z.string().datetime(),
+  }).optional(),
+}).meta({ ref: "CloudInstanceResponse" })
+
+const cloudInstanceUpdateRequestSchema = z.object({
+  // Web shells published before deferrals only understand already_current and
+  // flush_failed and reject anything else as an invalid payload. New shells opt
+  // in here to receive busy / activity_unknown when the sandbox cannot be stopped.
+  acceptsDeferral: z.boolean().optional(),
+})
+
+const cloudInstanceUpdateResponseSchema = z.union([
+  z.object({
+    ok: z.literal(true),
+    status: z.literal("update_requested"),
+  }),
+  z.object({
+    ok: z.literal(false),
+    error: z.enum(["already_current", "flush_failed", "busy", "activity_unknown"]),
+  }),
+]).meta({ ref: "CloudInstanceUpdateResponse" })
+
+const cloudGatewayInstanceResponseSchema = z.object({
+  status: z.enum(["provisioning", "waking", "ready", "failed"]),
+  url: z.string().url().nullable(),
+  clientToken: z.string().nullable(),
+  hostToken: z.string().nullable(),
+  expiresAt: z.string().datetime().nullable(),
+  failure: z.object({
+    code: z.string(),
+    stage: z.enum(["provisioning", "recovery", "runtime"]),
+    reference: z.string(),
+    occurredAt: z.string().datetime(),
+  }).optional(),
+  providerSync: z.object({
+    status: z.literal("degraded"),
+    reason: z.literal("unsupported").optional(),
+  }).optional(),
+}).meta({ ref: "CloudGatewayInstanceResponse" })
+
+const idexalOsWebAccessRequiredSchema = z.object({
+  error: z.literal("idexal_os_web_access_required"),
+  message: z.string(),
+}).meta({ ref: "IdexalOsWebAccessRequiredError" })
+
+function cloudNotFound() {
+  return { error: "cloud_not_found" }
+}
+
+const logger = appLogger.child({ component: "cloud_routes" })
+const gatewayKeyHeader = "X-Idexal-Os-Gateway-Key"
+const ensureCloudWorkerInFlight = new Map<string, Promise<CloudWorker>>()
+
+function isUpdateResultRecord(value: unknown): value is UpdateResultRecord {
+  return typeof value === "object" && value !== null
+}
+
+function changedRows(result: unknown): number | null {
+  if (Array.isArray(result)) {
+    for (const value of result) {
+      const nestedRows = changedRows(value)
+      if (nestedRows !== null) {
+        return nestedRows
+      }
+    }
+    return null
+  }
+
+  if (!isUpdateResultRecord(result)) {
+    return null
+  }
+
+  if (typeof result.rowsAffected === "number") {
+    return result.rowsAffected
+  }
+
+  if (typeof result.affectedRows === "number") {
+    return result.affectedRows
+  }
+
+  return null
+}
+
+function hasChangedRows(result: unknown) {
+  const rows = changedRows(result)
+  return rows !== null && rows > 0
+}
+
+function ensureKey(orgId: OrgId, userId: UserId) {
+  return `${orgId}:${userId}`
+}
+
+const databaseCloudWorkerStore: CloudWorkerStore = {
+  async getCloudWorker(input) {
+    // Cloud is per-user. Legacy shared rows already have created_by_user_id set
+    // to the first clicker; that member keeps the row while others get fresh
+    // instances. Follow-up: admin user deletion currently nulls
+    // created_by_user_id (src/user-deletion.ts), orphaning instances; cleanup is
+    // tracked separately.
+    const rows = await db
+      .select()
+      .from(WorkerTable)
+      .where(and(
+        eq(WorkerTable.org_id, input.orgId),
+        eq(WorkerTable.created_by_user_id, input.userId),
+        eq(WorkerTable.destination, "cloud"),
+        eq(WorkerTable.sandbox_backend, CLOUD_INSTANCE_BACKEND),
+      ))
+      .orderBy(asc(WorkerTable.created_at), asc(WorkerTable.id))
+      .limit(1)
+
+    return rows[0] ?? null
+  },
+  async insertCloudWorkerWithTokens(input) {
+    await db.transaction(async (tx) => {
+      await tx.insert(WorkerTable).values({
+        id: input.workerId,
+        org_id: input.orgId,
+        created_by_user_id: input.userId,
+        name: input.name,
+        description: "idexal Os Cloud browser instance",
+        destination: "cloud",
+        status: "provisioning",
+        sandbox_backend: CLOUD_INSTANCE_BACKEND,
+      })
+      await tx.insert(WorkerTokenTable).values([
+        {
+          id: createDenTypeId("workerToken"),
+          worker_id: input.workerId,
+          scope: "host",
+          token: input.hostToken,
+        },
+        {
+          id: createDenTypeId("workerToken"),
+          worker_id: input.workerId,
+          scope: "client",
+          token: input.clientToken,
+        },
+        {
+          id: createDenTypeId("workerToken"),
+          worker_id: input.workerId,
+          scope: "activity",
+          token: input.activityToken,
+        },
+      ])
+    })
+  },
+  async deleteCreateRaceLoser(workerId) {
+    await db.transaction(async (tx) => {
+      await tx.delete(WorkerTokenTable).where(eq(WorkerTokenTable.worker_id, workerId))
+      await tx.delete(WorkerTable).where(eq(WorkerTable.id, workerId))
+    })
+  },
+  async claimFailedWorker(workerId) {
+    const result: unknown = await db
+      .update(WorkerTable)
+      .set({ status: "provisioning" })
+      .where(and(eq(WorkerTable.id, workerId), eq(WorkerTable.status, "failed")))
+
+    return hasChangedRows(result)
+  },
+  async claimRecycleWorker(workerId) {
+    const result: unknown = await db
+      .update(WorkerTable)
+      .set({ status: "provisioning" })
+      .where(and(eq(WorkerTable.id, workerId), inArray(WorkerTable.status, ["healthy", "stopped"])))
+
+    return hasChangedRows(result)
+  },
+  async getActiveTokens(workerId) {
+    return db
+      .select({ scope: WorkerTokenTable.scope, token: WorkerTokenTable.token })
+      .from(WorkerTokenTable)
+      .where(and(eq(WorkerTokenTable.worker_id, workerId), isNull(WorkerTokenTable.revoked_at)))
+  },
+  async markProvisioningWorkerFailed(workerId, failure) {
+    await db
+      .update(WorkerTable)
+      .set({ status: "failed", ...(failure ? cloudStartupFailureUpdate(failure) : {}) })
+      .where(and(eq(WorkerTable.id, workerId), eq(WorkerTable.status, "provisioning")))
+  },
+  async markHealthyWorkerFailed(workerId, failure) {
+    await db
+      .update(WorkerTable)
+      .set({ status: "failed", ...(failure ? cloudStartupFailureUpdate(failure) : {}) })
+      .where(and(eq(WorkerTable.id, workerId), eq(WorkerTable.status, "healthy")))
+  },
+}
+
+// Deployment-level availability only: multi-org, or a single-org install with
+// idexal Os Web turned on, plus a configured runtime provider. Organization
+// entitlement is the separate Web access check on each execution route.
+function cloudAvailable(payload: NonNullable<OrgRouteVariables["organizationContext"]>, options: CloudRouteOptions) {
+  return cloudHostingAvailable({
+    orgMode: options.orgMode ?? env.orgMode,
+    idexalOsWebEnabled: options.idexalOsWebEnabled ?? env.idexalOsWebEnabled,
+  })
+    && cloudRuntimeAvailable({ provisionerMode: options.provisionerMode, daytonaApiKey: options.daytonaApiKey })
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
+}
+
+function hasCloudUserId(user: unknown): user is CloudRouteUser {
+  if (!isRecord(user)) {
+    return false
+  }
+
+  if (typeof user.id !== "string" || !user.id.trim()) {
+    return false
+  }
+
+  if (user.name !== undefined && user.name !== null && typeof user.name !== "string") {
+    return false
+  }
+
+  if (user.email !== undefined && user.email !== null && typeof user.email !== "string") {
+    return false
+  }
+
+  return true
+}
+
+const textEncoder = new TextEncoder()
+
+function timingSafeStringEqual(left: string, right: string) {
+  const leftBytes = textEncoder.encode(left)
+  const rightBytes = textEncoder.encode(right)
+  if (leftBytes.byteLength === rightBytes.byteLength) {
+    return timingSafeEqual(leftBytes, rightBytes)
+  }
+
+  const byteLength = Math.max(leftBytes.byteLength, rightBytes.byteLength)
+  const paddedLeft = new Uint8Array(byteLength)
+  const paddedRight = new Uint8Array(byteLength)
+  paddedLeft.set(leftBytes)
+  paddedRight.set(rightBytes)
+  timingSafeEqual(paddedLeft, paddedRight)
+  return false
+}
+
+function gatewaySecretMatches(requestSecret: string | undefined, configuredSecret: string | undefined) {
+  const expected = configuredSecret?.trim()
+  const candidate = requestSecret?.trim()
+  if (!expected || !candidate) {
+    return false
+  }
+
+  return timingSafeStringEqual(candidate, expected)
+}
+
+async function getCloudWorker(orgId: OrgId, userId: UserId, store: CloudWorkerStore) {
+  return store.getCloudWorker({ orgId, userId })
+}
+
+async function createCloudWorker(input: {
+  orgId: OrgId
+  createdByUserId: UserId
+  name: string
+  continueProvisioning: typeof continueCloudProvisioning
+  store: CloudWorkerStore
+}): Promise<CloudWorker> {
+  const workerId = createDenTypeId("worker")
+  const hostToken = token()
+  const clientToken = token()
+  const activityToken = token()
+
+  await input.store.insertCloudWorkerWithTokens({
+    workerId,
+    orgId: input.orgId,
+    userId: input.createdByUserId,
+    name: input.name,
+    hostToken,
+    clientToken,
+    activityToken,
+  })
+
+  const canonical = await getCloudWorker(input.orgId, input.createdByUserId, input.store)
+  if (canonical && canonical.id !== workerId) {
+    // No unique index exists for (org_id, created_by_user_id, destination,
+    // sandbox_backend), and a partial unique is not viable across legacy rows.
+    // Converge create races by keeping the oldest canonical row and deleting the
+    // losing worker plus the tokens that were minted for it before provisioning.
+    await input.store.deleteCreateRaceLoser(workerId)
+    return canonical
+  }
+
+  void input.continueProvisioning({
+    workerId,
+    orgId: input.orgId,
+    name: input.name,
+    hostToken,
+    clientToken,
+    activityToken,
+  })
+
+  return canonical ?? { id: workerId, name: input.name, status: "provisioning" }
+}
+
+async function ensureCloudWorker(input: {
+  orgId: OrgId
+  createdByUserId: UserId
+  name: string
+  continueProvisioning: typeof continueCloudProvisioning
+  store: CloudWorkerStore
+}) {
+  const key = ensureKey(input.orgId, input.createdByUserId)
+  const existingPromise = ensureCloudWorkerInFlight.get(key)
+  if (existingPromise) {
+    return existingPromise
+  }
+
+  const promise = (async () => {
+    const existing = await getCloudWorker(input.orgId, input.createdByUserId, input.store)
+    if (existing) {
+      return existing
+    }
+
+    return createCloudWorker(input)
+  })()
+    .finally(() => {
+      if (ensureCloudWorkerInFlight.get(key) === promise) {
+        ensureCloudWorkerInFlight.delete(key)
+      }
+    })
+  ensureCloudWorkerInFlight.set(key, promise)
+
+  return promise
+}
+
+/** Share the browser's member-scoped creation and race handling with MCP. */
+export function ensureMemberCloudWorker(input: { orgId: OrgId; createdByUserId: UserId }) {
+  return ensureCloudWorker({
+    ...input,
+    name: CLOUD_INSTANCE_NAME,
+    continueProvisioning: continueCloudProvisioning,
+    store: databaseCloudWorkerStore,
+  })
+}
+
+type CurrentImageVersion = () => string | null
+
+function workerNeedsUserRequestedUpdate(worker: CloudWorker, imageVersion: string | null) {
+  return Boolean(imageVersion && (worker.image_version ?? null) !== imageVersion)
+}
+
+function isRunningSandboxState(inspection: CloudSandboxInspection) {
+  return inspection?.state === "running"
+}
+
+function isStoppedSandboxState(inspection: CloudSandboxInspection) {
+  return inspection?.state === "stopped"
+}
+
+function cloudInstanceName(worker: CloudWorker, sandbox: CloudSandboxRecord | null, imageVersion: string | null) {
+  if (!sandbox?.sandbox) return null
+  const storedName = sandbox.sandbox.ref.sandboxId?.trim() ?? ""
+  if (storedName) return storedName
+  return currentInstanceName(cloudRuntimeOrchestratorConfig().instanceNamePrefix, { workerId: worker.id, name: worker.name }, imageVersion)
+}
+
+function memberCloudInstanceResponse(
+  worker: CloudWorker,
+  instance: CloudRuntimeState,
+  sandbox: CloudSandboxRecord | null,
+  currentImageVersion: CurrentImageVersion,
+): CloudInstanceMemberResponse {
+  const latestVersion = currentImageVersion()
+  const instanceName = cloudInstanceName(worker, sandbox, latestVersion)
+  const failure = instance.status === "ready"
+    ? null
+    : instance.failure ?? cloudStartupFailureFromWorker(worker)
+  return {
+    status: instance.status,
+    url: instance.url,
+    imageVersion: worker.image_version ?? null,
+    ...(instanceName ? { instanceName } : {}),
+    latestVersion,
+    ...(failure ? { failure: publicCloudStartupFailure(failure) } : {}),
+  }
+}
+
+async function resolveCloudInstanceForMember(input: {
+  payload: NonNullable<OrgRouteVariables["organizationContext"]>
+  user: CloudRouteUser
+  continueProvisioning: typeof continueCloudProvisioning
+  refreshSignedPreview: RefreshSignedPreview
+  store: CloudWorkerStore
+  ensureWorker: EnsureCloudWorker
+  getSandboxRecord: GetSandboxRecord
+  inspectSandbox: InspectSandbox
+  probeSignedPreview: ProbeSignedPreview
+  startWake: (workerId: CloudWorker["id"]) => void
+  startRecovery: (workerId: CloudWorker["id"]) => void
+  now: () => number
+  currentImageVersion: CurrentImageVersion
+  forceFailedRecovery?: boolean
+  probeActivity?: ProbeCloudWorkerActivity
+  unreachableGraceMs?: number
+  unreachableMisses?: number
+}) {
+  const worker = await input.ensureWorker({
+    orgId: input.payload.organization.id,
+    createdByUserId: input.user.id,
+    name: CLOUD_INSTANCE_NAME,
+    continueProvisioning: input.continueProvisioning,
+    store: input.store,
+  })
+  const instance = await resolveCloudRuntimeState({
+    worker,
+    organizationId: input.payload.organization.id,
+  }, {
+    refreshSignedPreview: input.refreshSignedPreview,
+    getSandboxRecord: input.getSandboxRecord,
+    inspectSandbox: input.inspectSandbox,
+    probeSignedPreview: input.probeSignedPreview,
+    startWake: input.startWake,
+    startRecovery: input.startRecovery,
+    store: input.store,
+    now: input.now,
+    currentImageVersion: input.currentImageVersion,
+    forceFailedRecovery: input.forceFailedRecovery,
+    probeActivity: input.probeActivity,
+    unreachableGraceMs: input.unreachableGraceMs,
+    unreachableMisses: input.unreachableMisses,
+  })
+
+  return { worker, instance }
+}
+
+async function requestCloudInstanceUpdate(input: {
+  worker: CloudWorker | null
+  store: CloudWorkerStore
+  getSandboxRecord: GetSandboxRecord
+  refreshSignedPreview: RefreshSignedPreview
+  inspectSandbox: InspectSandbox
+  flushWorkerCheckpoint: FlushWorkerCheckpoint
+  stopCloudWorker: StopCloudWorker
+  probeActivity?: ProbeCloudWorkerActivity
+  hasActiveAutomationRun: HasActiveAutomationRun
+  currentImageVersion: CurrentImageVersion
+  now: () => number
+  acceptsDeferral: boolean
+}): Promise<CloudInstanceUpdateResponse> {
+  if (!input.worker) {
+    return { ok: true, status: "update_requested" }
+  }
+  const worker = input.worker
+
+  if (!workerNeedsUserRequestedUpdate(worker, input.currentImageVersion())) {
+    return { ok: false, error: "already_current" }
+  }
+
+  const sandbox = await input.getSandboxRecord(worker.id)
+  if (!sandbox) {
+    return { ok: true, status: "update_requested" }
+  }
+
+  let inspection: CloudSandboxInspection = null
+  try {
+    inspection = await input.inspectSandbox(worker.id)
+  } catch (error) {
+    logger.warn("cloud update failed to inspect sandbox", { worker_id: worker.id, error })
+    return { ok: false, error: "flush_failed" }
+  }
+
+  if (isStoppedSandboxState(inspection) || !isRunningSandboxState(inspection)) {
+    return { ok: true, status: "update_requested" }
+  }
+
+  // The browser only knows about its own tab. Ask the instance itself, and the
+  // Automation ledger, before stopping a sandbox that may be mid-task for
+  // another tab, device, remote session, or scheduled run.
+  const interruptibility = await resolveCloudWorkerInterruptibility({
+    workerId: worker.id,
+    trigger: "update",
+    hasActiveAutomationRun: input.hasActiveAutomationRun,
+    probeActivity: input.probeActivity,
+    instance: async () => {
+      const hostToken = (await input.store.getActiveTokens(worker.id)).find((entry) => entry.scope === "host")?.token ?? null
+      if (!hostToken) return null
+      const endpoint = sandbox.endpointExpiresAt.getTime() > input.now()
+        ? sandbox
+        : await input.refreshSignedPreview(worker.id).catch(() => null)
+      return endpoint ? { url: endpoint.endpointUrl, hostToken } : null
+    },
+  })
+  if (interruptibility.verdict !== "interruptible") {
+    const deferral = interruptibility.verdict === "busy" ? "busy" : "activity_unknown"
+    if (input.acceptsDeferral) return { ok: false, error: deferral }
+    // A shell built before deferrals treats busy / activity_unknown as an invalid
+    // payload and shows a failure. Inside its contract, already_current is the one
+    // answer that leaves the update pending quietly: the pill keeps offering it, the
+    // shell tries again on the next version or when the person clicks Update now,
+    // and the stale sandbox still recycles on its next idle stop.
+    logger.info("cloud update deferred for a client without deferral support", {
+      worker_id: worker.id,
+      deferral,
+      reason: interruptibility.reason,
+    })
+    return { ok: false, error: "already_current" }
+  }
+
+  const flushed = await input.flushWorkerCheckpoint(input.worker.id).catch((error) => {
+    logger.warn("cloud update checkpoint flush failed", { worker_id: input.worker?.id, error })
+    return false
+  })
+  if (!flushed) {
+    return { ok: false, error: "flush_failed" }
+  }
+
+  await input.stopCloudWorker(input.worker.id)
+  return { ok: true, status: "update_requested" }
+}
+
+async function resolveCloudInstanceForGateway(input: {
+  payload: NonNullable<OrgRouteVariables["organizationContext"]>
+  user: CloudRouteUser
+  continueProvisioning: typeof continueCloudProvisioning
+  refreshSignedPreview: RefreshSignedPreview
+  store: CloudWorkerStore
+  ensureWorker: EnsureCloudWorker
+  getSandboxRecord: GetSandboxRecord
+  inspectSandbox: InspectSandbox
+  probeSignedPreview: ProbeSignedPreview
+  startWake: (workerId: CloudWorker["id"]) => void
+  startRecovery: (workerId: CloudWorker["id"]) => void
+  materializeProviders: typeof materializeCloudWorkerProviders
+  now: () => number
+  currentImageVersion: CurrentImageVersion
+  probeActivity?: ProbeCloudWorkerActivity
+  unreachableGraceMs?: number
+  unreachableMisses?: number
+}): Promise<CloudGatewayInstanceResponse> {
+  const resolved = await resolveCloudRuntimeAccess({
+    organizationId: input.payload.organization.id,
+    userId: input.user.id,
+  }, {
+    loadWorker: async () => input.ensureWorker({
+      orgId: input.payload.organization.id,
+      createdByUserId: input.user.id,
+      name: CLOUD_INSTANCE_NAME,
+      continueProvisioning: input.continueProvisioning,
+      store: input.store,
+    }),
+    refreshSignedPreview: input.refreshSignedPreview,
+    getSandboxRecord: input.getSandboxRecord,
+    inspectSandbox: input.inspectSandbox,
+    probeSignedPreview: input.probeSignedPreview,
+    startWake: input.startWake,
+    startRecovery: input.startRecovery,
+    store: input.store,
+    now: input.now,
+    currentImageVersion: input.currentImageVersion,
+    probeActivity: input.probeActivity,
+    unreachableGraceMs: input.unreachableGraceMs,
+    unreachableMisses: input.unreachableMisses,
+  })
+  if (resolved.status !== "ready") {
+    const status = resolved.status === "missing" ? "failed" : resolved.status
+    return {
+      status,
+      url: null,
+      clientToken: null,
+      hostToken: null,
+      expiresAt: null,
+      ...("failure" in resolved && resolved.failure
+        ? { failure: publicCloudStartupFailure(resolved.failure) }
+        : {}),
+    }
+  }
+
+  let providerSync: CloudGatewayInstanceResponse["providerSync"] | null = null
+  try {
+    const result = await input.materializeProviders({
+      organizationId: input.payload.organization.id,
+      workerId: resolved.workerId,
+      instanceUrl: resolved.url,
+      hostToken: resolved.hostToken,
+      clientToken: resolved.clientToken,
+    })
+    if (!result.ok) {
+      providerSync = result.status === "unsupported"
+        ? { status: "degraded", reason: "unsupported" }
+        : { status: "degraded" }
+    }
+  } catch (error) {
+    providerSync = { status: "degraded" }
+    logger.warn("cloud gateway provider materialization warning", {
+      worker_id: resolved.workerId,
+      message: error instanceof Error ? error.message : "provider_materialization_failed",
+    })
+  }
+
+  return {
+    status: "ready",
+    url: resolved.url,
+    clientToken: resolved.clientToken,
+    hostToken: resolved.hostToken,
+    expiresAt: resolved.expiresAt.toISOString(),
+    ...(providerSync ? { providerSync } : {}),
+  }
+}
+
+export function registerCloudRoutes<T extends { Variables: OrgRouteVariables }>(
+  app: Hono<T>,
+  options: CloudRouteOptions = {},
+) {
+  const orgMemberRouteMiddleware = options.memberRoute ?? orgMemberRoute()
+  const materializeProviders = options.materializeProviders ?? materializeCloudWorkerProviders
+  const getIdexalOsWebAccess = options.getIdexalOsWebAccess ?? getIdexalOsWebRuntimeAccess
+  const continueProvisioning: typeof continueCloudProvisioning = options.continueProvisioning
+    ?? ((input, continueOptions = {}) => continueCloudProvisioning(input, { ...continueOptions, materializeProviders }))
+  const refreshSignedPreview = options.refreshSignedPreview ?? ((workerId) => getCloudRuntime().refreshEndpoint(workerId))
+  const store = options.cloudWorkerStore ?? databaseCloudWorkerStore
+  const ensureWorker = options.ensureCloudWorker ?? ensureCloudWorker
+  const getSandboxRecord = options.getSandboxRecord ?? ((workerId) => cloudRuntimeStore().get(workerId))
+  const inspectSandbox = options.inspectSandbox ?? ((workerId) => getCloudRuntime().inspect(workerId))
+  const signedPreviewProbe = options.probeSignedPreview ?? probeCloudRuntimeSignedPreview
+  const wakeCloudWorker = options.wakeCloudWorker ?? defaultWakeCloudWorker
+  const recoverCloudWorker = options.recoverCloudWorker
+    ?? (options.wakeCloudWorker ? options.wakeCloudWorker : defaultRecoverCloudWorker)
+  const flushWorkerCheckpoint = options.flushWorkerCheckpoint ?? ((workerId) => getCloudRuntime().flushCheckpoint(workerId))
+  const stopCloudWorker = options.stopCloudWorker ?? ((workerId) => getCloudRuntime().stop(workerId))
+  const hasActiveAutomationRun = options.hasActiveAutomationRun ?? defaultHasActiveCloudAutomationRun
+  const now = options.now ?? Date.now
+  const currentImageVersion: CurrentImageVersion = () => currentCloudImageVersion({ provisionerMode: options.provisionerMode })
+  const gatewayKey = options.gatewayKey !== undefined ? options.gatewayKey : env.gatewayKey
+  const wakingWorkers = new Set<CloudWorker["id"]>()
+
+  function startWake(workerId: CloudWorker["id"]) {
+    if (wakingWorkers.has(workerId)) {
+      return
+    }
+
+    wakingWorkers.add(workerId)
+    void wakeCloudWorker(workerId)
+      .catch(() => undefined)
+      .finally(() => {
+        wakingWorkers.delete(workerId)
+      })
+  }
+
+  function startRecovery(workerId: CloudWorker["id"]) {
+    if (wakingWorkers.has(workerId)) return
+    wakingWorkers.add(workerId)
+    void recoverCloudWorker(workerId)
+      .catch(() => undefined)
+      .finally(() => wakingWorkers.delete(workerId))
+  }
+
+  app.get(
+    "/v1/cloud/instance",
+    describeRoute({
+      tags: ["Cloud"],
+      summary: "Get the active organization's Cloud instance",
+      description: "Starts the active organization's idexal Os Cloud browser instance when needed and returns its browser URL once ready.",
+      responses: {
+        200: jsonResponse("Cloud instance status returned successfully.", cloudInstanceResponseSchema),
+        401: jsonResponse("The caller must be signed in to open Cloud.", unauthorizedSchema),
+        403: jsonResponse("idexal Os Web access is not active for the organization.", idexalOsWebAccessRequiredSchema),
+        404: jsonResponse("Cloud is not available for this organization.", notFoundSchema),
+      },
+    }),
+    orgMemberRouteMiddleware,
+    async (c) => {
+      const payload = c.get("organizationContext")
+      const user = c.get("user")
+      if (!hasCloudUserId(user)) {
+        return c.json({ error: "unauthorized" }, 401)
+      }
+
+      // Published desktops reach this route only from inside the gateway
+      // runtime, after IdexalOsWebAccessGate (v0.18.42+) has already resolved
+      // Web access for the organization; see idexal-os-web-runtime-access.ts.
+      const webAccess = await getIdexalOsWebAccess(payload.organization.id)
+      if (!webAccess.hasAccess) {
+        return c.json(idexalOsWebAccessRequiredPayload(), 403)
+      }
+
+      if (!cloudAvailable(payload, options)) {
+        return c.json(cloudNotFound(), 404)
+      }
+
+      const resolved = await resolveCloudInstanceForMember({
+        payload,
+        user,
+        continueProvisioning,
+        refreshSignedPreview,
+        store,
+        ensureWorker,
+        getSandboxRecord,
+        inspectSandbox,
+        probeSignedPreview: signedPreviewProbe,
+        startWake,
+        startRecovery,
+        now,
+        currentImageVersion,
+        probeActivity: options.probeActivity,
+        unreachableGraceMs: options.unreachableGraceMs,
+        unreachableMisses: options.unreachableMisses,
+      })
+
+      const sandbox = await getSandboxRecord(resolved.worker.id)
+      return c.json(memberCloudInstanceResponse(resolved.worker, resolved.instance, sandbox, currentImageVersion))
+    },
+  )
+
+  app.post(
+    "/v1/cloud/instance/retry",
+    describeRoute({
+      tags: ["Cloud"],
+      summary: "Retry the active organization's Cloud instance",
+      description: "Bypasses the passive recovery cooldown and makes one explicit attempt to recover the caller's failed Cloud instance.",
+      responses: {
+        200: jsonResponse("Cloud instance recovery was requested.", cloudInstanceResponseSchema),
+        401: jsonResponse("The caller must be signed in to retry Cloud.", unauthorizedSchema),
+        403: jsonResponse("idexal Os Web access is not active for the organization.", idexalOsWebAccessRequiredSchema),
+        404: jsonResponse("Cloud is not available for this organization.", notFoundSchema),
+      },
+    }),
+    orgMemberRouteMiddleware,
+    async (c) => {
+      const payload = c.get("organizationContext")
+      const user = c.get("user")
+      if (!hasCloudUserId(user)) {
+        return c.json({ error: "unauthorized" }, 401)
+      }
+
+      const webAccess = await getIdexalOsWebAccess(payload.organization.id)
+      if (!webAccess.hasAccess) {
+        return c.json(idexalOsWebAccessRequiredPayload(), 403)
+      }
+
+      if (!cloudAvailable(payload, options)) {
+        return c.json(cloudNotFound(), 404)
+      }
+
+      const resolved = await resolveCloudInstanceForMember({
+        payload,
+        user,
+        continueProvisioning,
+        refreshSignedPreview,
+        store,
+        ensureWorker,
+        getSandboxRecord,
+        inspectSandbox,
+        probeSignedPreview: signedPreviewProbe,
+        startWake,
+        startRecovery,
+        now,
+        currentImageVersion,
+        forceFailedRecovery: true,
+        probeActivity: options.probeActivity,
+        unreachableGraceMs: options.unreachableGraceMs,
+        unreachableMisses: options.unreachableMisses,
+      })
+
+      const sandbox = await getSandboxRecord(resolved.worker.id)
+      return c.json(memberCloudInstanceResponse(resolved.worker, resolved.instance, sandbox, currentImageVersion))
+    },
+  )
+
+  app.post(
+    "/v1/cloud/instance/update",
+    describeRoute({
+      tags: ["Cloud"],
+      summary: "Request an update for the active organization's Cloud instance",
+      description: "Flushes a running Cloud workspace checkpoint and stops the sandbox so the next resolve can recycle it onto the latest snapshot. A sandbox that is mid-task is left running; clients that send { acceptsDeferral: true } learn why (busy or activity_unknown), older clients receive already_current.",
+      responses: {
+        200: jsonResponse("Cloud instance update request handled.", cloudInstanceUpdateResponseSchema),
+        401: jsonResponse("The caller must be signed in to update Cloud.", unauthorizedSchema),
+        403: jsonResponse("idexal Os Web access is not active for the organization.", idexalOsWebAccessRequiredSchema),
+        404: jsonResponse("Cloud is not available for this organization.", notFoundSchema),
+      },
+    }),
+    orgMemberRouteMiddleware,
+    async (c) => {
+      const payload = c.get("organizationContext")
+      const user = c.get("user")
+      if (!hasCloudUserId(user)) {
+        return c.json({ error: "unauthorized" }, 401)
+      }
+
+      const webAccess = await getIdexalOsWebAccess(payload.organization.id)
+      if (!webAccess.hasAccess) {
+        return c.json(idexalOsWebAccessRequiredPayload(), 403)
+      }
+
+      if (!cloudAvailable(payload, options)) {
+        return c.json(cloudNotFound(), 404)
+      }
+
+      const requestBody = cloudInstanceUpdateRequestSchema.safeParse(await c.req.json().catch(() => ({})))
+      const worker = await getCloudWorker(payload.organization.id, user.id, store)
+      const result = await requestCloudInstanceUpdate({
+        worker,
+        store,
+        getSandboxRecord,
+        refreshSignedPreview,
+        inspectSandbox,
+        flushWorkerCheckpoint,
+        stopCloudWorker,
+        probeActivity: options.probeActivity,
+        hasActiveAutomationRun,
+        currentImageVersion,
+        now,
+        acceptsDeferral: requestBody.success && requestBody.data.acceptsDeferral === true,
+      })
+
+      return c.json(result)
+    },
+  )
+
+  app.get(
+    "/v1/cloud/gateway/resolve",
+    describeRoute({
+      tags: ["Cloud"],
+      summary: "Resolve the caller's Cloud instance for the browser gateway",
+      description: "Starts or wakes the caller's own idexal Os Cloud browser instance when needed and returns the collaborator token only to the trusted gateway.",
+      responses: {
+        200: jsonResponse("Cloud instance status returned successfully for the gateway.", cloudGatewayInstanceResponseSchema),
+        401: jsonResponse("The caller must be signed in to open Cloud.", unauthorizedSchema),
+        403: jsonResponse("idexal Os Web access is not active for the organization.", idexalOsWebAccessRequiredSchema),
+        404: jsonResponse("Cloud is not available for this organization or gateway.", notFoundSchema),
+      },
+    }),
+    async (c, next) => {
+      if (!gatewaySecretMatches(c.req.header(gatewayKeyHeader), gatewayKey)) {
+        return c.json(cloudNotFound(), 404)
+      }
+
+      await next()
+    },
+    orgMemberRouteMiddleware,
+    async (c) => {
+      const payload = c.get("organizationContext")
+      if (!cloudAvailable(payload, options)) {
+        return c.json(cloudNotFound(), 404)
+      }
+
+      const user = c.get("user")
+      if (!hasCloudUserId(user)) {
+        return c.json({ error: "unauthorized" }, 401)
+      }
+
+      const webAccess = await getIdexalOsWebAccess(payload.organization.id)
+      if (!webAccess.hasAccess) {
+        return c.json(idexalOsWebAccessRequiredPayload(), 403)
+      }
+
+      const instance = await resolveCloudInstanceForGateway({
+        payload,
+        user,
+        continueProvisioning,
+        refreshSignedPreview,
+        store,
+        ensureWorker,
+        getSandboxRecord,
+        inspectSandbox,
+        probeSignedPreview: signedPreviewProbe,
+        startWake,
+        startRecovery,
+        materializeProviders,
+        now,
+        currentImageVersion,
+        probeActivity: options.probeActivity,
+        unreachableGraceMs: options.unreachableGraceMs,
+        unreachableMisses: options.unreachableMisses,
+      })
+
+      return c.json(instance)
+    },
+  )
+}

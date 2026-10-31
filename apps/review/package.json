@@ -1,0 +1,27 @@
+{
+  "name": "@idexal/review-app",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "next dev --hostname 127.0.0.1 --port ${REVIEW_PORT:-3011}",
+    "build": "pnpm --filter \"@idexal/review-app^...\" --if-present run build && next build",
+    "start": "next start --hostname 127.0.0.1 --port ${REVIEW_PORT:-3011}",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test lib/*.test.ts"
+  },
+  "dependencies": {
+    "@idexal/daytona-evidence": "workspace:*",
+    "@idexal/evidence-provider": "workspace:*",
+    "@idexal/freestyle": "workspace:*",
+    "@idexal/review": "workspace:*",
+    "next": "16.3.8",
+    "react": "catalog:",
+    "react-dom": "catalog:"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "typescript": "^5.9.3"
+  }
+}

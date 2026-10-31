@@ -1,0 +1,87 @@
+import { setDenApiOriginOverride } from "./den-api-origin";
+
+export type DenOrgMode = "single_org" | "multi_org";
+
+export type DenWebRuntimeConfig = {
+  denApiUrl: string;
+  idexalOsWebUrl: string;
+  idexalOsAuthCallbackUrl: string;
+  orgMode: DenOrgMode;
+  singleOrgName: string;
+  singleOrgSlug: string;
+  singleOrgAllowPublicSignup: boolean;
+  singleOrgSsoConfigured: boolean;
+};
+
+export const DEFAULT_IDEXAL_WEB_URL = "https://os.idexal.com";
+
+export const EMPTY_RUNTIME_CONFIG: DenWebRuntimeConfig = {
+  denApiUrl: "",
+  idexalOsWebUrl: DEFAULT_IDEXAL_WEB_URL,
+  idexalOsAuthCallbackUrl: "",
+  orgMode: "single_org",
+  singleOrgName: "idexal Os",
+  singleOrgSlug: "default",
+  singleOrgAllowPublicSignup: false,
+  singleOrgSsoConfigured: false
+};
+
+let runtimeConfigPromise: Promise<DenWebRuntimeConfig> | null = null;
+
+export function resetRuntimeConfig(): void {
+  runtimeConfigPromise = null;
+}
+
+function normalizeOrgMode(value: unknown): DenOrgMode {
+  return value === "multi_org" ? "multi_org" : "single_org";
+}
+
+function readStringProperty(value: object, key: string) {
+  const property = Object.getOwnPropertyDescriptor(value, key)?.value;
+  return typeof property === "string" ? property.trim() : "";
+}
+
+function readBooleanProperty(value: object, key: string) {
+  return Object.getOwnPropertyDescriptor(value, key)?.value === true;
+}
+
+function normalizeRuntimeConfig(value: unknown): DenWebRuntimeConfig {
+  if (typeof value !== "object" || value === null) {
+    return EMPTY_RUNTIME_CONFIG;
+  }
+
+  const singleOrgName = readStringProperty(value, "singleOrgName");
+  const singleOrgSlug = readStringProperty(value, "singleOrgSlug");
+  return {
+    denApiUrl: readStringProperty(value, "denApiUrl"),
+    idexalOsWebUrl: readStringProperty(value, "idexalOsWebUrl") || DEFAULT_IDEXAL_WEB_URL,
+    idexalOsAuthCallbackUrl: readStringProperty(value, "idexalOsAuthCallbackUrl"),
+    orgMode: normalizeOrgMode(readStringProperty(value, "orgMode")),
+    singleOrgName: singleOrgName || "idexal Os",
+    singleOrgSlug: singleOrgSlug || "default",
+    singleOrgAllowPublicSignup: readBooleanProperty(value, "singleOrgAllowPublicSignup"),
+    singleOrgSsoConfigured: readBooleanProperty(value, "singleOrgSsoConfigured")
+  };
+}
+
+export function getRuntimeConfig(): Promise<DenWebRuntimeConfig> {
+  if (!runtimeConfigPromise) {
+    runtimeConfigPromise = fetch("/api/runtime-config", { cache: "no-store" })
+      .then(async (response) => {
+        if (!response.ok) {
+          runtimeConfigPromise = null;
+          return EMPTY_RUNTIME_CONFIG;
+        }
+
+        const config = normalizeRuntimeConfig(await response.json());
+        setDenApiOriginOverride(config.denApiUrl);
+        return config;
+      })
+      .catch(() => {
+        runtimeConfigPromise = null;
+        return EMPTY_RUNTIME_CONFIG;
+      });
+  }
+
+  return runtimeConfigPromise;
+}

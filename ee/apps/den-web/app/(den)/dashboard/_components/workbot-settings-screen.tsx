@@ -1,0 +1,229 @@
+"use client";
+
+import Link from "next/link";
+import { Lock } from "lucide-react";
+import { useEffect, useId, useState } from "react";
+import type { WorkbotSettings } from "@idexal/types/den/workbot-settings";
+import {
+  getBrandAppearanceRoute,
+  getOrgAccessFlags,
+  parseOrganizationMetadata,
+  permissionLockReason,
+} from "../../_lib/den-org";
+import { DenButton } from "../../_components/ui/button";
+import { DashboardPageTemplate } from "../../_components/ui/dashboard-page-template";
+import { DenNotice } from "../../_components/ui/notice";
+import { DenBrandMark } from "../../_components/ui/brand-mark";
+import { DenCombobox, type DenComboboxOption } from "../../_components/ui/combobox";
+import { DenSkeleton } from "../../_components/ui/skeleton";
+import { useOrgDashboard } from "../_providers/org-dashboard-provider";
+import { providerIconSlug } from "./library-models";
+import { useSaveWorkbotModel, useWorkbotSettings } from "./workbot-settings-data";
+
+/** The name Workbot introduces itself with: the organization's brand name, unless it is unset or idexal Os. */
+function workbotName(metadata: string | null): string {
+  const brand = parseOrganizationMetadata(metadata)?.brandAppName;
+  const trimmed = typeof brand === "string" ? brand.trim() : "";
+  return trimmed && trimmed !== "idexal Os" ? trimmed.slice(0, 40) : "Workbot";
+}
+
+/** Runner model ids read "provider/model"; the provider part picks the logo. */
+function ModelMark({ id }: { id: string }) {
+  const provider = id.includes("/") ? id.slice(0, id.indexOf("/")) : id;
+  return (
+    <DenBrandMark
+      name={provider}
+      simpleIconSlug={providerIconSlug(provider)}
+      className="h-5 w-5 rounded-[5px] border-gray-200"
+      imageClassName="h-3.5 w-3.5"
+    />
+  );
+}
+
+/** The same searchable rows as the organization default model picker. */
+function modelOptions(settings: WorkbotSettings): DenComboboxOption[] {
+  const missing = settings.model && !settings.models.some((entry) => entry.id === settings.model)
+    ? [{ value: settings.model, label: settings.model, description: "No longer available" }]
+    : [];
+  return [
+    { value: "", label: defaultLabel(settings) },
+    ...missing,
+    ...settings.models.map((entry) => ({ value: entry.id, label: entry.name, keywords: [entry.id], icon: <ModelMark id={entry.id} /> })),
+  ];
+}
+
+function modelName(settings: WorkbotSettings, id: string | null): string {
+  if (!id) return defaultLabel(settings);
+  return settings.models.find((entry) => entry.id === id)?.name ?? "Unavailable model";
+}
+
+function defaultModelName(settings: WorkbotSettings): string {
+  if (!settings.defaultModel) return "the default model";
+  return settings.models.find((entry) => entry.id === settings.defaultModel)?.name ?? "the default model";
+}
+
+function defaultLabel(settings: WorkbotSettings): string {
+  return settings.defaultModel ? `Default (${defaultModelName(settings)})` : "Default";
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message.trim() ? error.message : fallback;
+}
+
+function SettingsRow({ label, labelId, children }: { label: string; labelId?: string; children: React.ReactNode }) {
+  return (
+    <div className="flex min-h-12 flex-wrap items-center justify-between gap-3 px-6 py-3">
+      <span id={labelId} className="text-[13px] font-medium text-gray-900">{label}</span>
+      <div className="flex min-w-0 max-w-full flex-wrap items-center justify-end gap-2">{children}</div>
+    </div>
+  );
+}
+
+export function WorkbotSettingsScreen() {
+  const { orgContext, orgSlug } = useOrgDashboard();
+  const orgId = orgContext?.organization.id ?? "";
+  const access = getOrgAccessFlags(
+    orgContext?.currentMember.role ?? "member",
+    orgContext?.currentMember.isOwner ?? false,
+    orgContext?.currentMember.permissions,
+  );
+  const canManage = access.canManageModelsSettings;
+  const query = useWorkbotSettings(orgId, Boolean(orgId));
+  const save = useSaveWorkbotModel(orgId);
+  const labelId = useId();
+  const [draft, setDraft] = useState("");
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saved, setSaved] = useState<{ previous: string | null } | null>(null);
+
+  const settings = query.data;
+  useEffect(() => {
+    setDraft(settings?.model ?? "");
+  }, [settings?.model]);
+
+  const name = workbotName(orgContext?.organization.metadata ?? null);
+  const savedModel = settings?.model ?? null;
+  const draftModel = draft || null;
+  const changed = draftModel !== savedModel;
+  const canChoose = canManage && settings?.runnerReachable === true && !save.isPending;
+
+  async function store(model: string | null, previous: string | null) {
+    setSaveError(null);
+    setSaved(null);
+    try {
+      await save.mutateAsync(model);
+      setSaved({ previous });
+    } catch (error) {
+      setSaveError(errorMessage(error, "Couldn't save the default model. Try again."));
+    }
+  }
+
+  return (
+    <div data-testid="workbot-settings-screen">
+      <DashboardPageTemplate
+        title="Workbot"
+        description={null}
+      >
+        <div className="grid gap-4">
+          {settings && !settings.runnerReachable ? (
+            <DenNotice
+              tone="error"
+              message="Couldn't reach Workbot's models, so the model can't be changed right now."
+              action={(
+                <DenButton variant="secondary" size="sm" loading={query.isFetching} onClick={() => void query.refetch()}>
+                  Try again
+                </DenButton>
+              )}
+            />
+          ) : null}
+          {settings && settings.runnerReachable && !settings.modelAvailable && settings.model ? (
+            <DenNotice
+              tone="warning"
+              message={`The saved model is no longer available. New messages use ${defaultModelName(settings)} until you choose another model.`}
+            />
+          ) : null}
+
+          {query.isError ? (
+            <DenNotice
+              tone="error"
+              message={errorMessage(query.error, "Couldn't load Workbot settings.")}
+              action={(
+                <DenButton variant="secondary" size="sm" loading={query.isFetching} onClick={() => void query.refetch()}>
+                  Try again
+                </DenButton>
+              )}
+            />
+          ) : (
+            <div className="divide-y divide-gray-100 overflow-hidden rounded-2xl border border-gray-100 bg-white" data-section="workbot-default-model">
+              <SettingsRow label="Default model" labelId={labelId}>
+                {!settings ? (
+                  <DenSkeleton className="h-10 w-80 max-w-full" data-testid="workbot-model-skeleton" />
+                ) : (
+                  <>
+                    <div className="w-80 min-w-0 max-w-full" data-testid="workbot-model-picker">
+                      <DenCombobox
+                        ariaLabel="Default model"
+                        value={draft}
+                        options={modelOptions(settings)}
+                        disabled={!canChoose}
+                        placeholder={defaultLabel(settings)}
+                        searchPlaceholder="Search models"
+                        emptyLabel="No models match"
+                        onChange={(value) => {
+                          setDraft(value);
+                          setSaved(null);
+                          setSaveError(null);
+                        }}
+                      />
+                    </div>
+                    {canManage ? (
+                      <DenButton
+                        size="sm"
+                        loading={save.isPending && !saved}
+                        disabled={!canChoose || !changed}
+                        onClick={() => void store(draftModel, savedModel)}
+                      >
+                        Save model
+                      </DenButton>
+                    ) : null}
+                  </>
+                )}
+              </SettingsRow>
+              <SettingsRow label="Name">
+                <span className="text-[13px] text-gray-900" data-testid="workbot-name">{name}</span>
+                <Link
+                  href={getBrandAppearanceRoute(orgSlug)}
+                  className="rounded text-[13px] text-gray-500 underline-offset-2 hover:text-gray-900 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-gray-900"
+                >
+                  Change in Brand appearance
+                </Link>
+              </SettingsRow>
+            </div>
+          )}
+
+          {saveError ? (
+            <p role="alert" className="px-1 text-[13px] text-red-700">{saveError}</p>
+          ) : null}
+          {saved && settings ? (
+            <div role="status" className="flex items-center justify-between gap-3 px-1 text-[13px] text-gray-600">
+              <span className="min-w-0 [overflow-wrap:anywhere]">Saved. New messages use {modelName(settings, settings.model)}.</span>
+              <DenButton
+                variant="ghost"
+                size="xs"
+                loading={save.isPending}
+                onClick={() => void store(saved.previous, settings.model)}
+              >
+                Undo
+              </DenButton>
+            </div>
+          ) : null}
+          {!canManage && settings ? (
+            <p className="flex items-center gap-2 px-1 text-[13px] text-gray-500">
+              <Lock size={16} strokeWidth={1.5} aria-hidden="true" className="shrink-0" />
+              {`Read only. ${permissionLockReason("inference.manage")}`}
+            </p>
+          ) : null}
+        </div>
+      </DashboardPageTemplate>
+    </div>
+  );
+}
