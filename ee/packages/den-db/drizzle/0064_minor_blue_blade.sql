@@ -1,0 +1,1 @@
+ALTER TABLE `automation_revision` DROP INDEX `automation_revision_digest`;

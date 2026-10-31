@@ -1,0 +1,249 @@
+"use client";
+
+import {
+  ArrowUpRight,
+  Clock,
+  Code2,
+  Download,
+  FileText,
+  KeyRound,
+  Library,
+  Monitor,
+  Plug,
+  Server,
+  Shield,
+  SlidersHorizontal,
+  Users,
+} from "lucide-react";
+
+type PricingGridProps = {
+  callUrl: string;
+  showHeader?: boolean;
+};
+
+type PricingCard = {
+  id: string;
+  title: string;
+  price: string;
+  priceSub: string;
+  ctaLabel: string;
+  href: string;
+  external?: boolean;
+  features: Array<{ text: string; icon: typeof Download }>;
+  footer?: string;
+  isCustomPricing?: boolean;
+  badge?: string;
+};
+
+const CLOUD_SIGNUP_URL = "https://os.idexal.com?mode=sign-up";
+
+function PricingCardView({ card }: { card: PricingCard }) {
+  return (
+    <div className="flex h-full flex-col relative group">
+      {/* ── Header card ── */}
+      <div className="relative p-5 rounded-[20px] overflow-hidden mb-6 flex-shrink-0 bg-[#F4F4F4] text-gray-900 group-hover:bg-gray-950 group-hover:text-white transition-colors duration-300">
+        <div className="relative z-10 flex flex-col h-full min-h-[160px] justify-between">
+          <div>
+            <div className="flex justify-between items-start mb-6">
+              <h2 className="text-[17px] font-medium tracking-tight">{card.title}</h2>
+              {card.badge ? (
+                <span className="rounded-full bg-gray-900 px-2.5 py-1 text-[10px] font-medium uppercase tracking-wide text-white group-hover:bg-white/15 transition-colors duration-300">
+                  {card.badge}
+                </span>
+              ) : null}
+            </div>
+
+            {card.isCustomPricing ? (
+              <div className="text-[16px] font-semibold mt-4 mb-2">{card.price}</div>
+            ) : (
+              <div className="mt-4">
+                <div className="flex items-baseline gap-1.5">
+                  <span className="text-[28px] font-semibold tracking-tight leading-none">{card.price}</span>
+                  <span className="text-[12px] font-medium text-gray-500 group-hover:text-white/80 transition-colors duration-300">
+                    {card.priceSub}
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <a
+            href={card.href}
+            {...(card.external ? { rel: "noreferrer", target: "_blank" as const } : {})}
+            className="w-full mt-6 py-2.5 rounded-full text-[13px] font-medium bg-gray-950 text-white hover:bg-gray-900 shadow-sm transition-colors flex items-center justify-center gap-2"
+          >
+            {card.ctaLabel}
+            <ArrowUpRight size={14} />
+          </a>
+        </div>
+      </div>
+
+      {/* ── Features list ── */}
+      <div className="flex-1 pr-4">
+        <div className="flex flex-col">
+          {card.features.map((feature, idx) => {
+            const Icon = feature.icon;
+            return (
+              <div
+                key={idx}
+                className="flex items-start gap-3 py-3 border-b border-dotted border-gray-400/40 last:border-0 text-[13px] text-gray-700 font-medium"
+              >
+                <Icon className="w-[18px] h-[18px] text-gray-500 shrink-0 mt-0.5" strokeWidth={1.5} />
+                <span className="leading-snug">{feature.text}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* ── Footer ── */}
+      {card.footer ? (
+        <div className="mt-auto pt-8">
+          <div className="text-[14px] font-medium text-gray-800">{card.footer}</div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+export function PricingGrid(props: PricingGridProps) {
+  const cards: PricingCard[] = [
+    {
+      id: "free",
+      title: "Free",
+      price: "$0",
+      priceSub: "first 5 Cloud seats",
+      ctaLabel: "Get Started for free",
+      href: CLOUD_SIGNUP_URL,
+      external: true,
+      features: [
+        { text: "Open source desktop app (MIT)", icon: Code2 },
+        { text: "Self-host the full platform, free for organizations up to 5 users", icon: Server },
+        { text: "Bring your own keys", icon: KeyRound },
+        { text: "macOS, Windows, and Linux downloads", icon: Download },
+        { text: "Community support", icon: Plug },
+      ],
+      footer: "First 5 Cloud seats free, any team size",
+    },
+    {
+      id: "team",
+      title: "Team",
+      price: "$10",
+      priceSub: "per seat / month",
+      ctaLabel: "Start team plan",
+      href: "https://os.idexal.com/dashboard/billing",
+      external: true,
+      badge: "Recommended",
+      features: [
+        { text: "Everything in Free, unlimited users", icon: Users },
+        { text: "SSO / SAML", icon: Shield },
+        { text: "Extension Marketplace", icon: Library },
+        { text: "Bring your own LLM keys, distributed to your team", icon: KeyRound },
+        { text: "Cloud automations", icon: Clock },
+        { text: "Basic usage analytics", icon: SlidersHorizontal },
+        { text: "Standard support included", icon: Plug },
+      ],
+      footer: "Billed monthly. Cancel anytime.",
+    },
+    {
+      id: "enterprise",
+      title: "Enterprise",
+      price: "Custom pricing",
+      priceSub: "",
+      isCustomPricing: true,
+      ctaLabel: "Talk to us",
+      href: props.callUrl,
+      external: /^https?:\/\//.test(props.callUrl),
+      features: [
+        { text: "Everything in Team, including SSO", icon: Users },
+        { text: "SCIM provisioning", icon: Shield },
+        { text: "Usage and adoption analytics", icon: SlidersHorizontal },
+        { text: "Desktop policies and version controls", icon: SlidersHorizontal },
+        { text: "Audit log and spend observability", icon: FileText },
+        { text: "Internal white-labeling — your name, logo, and branding", icon: FileText },
+        { text: "Bring your own inference — self-hosted or private models", icon: Server },
+        { text: "Standard SLA support included", icon: Plug },
+      ],
+      footer: "Annual contract with a 60-day opt-out. Same terms cloud or self-hosted.",
+    },
+  ];
+
+  const addOns: Array<{ name: string; price: string; description: string; icon: typeof Download }> = [
+    {
+      name: "idexal Os Cloud Computer",
+      price: "$50 per member / month",
+      description: "A cloud computer for each member, accessible from the browser.",
+      icon: Monitor,
+    },
+    {
+      name: "idexal Os models",
+      price: "$10 per user / month",
+      description: "Managed inference — no keys to bring.",
+      icon: Code2,
+    },
+  ];
+
+  return (
+    <section className="grid gap-8">
+      {props.showHeader !== false ? (
+        <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
+          <h2 className="text-[40px] md:text-[46px] font-medium tracking-tight text-gray-900 leading-[1.1]">
+            Pricing
+          </h2>
+        </div>
+      ) : null}
+
+      <div className="grid grid-cols-1 md:grid-cols-3 relative border-l border-t border-dotted border-gray-400/50 bg-[#f6f9fc]/75 backdrop-blur-sm">
+        {cards.map((card) => (
+          <div key={card.id} className="p-6 border-r border-b border-dotted border-gray-400/50 flex flex-col h-full">
+            <PricingCardView card={card} />
+          </div>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-1 border-l border-t border-dotted border-gray-400/50 bg-[#f6f9fc]/75 backdrop-blur-sm md:grid-cols-2">
+        {addOns.map((addOn) => {
+          const Icon = addOn.icon;
+          return (
+            <div
+              key={addOn.name}
+              className="flex items-start gap-4 border-b border-r border-dotted border-gray-400/50 p-6"
+            >
+              <Icon className="mt-0.5 h-[18px] w-[18px] shrink-0 text-gray-500" strokeWidth={1.5} />
+              <div className="flex flex-col gap-1">
+                <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                  <span className="text-[15px] font-medium tracking-tight text-gray-900">{addOn.name}</span>
+                  <span className="text-[12px] font-medium text-gray-500">{addOn.price}</span>
+                </div>
+                <p className="text-[13px] font-medium leading-snug text-gray-700">{addOn.description}</p>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <p className="text-center text-[12px] font-medium text-gray-500">
+        Add-ons are available on Team and Enterprise. Prices exclude taxes. Team costs the same on idexal Os Cloud
+        and self-hosted. No deployment fees.
+      </p>
+      <p className="text-center text-[12px] font-medium text-gray-500">
+        Self-hosting the control plane is free for organizations with up to 5 users (excluding Enterprise Features such as
+        SCIM, analytics, desktop policies, and white-labeling), free for development and testing, and
+        free to evaluate for 30 days at any size with all features — see the{" "}
+        <a
+          href="https://github.com/idexal/idexalOs/blob/dev/ee/LICENSE"
+          rel="noreferrer"
+          target="_blank"
+          className="underline"
+        >
+          idexal Os EE License
+        </a>{" "}
+        and{" "}
+        <a href="/terms/subscription" className="underline">
+          subscription terms
+        </a>
+        .
+      </p>
+    </section>
+  );
+}

@@ -1,0 +1,14 @@
+{
+  "opencode2": {
+    "version": "2.0.26",
+    "sha256": "78af5a9866f6074a1b88bc6d64eb0035f24ae53f5efa3fdf741ff7a8cb27c5e7"
+  },
+  "opencode": {
+    "version": "1.18.30",
+    "sha256": "17aea6d895c750ad5008df2395c5ae85353bd03a62ffc698ec040ef6dfea4115"
+  },
+  "idexal-os-server": {
+    "version": "3.10.2",
+    "sha256": "in-process"
+  }
+}

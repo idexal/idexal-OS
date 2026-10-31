@@ -1,0 +1,188 @@
+import "../src/load-env.ts"
+import { readFileSync } from "node:fs"
+import path from "node:path"
+import { fileURLToPath } from "node:url"
+import { drizzle } from "drizzle-orm/mysql2"
+import { migrate } from "drizzle-orm/mysql2/migrator"
+import { readMigrationFiles } from "drizzle-orm/migrator"
+import mysql from "mysql2/promise"
+import { parseMySqlConnectionConfig } from "../src/mysql-config.ts"
+import { ensureSchemaRepairs } from "../src/schema-repairs.ts"
+import { createExecutor, type Executor } from "./db-executor.ts"
+import { migrateWith0097Compatibility } from "./migration-0097-compat.ts"
+import { reconcilePermissionsFromEnv } from "./permission-reconciliation.ts"
+import { rejectMatrix } from "./migration-0097-schema.ts"
+
+export { migrateWith0097Compatibility }
+
+const MIGRATIONS_TABLE = "__drizzle_migrations"
+
+const scriptPath = fileURLToPath(import.meta.url)
+const distDir = path.resolve(path.dirname(scriptPath), "..")
+const migrationsFolder = path.join(distDir, "drizzle")
+const currentSchemaPath = path.join(distDir, "current-schema.sql")
+
+function mysqlConnectionConfigFromEnv(): ReturnType<typeof parseMySqlConnectionConfig> {
+  const databaseUrl = process.env.DATABASE_URL?.trim()
+  if (databaseUrl) {
+    return parseMySqlConnectionConfig(databaseUrl)
+  }
+
+  const host = process.env.DATABASE_HOST?.trim()
+  const user = process.env.DATABASE_USERNAME?.trim()
+  const password = process.env.DATABASE_PASSWORD ?? ""
+  const database = process.env.DATABASE_NAME?.trim()
+  const portValue = process.env.DATABASE_PORT?.trim()
+  const port = portValue ? Number(portValue) : 3306
+
+  if (!host || !user || !database) {
+    throw new Error("Provide DATABASE_URL, or DATABASE_HOST/DATABASE_USERNAME/DATABASE_PASSWORD/DATABASE_NAME.")
+  }
+
+  if (!Number.isInteger(port) || port <= 0) {
+    throw new Error("DATABASE_PORT must be a positive integer")
+  }
+
+  return {
+    host,
+    port,
+    user,
+    password,
+    database,
+    ssl: { rejectUnauthorized: true },
+  }
+}
+
+function splitSqlStatements(sql: string) {
+  return sql
+    .split(/;\s*(?:\r?\n|$)/)
+    .map((statement) => statement.trim())
+    .filter(Boolean)
+}
+
+async function applyCurrentSchema(executor: Executor) {
+  const statements = splitSqlStatements(readFileSync(currentSchemaPath, "utf8"))
+  if (statements.length === 0) {
+    throw new Error(`No SQL statements found in ${currentSchemaPath}`)
+  }
+
+  for (const statement of statements) {
+    await executor.query(statement)
+  }
+}
+
+async function listTables(executor: Executor) {
+  const rows = await executor.query("show tables")
+  return rows
+    .map((row) => Object.values(row).find((value) => typeof value === "string"))
+    .filter((value): value is string => Boolean(value))
+}
+
+function latestMigrationMillis(rows: Record<string, unknown>[]) {
+  const latest = rows[0]?.latest
+  if (typeof latest === "number") {
+    return latest
+  }
+  if (typeof latest === "bigint") {
+    return Number(latest)
+  }
+  if (typeof latest === "string") {
+    const parsed = Number(latest)
+    return Number.isFinite(parsed) ? parsed : 0
+  }
+  return 0
+}
+
+async function baselineCommittedMigrations(executor: Executor) {
+  const migrations = readMigrationFiles({ migrationsFolder }).sort((left, right) => left.folderMillis - right.folderMillis)
+
+  await executor.query(
+    `create table if not exists \`${MIGRATIONS_TABLE}\` (id serial primary key, hash text not null, created_at bigint)`,
+  )
+
+  const rows = await executor.query(`select max(created_at) as latest from \`${MIGRATIONS_TABLE}\``)
+  const latest = latestMigrationMillis(rows)
+  const pending = migrations.filter((migration) => migration.folderMillis > latest)
+
+  if (pending.length === 0) {
+    console.log("[den-db] migration baseline already current")
+    return
+  }
+
+  console.log(`[den-db] recording ${pending.length} committed migrations as baseline`)
+  for (const migration of pending) {
+    await executor.query(`insert into \`${MIGRATIONS_TABLE}\` (hash, created_at) values (?, ?)`, [
+      migration.hash,
+      migration.folderMillis,
+    ])
+  }
+}
+
+async function runCommittedMigrations() {
+  const connection = await mysql.createConnection(mysqlConnectionConfigFromEnv())
+  try {
+    const db = drizzle(connection)
+    await migrateWith0097Compatibility({
+      async query(statement, args = []) {
+        const [rows] = await connection.query<mysql.RowDataPacket[]>(statement, args)
+        return Array.isArray(rows) ? rows : []
+      },
+    }, migrationsFolder, async (migrationsFolder) => {
+      await migrate(db, { migrationsFolder })
+    }, console.log, { writersStoppedFor0097: process.env.DEN_DB_0097_WRITERS_STOPPED === "1" })
+  } finally {
+    await connection.end()
+  }
+}
+
+export async function initializeDenDb(executor: Executor) {
+  const tables = await listTables(executor)
+  const applicationTables = tables.filter((table) => table !== MIGRATIONS_TABLE)
+  if (applicationTables.length === 0) {
+    if (tables.includes(MIGRATIONS_TABLE) && (await executor.query(`SELECT 1 FROM \`${MIGRATIONS_TABLE}\` LIMIT 1`)).length) {
+      rejectMatrix("migration receipts exist but application tables are missing")
+    }
+    console.log("[den-db] empty database detected; applying current schema snapshot")
+    await applyCurrentSchema(executor)
+    await baselineCommittedMigrations(executor)
+  } else if (!tables.includes(MIGRATIONS_TABLE)) {
+    rejectMatrix("existing schema has no migration ledger; refusing to stamp unverified 0097")
+  }
+}
+
+export async function bootstrapDenDb() {
+  const executor = await createExecutor()
+  try {
+    await initializeDenDb(executor)
+  } finally {
+    await executor.close()
+  }
+
+  console.log("[den-db] running committed migrations")
+  await runCommittedMigrations()
+
+  console.log("[den-db] ensuring schema repairs")
+  const repairExecutor = await createExecutor()
+  try {
+    await ensureSchemaRepairs(repairExecutor)
+  } finally {
+    await repairExecutor.close()
+  }
+
+  // Not schema: a failure here must not stop den-api from starting. den-api
+  // also reconciles an organization's default sets when it first resolves
+  // permissions for it, so the next deploy or request catches up.
+  console.log("[den-db] reconciling default permission sets")
+  try {
+    await reconcilePermissionsFromEnv()
+  } catch (error) {
+    console.error(`[den-db] permission reconciliation failed; continuing: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) {
+  bootstrapDenDb().catch((error) => {
+    console.error(error instanceof Error ? error.message : error)
+    process.exit(1)
+  })
+}

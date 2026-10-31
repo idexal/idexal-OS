@@ -1,0 +1,29 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 377 380"
+  fill="none"
+>
+  <defs>
+    <linearGradient id="idexal-os-sliver" gradientUnits="userSpaceOnUse" x1="-34.478" y1="332.95" x2="-5.221" y2="50.423">
+      <stop offset="0" stop-color="rgb(0,253,4)"/>
+      <stop offset="1" stop-color="rgb(61,253,4)"/>
+    </linearGradient>
+    <linearGradient id="idexal-os-square" gradientUnits="userSpaceOnUse" x1="4.275" y1="-18.383" x2="17.544" y2="-75.436">
+      <stop offset="0" stop-color="rgb(92,253,3)"/>
+      <stop offset="1" stop-color="rgb(121,253,3)"/>
+    </linearGradient>
+    <linearGradient id="idexal-os-ne" gradientUnits="userSpaceOnUse" x1="-1.437" y1="1.712" x2="109.633" y2="-130.659">
+      <stop offset="0" stop-color="rgb(9,253,3)"/>
+      <stop offset="1" stop-color="rgb(105,253,3)"/>
+    </linearGradient>
+    <linearGradient id="idexal-os-se" gradientUnits="userSpaceOnUse" x1="-36.947" y1="39.2" x2="26.369" y2="-27.976">
+      <stop offset="0" stop-color="rgb(0,252,1)"/>
+      <stop offset="1" stop-color="rgb(13,252,1)"/>
+    </linearGradient>
+  </defs>
+  <path fill="url(#idexal-os-sliver)" d="M 5.8939 337.1301 L 6.0367 51.5886 L 85.1534 146.8953 L 85.1246 243.1621 L 5.8939 337.1301 Z"/>
+  <path fill="url(#idexal-os-square)" d="M 304.39 2.64 L 352.625 2.64 A 5.45 5.45 0 0 1 358.075 8.09 L 358.075 45.82 A 5.45 5.45 0 0 1 352.625 51.27 L 304.39 51.27 A 5.45 5.45 0 0 1 298.94 45.82 L 298.94 8.09 A 5.45 5.45 0 0 1 304.39 2.64 Z"/>
+  <path fill="url(#idexal-os-ne)" d="M 354.0644 74.4388 L 267.5786 74.4647 A 3.9 3.9 0 0 0 263.6819 75.9995 L 214.8545 138.19 A 4.15 4.15 0 0 0 214.95 141.9381 L 245.6181 181.3625 A 22.3 22.3 0 0 1 247.4543 210.4422 L 354.0644 74.4388 Z"/>
+  <path fill="url(#idexal-os-se)" d="M 371.7243 336.362 L 265.2408 197.1722 A 59.8 59.8 0 0 1 258.7081 214.782 L 227.4575 265.1954 A 2 2 0 0 0 226.6662 267.178 L 278.8901 336.3564 A 2 2 0 0 0 278.1802 336.2213 L 353.1295 337.3427 A 118.5 118.5 0 0 1 371.7243 336.362 Z"/>
+  <path fill="#0B0B0B" d="M 94.5628 2.714 L 6.4295 2.6171 L 158.4632 188.8062 A 10.9 10.9 0 0 1 158.3804 202.1671 L 14.5998 376.1206 L 110.5818 376.0918 A 5.775 5.775 0 0 0 115.7849 374.2534 L 246.8612 209.9904 A 22.65 22.65 0 0 0 246.8982 180.6461 L 103.6775 6.8675 A 11 11 0 0 0 94.5628 2.714 Z"/>
+</svg>

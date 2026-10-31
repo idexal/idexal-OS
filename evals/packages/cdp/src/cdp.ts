@@ -1,0 +1,394 @@
+import { browserSource, browserLiteral } from "./browser-script.ts";
+import type { BrowserEvaluation } from "./browser-script.ts";
+/**
+ * Minimal Chrome DevTools Protocol client for the eval runner.
+ *
+ * Zero dependencies: uses the global fetch + WebSocket available in Node 24+.
+ */
+
+export interface CdpTarget {
+  id: string;
+  type: string;
+  title: string;
+  url: string;
+  webSocketDebuggerUrl?: string;
+}
+
+export interface CdpClient {
+  targetId?: string | null;
+  webSocketDebuggerUrl?: string;
+  send(method: string, params?: Record<string, unknown>, options?: CdpSendOptions): Promise<unknown>;
+  abort?(reason?: Error): void;
+  close(): void;
+}
+
+export interface CdpSendOptions {
+  timeoutMs?: number;
+  sessionId?: string;
+}
+
+export interface CdpConnectOptions {
+  connectTimeoutMs?: number;
+  sendTimeoutMs?: number;
+}
+
+export interface EvaluateOptions {
+  awaitPromise?: true;
+  timeoutMs?: number;
+}
+
+export type CdpFunctionArgument = string | number | boolean | null | undefined;
+
+/** Cheap DOM/CDP probes should fail quickly enough for their caller to retry. */
+export const DEFAULT_CDP_PROBE_TIMEOUT_MS = 8_000;
+
+interface PendingCallbacks {
+  resolve(value: unknown): void;
+  reject(error: Error): void;
+  timer: NodeJS.Timeout | null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stringField(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function optionalStringField(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function parseTargets(payload: unknown): CdpTarget[] {
+  if (!Array.isArray(payload)) {
+    throw new Error("CDP target list response was not an array.");
+  }
+  return payload.map((entry, index) => {
+    if (!isRecord(entry)) {
+      return { id: String(index), type: "", title: "", url: "" };
+    }
+    return {
+      id: stringField(entry.id) || String(index),
+      type: stringField(entry.type),
+      title: stringField(entry.title),
+      url: stringField(entry.url),
+      webSocketDebuggerUrl: optionalStringField(entry.webSocketDebuggerUrl),
+    };
+  });
+}
+
+function messageText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export async function listTargets(
+  baseUrl: string,
+  { timeoutMs = DEFAULT_CDP_PROBE_TIMEOUT_MS }: { timeoutMs?: number } = {},
+): Promise<CdpTarget[]> {
+  const response = await fetch(`${baseUrl.replace(/\/$/, "")}/json/list`, {
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!response.ok) {
+    throw new Error(`Could not list CDP targets at ${baseUrl}: ${response.status}`);
+  }
+  return parseTargets(await response.json());
+}
+
+export async function pickAppTarget(
+  baseUrl: string,
+  { timeoutMs = DEFAULT_CDP_PROBE_TIMEOUT_MS }: { timeoutMs?: number } = {},
+): Promise<CdpTarget> {
+  const targets = await listTargets(baseUrl, { timeoutMs });
+  const pages = targets.filter((target) => target.type === "page" && target.webSocketDebuggerUrl);
+  const target =
+    pages.find((page) => page.title === "idexal Os") ??
+    pages.find(
+      (page) =>
+        page.url.includes("localhost") ||
+        page.url.includes("127.0.0.1") ||
+        page.url.includes("[::1]"),
+    ) ??
+    pages[0];
+  if (!target) {
+    throw new Error(`No CDP page target found at ${baseUrl}.`);
+  }
+  return target;
+}
+
+/**
+ * Chromium reports webSocketDebuggerUrl with its own local host
+ * (e.g. ws://127.0.0.1:9825/devtools/page/<id>), which breaks when the
+ * endpoint is reached through a proxy (e.g. Daytona preview URLs).
+ * Rebuild the ws URL on the base URL's host and scheme.
+ */
+export function debuggerUrlFor(baseUrl: string, target: CdpTarget): string {
+  if (!target.webSocketDebuggerUrl) {
+    throw new Error(`CDP target ${target.id} has no webSocketDebuggerUrl.`);
+  }
+  const base = new URL(baseUrl);
+  const ws = new URL(target.webSocketDebuggerUrl);
+  ws.protocol = base.protocol === "https:" ? "wss:" : "ws:";
+  ws.hostname = base.hostname;
+  ws.port = base.port;
+  return ws.toString();
+}
+
+/**
+ * Probe a list of CDP base URL candidates and return the first that responds.
+ */
+export async function resolveCdpBaseUrl(candidates: string[]): Promise<string> {
+  const errors: string[] = [];
+  for (const candidate of candidates) {
+    try {
+      await listTargets(candidate);
+      return candidate;
+    } catch (error) {
+      errors.push(`${candidate}: ${messageText(error)}`);
+    }
+  }
+  throw new Error(
+    `No CDP endpoint reachable. Tried:\n  ${errors.join("\n  ")}\n` +
+      "Start the app first (pnpm dev) or pass --cdp-url.",
+  );
+}
+
+// Default upper bound on a single CDP round trip (handshake or a send/reply).
+// Without this, a stalled Daytona proxy WebSocket (seen intermittently — the
+// handshake or a single message reply just never arrives) hangs the calling
+// promise forever with no error, which hangs the whole flow silently.
+const DEFAULT_CDP_TIMEOUT_MS = 20_000;
+
+export function connect(
+  webSocketDebuggerUrl: string,
+  { connectTimeoutMs = DEFAULT_CDP_TIMEOUT_MS, sendTimeoutMs = DEFAULT_CDP_TIMEOUT_MS }: CdpConnectOptions = {},
+): Promise<CdpClient> {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(webSocketDebuggerUrl);
+    let nextId = 1;
+    const pending = new Map<number, PendingCallbacks>();
+    let opened = false;
+    let settled = false;
+    let closed = false;
+
+    const connectTimer = setTimeout(() => {
+      if (opened) return;
+      settled = true;
+      try {
+        socket.close();
+      } catch {
+        // Socket may already be in a closing state.
+      }
+      reject(new Error(`CDP connect timed out after ${connectTimeoutMs}ms: ${webSocketDebuggerUrl}`));
+    }, connectTimeoutMs);
+
+    const rejectPending = (error: Error) => {
+      for (const callbacks of pending.values()) {
+        if (callbacks.timer) clearTimeout(callbacks.timer);
+        callbacks.reject(error);
+      }
+      pending.clear();
+    };
+
+    const closeSocket = () => {
+      closed = true;
+      try {
+        socket.close();
+      } catch {
+        // Socket may already be in a closing state.
+      }
+    };
+
+    socket.addEventListener("open", () => {
+      if (settled) return;
+      opened = true;
+      if (connectTimer) clearTimeout(connectTimer);
+      resolve({
+        targetId: new URL(webSocketDebuggerUrl).pathname.split("/").pop() ?? null,
+        webSocketDebuggerUrl,
+        abort: (reason?: Error) => {
+          const detail = reason ? `: ${reason.message}` : ".";
+          rejectPending(new Error(`CDP transport stalled${detail}`, { cause: reason }));
+          closeSocket();
+        },
+        close: closeSocket,
+        send(method: string, params: Record<string, unknown> = {}, { timeoutMs = sendTimeoutMs, sessionId }: CdpSendOptions = {}) {
+          if (closed || socket.readyState !== WebSocket.OPEN) {
+            return Promise.reject(new Error("CDP socket is not open."));
+          }
+          const id = nextId;
+          nextId += 1;
+          return new Promise((innerResolve, innerReject) => {
+            // Name WHAT timed out. The rejection fires from a timer, so the
+            // caller's stack is gone by then: "CDP call Runtime.evaluate timed
+            // out" alone cannot tell you which of a spec's dozens of
+            // evaluations blocked, which turns a one-line fix into a hunt.
+            const subject = typeof params.expression === "string"
+              ? ` evaluating: ${params.expression.replace(/\s+/g, " ").trim().slice(0, 160)}`
+              : "";
+            const timer = setTimeout(() => {
+              pending.delete(id);
+              innerReject(new Error(`CDP call ${method} timed out after ${timeoutMs}ms.${subject}`));
+            }, timeoutMs);
+            pending.set(id, { resolve: innerResolve, reject: innerReject, timer });
+            try {
+              socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+            } catch (error) {
+              pending.delete(id);
+              if (timer) clearTimeout(timer);
+              innerReject(error);
+            }
+          });
+        },
+      });
+    });
+    socket.addEventListener("message", (event) => {
+      const parsed: unknown = JSON.parse(String(event.data));
+      if (!isRecord(parsed) || typeof parsed.id !== "number") return;
+      const callbacks = pending.get(parsed.id);
+      if (!callbacks) return;
+      pending.delete(parsed.id);
+      if (callbacks.timer) clearTimeout(callbacks.timer);
+      if (isRecord(parsed.error)) {
+        callbacks.reject(new Error(stringField(parsed.error.message) || "CDP call failed."));
+      } else {
+        callbacks.resolve(parsed.result);
+      }
+    });
+    socket.addEventListener("error", () => {
+      const error = new Error("CDP websocket failed.");
+      closed = true;
+      rejectPending(error);
+      if (!opened && !settled) {
+        settled = true;
+        if (connectTimer) clearTimeout(connectTimer);
+        reject(error);
+      }
+    });
+    socket.addEventListener("close", () => {
+      const error = new Error("CDP websocket closed.");
+      closed = true;
+      rejectPending(error);
+      if (!opened && !settled) {
+        settled = true;
+        if (connectTimer) clearTimeout(connectTimer);
+        reject(error);
+      }
+    });
+  });
+}
+
+export async function evaluate<T>(
+  client: CdpClient,
+  expression: BrowserEvaluation<T>,
+  { awaitPromise = true, timeoutMs = DEFAULT_CDP_PROBE_TIMEOUT_MS }: EvaluateOptions = {},
+): Promise<Awaited<T>> {
+  const payload = await client.send("Runtime.evaluate", {
+    expression: browserSource(expression),
+    awaitPromise,
+    returnByValue: true,
+  }, { timeoutMs });
+  // CDP is the one untyped transport boundary; callers infer the callback result.
+  return runtimeResultValue(payload) as Awaited<T>;
+}
+
+/**
+ * The page ran the call and its own code threw. CDP answered, so this is the
+ * call's result, not a stalled transport: re-attaching cannot change it, even
+ * when the page's message says "timed out".
+ */
+export class CdpPageError extends Error {
+  override name = "CdpPageError";
+}
+
+function runtimeResultValue(payload: unknown): unknown {
+  if (!isRecord(payload)) throw new Error("CDP returned a malformed evaluation result");
+  if (isRecord(payload.exceptionDetails)) {
+    const exception = payload.exceptionDetails.exception;
+    throw new CdpPageError(
+      (isRecord(exception) && stringField(exception.description)) ||
+        stringField(payload.exceptionDetails.text) ||
+        "Evaluation failed.",
+    );
+  }
+  const result = payload.result;
+  if (!isRecord(result)) throw new Error("CDP evaluation did not return a RemoteObject");
+  if (result.unserializableValue === "NaN") return NaN;
+  if (result.unserializableValue === "Infinity") return Infinity;
+  if (result.unserializableValue === "-Infinity") return -Infinity;
+  if (result.unserializableValue === "-0") return -0;
+  if (typeof result.unserializableValue === "string") throw new Error("Unsupported browser result: " + result.unserializableValue);
+  return result.value;
+}
+
+export async function callFunction<Args extends CdpFunctionArgument[], T>(
+  client: CdpClient,
+  callback: (...args: Args) => T,
+  args: [...Args],
+  { awaitPromise = true, timeoutMs = DEFAULT_CDP_PROBE_TIMEOUT_MS }: EvaluateOptions = {},
+): Promise<Awaited<T>> {
+  browserLiteral(args); // Reject functions, accessors and cyclic data before sending anything.
+  const receiverPayload = await client.send("Runtime.evaluate", {
+    expression: "globalThis",
+    returnByValue: false,
+  }, { timeoutMs });
+  if (!isRecord(receiverPayload) || !isRecord(receiverPayload.result)) {
+    throw new Error("CDP did not return the page global object.");
+  }
+  if (isRecord(receiverPayload.exceptionDetails)) runtimeResultValue(receiverPayload);
+  const objectId = stringField(receiverPayload.result.objectId);
+  if (!objectId) throw new Error("CDP did not identify the page global object.");
+
+  const payload = await client.send("Runtime.callFunctionOn", {
+    functionDeclaration: callback.toString(),
+    objectId,
+    arguments: args.map((value) => typeof value === "number" && (!Number.isFinite(value) || Object.is(value, -0))
+      ? { unserializableValue: Object.is(value, -0) ? "-0" : String(value) }
+      : { value }),
+    awaitPromise,
+    returnByValue: true,
+  }, { timeoutMs });
+  return runtimeResultValue(payload) as Awaited<T>;
+}
+
+export async function addInitScript<T>(client: CdpClient, script: BrowserEvaluation<T>): Promise<AsyncDisposable & { dispose(): Promise<void> }> {
+  const result = await client.send("Page.addScriptToEvaluateOnNewDocument", { source: browserSource(script) });
+  if (!isRecord(result) || typeof result.identifier !== "string") throw new Error("CDP did not return an init script identifier");
+  const identifier = result.identifier;
+  let disposed = false;
+  const dispose = async () => {
+    if (disposed) return;
+    await client.send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+    disposed = true;
+  };
+  return { dispose, [Symbol.asyncDispose]: dispose };
+}
+
+export async function navigate(client: CdpClient, url: string): Promise<void> {
+  await client.send("Page.navigate", { url });
+}
+
+/**
+ * Activates a page target the way a person focuses its window. Out-of-process
+ * iframes (an MCP App's frame) are separate targets that Chrome refuses to
+ * foreground; their top-level page already is, so that refusal is not an error.
+ */
+export async function bringTargetToFront(client: CdpClient): Promise<void> {
+  try {
+    await client.send("Page.bringToFront");
+  } catch (error) {
+    if (error instanceof Error && /top-level targets/.test(error.message)) return;
+    throw error;
+  }
+}
+
+export async function captureScreenshot(client: CdpClient): Promise<Buffer> {
+  // OAuth can foreground another tab. Activate this explicit target so its
+  // compositor can produce the requested frame instead of stalling in the background.
+  await bringTargetToFront(client);
+  const payload = await client.send("Page.captureScreenshot", { format: "png" });
+  if (!isRecord(payload) || typeof payload.data !== "string") {
+    throw new Error("Page.captureScreenshot did not return base64 PNG data.");
+  }
+  return Buffer.from(payload.data, "base64");
+}

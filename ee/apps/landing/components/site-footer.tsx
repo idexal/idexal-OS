@@ -1,0 +1,82 @@
+import Link from "next/link";
+import { OpenCodeLogo } from "./opencode-logo";
+import { SocTypeIIBadge } from "./soc-type-ii-badge";
+
+export function SiteFooter() {
+  return (
+    <footer className="pt-10 text-sm text-gray-500">
+      <div className="flex flex-col items-start gap-6 border-t border-[var(--lp-border)] pt-10">
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-3 md:gap-x-8">
+          <Link href="/docs" target="_blank" className="whitespace-nowrap transition-colors hover:text-gray-800">
+            Docs
+          </Link>
+          <Link href="/pricing" className="whitespace-nowrap transition-colors hover:text-gray-800">
+            Pricing
+          </Link>
+          <Link href="/roadmap" className="whitespace-nowrap transition-colors hover:text-gray-800">
+            Roadmap
+          </Link>
+          <Link href="/download" className="whitespace-nowrap transition-colors hover:text-gray-800">
+            Desktop
+          </Link>
+          <Link href="/alternatives/claude-cowork" className="whitespace-nowrap transition-colors hover:text-gray-800">
+            Claude Cowork alternative
+          </Link>
+          <Link href="/guides" className="whitespace-nowrap transition-colors hover:text-gray-800">
+            Guides
+          </Link>
+          <a
+            href="https://os.idexal.com"
+            target="_blank"
+            rel="noreferrer"
+            className="whitespace-nowrap transition-colors hover:text-gray-800"
+          >
+            Cloud
+          </a>
+          <Link href="/dashboard" className="whitespace-nowrap transition-colors hover:text-gray-800">
+            Dashboard
+          </Link>
+          <Link href="/enterprise" className="whitespace-nowrap transition-colors hover:text-gray-800">
+            Enterprise
+          </Link>
+          <Link href="/contact" className="whitespace-nowrap transition-colors hover:text-gray-800">
+            Contact
+          </Link>
+          <Link href="/trust" className="whitespace-nowrap transition-colors hover:text-gray-800">
+            Trust Center
+          </Link>
+          <Link href="/privacy" className="whitespace-nowrap transition-colors hover:text-gray-800">
+            Privacy
+          </Link>
+          <Link href="/terms" className="whitespace-nowrap transition-colors hover:text-gray-800">
+            Terms
+          </Link>
+          <div className="whitespace-nowrap">© 2026 Idexal</div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-3">
+          <div className="flex items-center gap-2 whitespace-nowrap text-xs">
+            <span>Powered by</span>
+            <a
+              href="https://opencode.ai"
+              aria-label="OpenCode"
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center text-gray-500 transition-colors hover:text-gray-800"
+            >
+              <OpenCodeLogo className="h-3 w-auto" />
+            </a>
+          </div>
+          <Link
+            href="/trust"
+            aria-label="SOC 2 Type II. View Trust Center"
+            className="inline-flex shrink-0 items-center text-gray-600 transition-opacity hover:opacity-80"
+          >
+            <SocTypeIIBadge className="h-14 w-14" />
+            <span className="sr-only">SOC 2 Type II</span>
+          </Link>
+        </div>
+      </div>
+    </footer>
+  );
+}

@@ -1,0 +1,37 @@
+{
+  "name": "@idexal-ee/landing",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "IDEXAL_DEV_MODE=1 next dev --hostname 0.0.0.0",
+    "check:agent-links": "node scripts/check-agent-links.mjs",
+    "eval:agents": "node scripts/agent-discovery-eval.mjs",
+    "prices:update": "node scripts/update-model-prices.mjs",
+    "plain:setup-fields": "node scripts/setup-plain-feedback-fields.mjs",
+    "prebuild": "pnpm --dir ../../../packages/ui build && node ../../../scripts/check-connect-installer-parity.mjs && node scripts/copy-bootstrap-cli.mjs",
+    "build": "next build",
+    "start": "next start --hostname 0.0.0.0",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@idexal/ui": "workspace:*",
+    "@paper-design/shaders-react": "0.0.72",
+    "@team-plain/graphql": "^3.1.0",
+    "botid": "^1.5.11",
+    "framer-motion": "^12.35.1",
+    "graphql": "^16.13.2",
+    "lucide-react": "^0.577.0",
+    "next": "15.5.27",
+    "react": "catalog:react18",
+    "react-dom": "catalog:react18"
+  },
+  "devDependencies": {
+    "@types/node": "20.12.12",
+    "@types/react": "18.2.79",
+    "@types/react-dom": "19.2.3",
+    "autoprefixer": "10.4.19",
+    "postcss": "8.5.23",
+    "tailwindcss": "3.4.7",
+    "typescript": "5.4.5"
+  }
+}

@@ -1,0 +1,34 @@
+export { browserScript } from "@idexal/cdp";
+export { attachSurface, evaluateOnSurface } from "@idexal/cdp";
+export { denFetch, signIn as signInDen, engineSessionProbe, sendComposerMessage, waitFor } from "@idexal/behaviors";
+export type { DenSession } from "@idexal/behaviors";
+export { allocateFreePorts, listTargets, setViewport } from "@idexal/cdp";
+export { chrome } from "@idexal/hosts";
+// checkpointCapability and its types come from @idexal/env (re-exported below).
+export { screenshot, validate } from "@idexal/test-evidence";
+export type { BrowserEvaluation, BrowserScript } from "@idexal/cdp";
+export { control, createDesktopHandoffGrant, evalIn, quitDesktop, signInDesktopAs } from "@idexal/behaviors";
+export { requestDenLoopback } from "@idexal/labs";
+export { desktop as relaunchDesktop, electronProfilePaths } from "@idexal/hosts";
+export type { DesktopHandle } from "@idexal/hosts";
+export type { Surface } from "@idexal/cdp";
+export type { Target } from "@idexal/cdp";
+export { browserConversation } from "@idexal/behaviors";
+export type { BrowserTaskInput, BrowserTaskReply } from "@idexal/behaviors";
+export { renderPrMarkdown } from "@idexal/test-artifacts";
+export type { TestRunRecord } from "@idexal/test-artifacts";
+export type { StepRecord, TestOutcome, TraceEntry } from "@idexal/test-evidence";
+export { test, CHECKPOINTS_TAG } from "./fixture.ts";
+export * from "@idexal/env";
+export * from "./brief.ts";
+export * from "./daytona-witness.ts";
+export * from "./app-web-preview-witness.ts";
+export * from "./browser-evidence.ts";
+export * from "./link.ts";
+export * from "./spec/index.ts";
+export * from "./state.ts";
+
+export { observeTranscript, readTranscriptMessages } from "./transcript-observer.ts";
+export { readSidebarOverflow } from "@idexal/behaviors";
+export * from "./verification.ts";
+export * from "./verification-jev.ts";

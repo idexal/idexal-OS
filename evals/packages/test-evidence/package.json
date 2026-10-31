@@ -1,0 +1,30 @@
+{
+  "name": "@idexal/test-evidence",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "test-evidence-judge": "./bin/test-evidence-judge.mjs",
+    "test-evidence-design-review": "./bin/test-evidence-design-review.mjs"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "development": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./vitest": {
+      "types": "./src/vitest.ts",
+      "development": "./src/vitest.ts",
+      "default": "./src/vitest.ts"
+    }
+  },
+  "dependencies": {
+    "@idexal/cdp": "workspace:*",
+    "@idexal/design-review": "workspace:*",
+    "@idexal/freestyle": "link:../../../packages/freestyle",
+    "@idexal/env": "workspace:*",
+    "@idexal/timeline": "workspace:*",
+    "@idexal/evidence-provider": "link:../../../packages/evidence-provider"
+  }
+}

@@ -1,0 +1,10 @@
+User-agent: *
+Allow: /
+Disallow: /admin
+Disallow: /dashboard
+Disallow: /locale/
+Disallow: /auth/
+Disallow: /r/
+Disallow: /invitations/
+
+Sitemap: https://os.idexal.com/sitemap.xml

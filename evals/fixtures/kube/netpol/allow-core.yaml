@@ -1,0 +1,48 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: idexal-os-den-allow-core-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: idexal-os-ee
+      app.kubernetes.io/instance: idexal-os-ee
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values:
+          - den-api
+          - den-web
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: idexal-os-mysql
+      ports:
+        - protocol: TCP
+          port: 3306
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: idexal-os-ee
+              app.kubernetes.io/instance: idexal-os-ee
+            matchExpressions:
+              - key: app.kubernetes.io/component
+                operator: In
+                values:
+                  - den-api
+                  - den-web

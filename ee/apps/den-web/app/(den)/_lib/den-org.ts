@@ -1,0 +1,1539 @@
+import { parseDeploymentCapabilities, type DeploymentCapabilities } from "@idexal/types/den/deployment-capabilities";
+import { mapFeatures, type FeatureMap } from "@idexal/features";
+import { PERMISSION_KEYS, getPermissionDefinition, isPermissionKey, isPermissionOwnerOnlyByDefault, permissionDefaultKeys, type PermissionKey } from "@idexal/types/den/permissions";
+
+export type DenOrgSummary = {
+  id: string;
+  name: string;
+  slug: string;
+  logo: string | null;
+  metadata: string | null;
+  role: string;
+  orgMemberId: string;
+  membershipId: string;
+  memberCount: number;
+  createdAt: string | null;
+  updatedAt: string | null;
+  isActive: boolean;
+};
+
+export type DenOrgMember = {
+  id: string;
+  userId: string | null;
+  inviteId: string | null;
+  role: string;
+  effectiveRole: string;
+  adminTeams: { id: string; name: string }[];
+  createdAt: string | null;
+  joinedAt: string | null;
+  isOwner: boolean;
+  user: {
+    id: string;
+    email: string;
+    name: string;
+    image: string | null;
+  };
+};
+
+export type DenOrgInvitation = {
+  id: string;
+  email: string;
+  role: string;
+  status: string;
+  expiresAt: string | null;
+  createdAt: string | null;
+};
+
+export type DenOrgTeam = {
+  id: string;
+  name: string;
+  createdAt: string | null;
+  updatedAt: string | null;
+  memberIds: string[];
+  managedByScim: boolean;
+  grantsOrganizationAdmin: boolean;
+};
+
+export type DenCurrentMemberTeam = {
+  id: string;
+  name: string;
+  organizationId: string;
+  createdAt: string | null;
+  updatedAt: string | null;
+};
+
+export type DenInvitationPreview = {
+  invitation: {
+    id: string;
+    email: string;
+    role: string;
+    status: string;
+    expiresAt: string | null;
+    createdAt: string | null;
+  };
+  organization: {
+    id: string;
+    name: string;
+    slug: string;
+    allowedEmailDomains: string[] | null;
+    branding: {
+      appName: string;
+      logoUrl: string | null;
+      iconUrl: string | null;
+    };
+  };
+};
+
+export type DenCanonicalRole = "owner" | "admin" | "member";
+
+/** Roles the member pickers offer. Owner moves only by ownership transfer. */
+export const ASSIGNABLE_ORG_ROLES = ["member", "admin"] as const;
+
+/**
+ * What the signed-in member can do in the dashboard. Each `can*` flag is the
+ * catalog permission the matching Den API route requires (see
+ * docs/permissions/route-inventory.md), so the UI never offers an action the
+ * API will refuse. `isOwner`, `isAdmin` and `isMember` describe the role.
+ */
+export type DenOrgAccessFlags = {
+  canonicalRole: DenCanonicalRole;
+  isOwner: boolean;
+  isMember: boolean;
+  /** Owner, admin role, or member of an Admin team. Role-derived; prefer a permission flag for gating an action. */
+  isAdmin: boolean;
+  /**
+   * Holds at least one organization permission, so some admin page has
+   * something to show. Opens the admin area; each page then checks its own flag.
+   */
+  canViewSettings: boolean;
+  /** `organization.update` */
+  canManageSettings: boolean;
+  /** `sso.manage` or `scim.manage` */
+  canManageSecurityConfiguration: boolean;
+  /** `invitations.manage` */
+  canInviteMembers: boolean;
+  /** `invitations.manage` */
+  canCancelInvitations: boolean;
+  /** `members.update` */
+  canManageMembers: boolean;
+  /** `members.delete` */
+  canRemoveMembers: boolean;
+  /** `members.update`: assign the Member or Admin role (also on invitations). */
+  canManageRoles: boolean;
+  /** `teams.view`: open any team's details. */
+  canViewTeams: boolean;
+  /** `teams.manage` */
+  canManageTeams: boolean;
+  /** `teams.manage_admin`: mark a team Admin, or change who is in an Admin team. */
+  canManageAdminTeams: boolean;
+  /** `permissions.view`: Member, Admin and team permissions and their history. */
+  canViewPermissions: boolean;
+  /** `permissions.manage`: change Member, Admin and team permissions. */
+  canManagePermissions: boolean;
+  /** `agent_permissions.view`: what agents can do on members' computers. */
+  canViewAgentPermissions: boolean;
+  /** `agent_permissions.manage`: change what agents can do on members' computers. */
+  canManageAgentPermissions: boolean;
+  /** `api_keys.view` */
+  canViewApiKeys: boolean;
+  /** `api_keys.manage` */
+  canManageApiKeys: boolean;
+  /** `scim.view` */
+  canViewScim: boolean;
+  /** `scim.manage` */
+  canManageScim: boolean;
+  /** `sso.view` */
+  canViewSso: boolean;
+  /** `sso.manage` */
+  canManageSso: boolean;
+  /** `branding.update` */
+  canManageBranding: boolean;
+  /** `web_origins.view` */
+  canViewWebOrigins: boolean;
+  /** `web_origins.manage` */
+  canManageWebOrigins: boolean;
+  /** `desktop_policies.view` */
+  canViewDesktopPolicies: boolean;
+  /** `desktop_policies.manage` */
+  canManageDesktopPolicies: boolean;
+  canViewDeployments: boolean;
+  canViewUsageAnalytics: boolean;
+  canManageDeployments: boolean;
+  /** `egress_diagnostics.view` */
+  canViewEgressDiagnostics: boolean;
+  /** `egress_diagnostics.manage` */
+  canManageEgressDiagnostics: boolean;
+  /** `billing.view` */
+  canViewBilling: boolean;
+  /** `billing.manage`: start a subscription in checkout. */
+  canManageBilling: boolean;
+  /** `billing_portal.use`: payment details, invoices, change or cancel the subscription. */
+  canOpenBillingPortal: boolean;
+  /** `audit.view` */
+  canViewAuditLogs: boolean;
+  /** `audit.manage`: turn audit capture on or off. */
+  canManageAuditCapture: boolean;
+  /** `inference.view`: idexal Os Models settings. */
+  canViewModelsSettings: boolean;
+  /** `inference.manage`: turn idexal Os Models on or off. */
+  canManageModelsSettings: boolean;
+  /** `llm_providers.view`: every provider, not only your own. */
+  canViewAllLlmProviders: boolean;
+  /** `gateway_providers.view` */
+  canViewGatewayProviders: boolean;
+  /** `gateway_providers.manage` */
+  canManageGatewayProviders: boolean;
+  /** `gateway_usage.view` */
+  canViewGatewayUsage: boolean;
+  /** `gateway_limits.view` */
+  canViewGatewayLimits: boolean;
+  /** `gateway_limits.manage` */
+  canManageGatewayLimits: boolean;
+  /** `connections.view`: every connection, its tools and tool policy. */
+  canViewAllConnections: boolean;
+  /** `connections.manage`: organization connections, who can use any connection, tool policies, shared accounts. */
+  canManageConnections: boolean;
+  /** `connections.update`: edit any connection's settings. */
+  canEditAnyConnection: boolean;
+  /** `connections.disconnect`: sign everyone out of any connection. */
+  canDisconnectAnyConnection: boolean;
+  /** `connections.delete`: remove any connection. */
+  canRemoveAnyConnection: boolean;
+  /** `marketplaces.manage` */
+  canManageMarketplaces: boolean;
+  /** `plugins.import` */
+  canImportPlugins: boolean;
+  /** `connectors.manage`: GitHub sync sources. */
+  canManageSyncSources: boolean;
+  /** `sharing.manage_all`: manager on every plugin, marketplace, skill and connector. */
+  canManageAllShared: boolean;
+  /** `sharing.share_org_wide` */
+  canShareWithEveryone: boolean;
+  /** Owner only. */
+  canTransferOwnership: boolean;
+  /** Owner only. */
+  canDeleteOrganization: boolean;
+  /** `billing.manage` */
+  canStartSeatCheckout: boolean;
+};
+
+export type DenOrgApiKey = {
+  id: string;
+  configId: string;
+  name: string | null;
+  start: string | null;
+  prefix: string | null;
+  enabled: boolean;
+  rateLimitEnabled: boolean;
+  rateLimitMax: number | null;
+  rateLimitTimeWindow: number | null;
+  lastRequest: string | null;
+  expiresAt: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+  owner: {
+    userId: string;
+    memberId: string;
+    name: string;
+    email: string;
+    image: string | null;
+  };
+};
+
+export type DenOrgScimConnection = {
+  id: string;
+  providerId: string;
+  organizationId: string;
+  groupMappingMode: "metadata_only" | "create_teams";
+  createdAt: string | null;
+  updatedAt: string | null;
+};
+
+export type DenOrgScimHealth = {
+  unresolvedFailureCount: number;
+  lastFailureAt: string | null;
+  lastFailureAction: string | null;
+  lastFailureMessage: string | null;
+  nextRetryAt: string | null;
+  lastSuccessfulSyncAt: string | null;
+};
+
+export type DenOrgSsoConnection = {
+  id: string;
+  providerId: string;
+  kind: "oidc" | "saml";
+  issuer: string;
+  domain: string;
+  status: "disabled" | "enabled";
+  testStatus: "untested" | "testing" | "succeeded" | "failed";
+  testExpiresAt: string | null;
+  signInPath: string;
+  signInUrl: string;
+  redirectUrl: string;
+  acsUrl: string | null;
+  metadataUrl: string | null;
+  domainVerified: boolean;
+  domainVerificationHost: string;
+  domainVerificationDnsName: string;
+  oidc: {
+    clientId: string | null;
+    scopes: string[];
+    skipDiscovery: boolean;
+    authorizationEndpoint: string | null;
+    tokenEndpoint: string | null;
+    jwksEndpoint: string | null;
+    userInfoEndpoint: string | null;
+    tokenEndpointAuthentication: "client_secret_basic" | "client_secret_post" | null;
+  } | null;
+  saml: {
+    entryPoint: string | null;
+    audience: string | null;
+    wantAssertionsSigned: boolean;
+  } | null;
+  lastTestedAt: string | null;
+  lastError: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+};
+
+export type DenOrgContext = {
+  organization: {
+    id: string;
+    name: string;
+    slug: string;
+    logo: string | null;
+    allowedEmailDomains: string[] | null;
+    metadata: string | null;
+    createdAt: string | null;
+    updatedAt: string | null;
+    owner: {
+      memberId: string;
+      userId: string;
+      name: string | null;
+      email: string | null;
+      image: string | null;
+    } | null;
+  };
+  currentMember: {
+    id: string;
+    userId: string;
+    role: string;
+    createdAt: string | null;
+    isOwner: boolean;
+    directRole: string;
+    adminTeams: { id: string; name: string }[];
+    /** Effective permission keys from GET /v1/org. Null when an older server does not send them. */
+    permissions: PermissionKey[] | null;
+  };
+  members: DenOrgMember[];
+  invitations: DenOrgInvitation[];
+  teams: DenOrgTeam[];
+  currentMemberTeams: DenCurrentMemberTeam[];
+  entitlements: DenOrgEntitlements;
+  authMethods: DenOrgAuthMethods;
+  /** Frozen for published screens; new code reads `features` through orgFeatureEnabled(). */
+  capabilities: DenOrgCapabilities;
+  /** Effective on/off per registry feature (packages/features/src/registry.ts). Missing from older servers means off. */
+  features: FeatureMap;
+  deploymentCapabilities: DeploymentCapabilities;
+};
+
+export type DenOrgAuthMethods = {
+  sso: boolean;
+  scim: boolean;
+};
+
+export type DenOrgEntitlements = {
+  sso: boolean;
+  desktopPolicies: boolean;
+  orgControls: boolean;
+  analytics: boolean;
+  auditLogs: boolean;
+};
+
+/** Server-advertised and per-org capabilities; optional fields default to off. */
+export type DenOrgCapabilities = {
+  /** Effective organization rollout and deployment visibility, separate from capture entitlement. */
+  auditLogs: boolean;
+  installLinks: boolean;
+  mcpConnections: boolean;
+  /** Apps built in idexal Os are served as their own MCP servers; absent (off) on older servers. */
+  appMcpServers?: boolean;
+  /** Always on: Workflows/Code Mode shipped for every organization. Older servers may still return false. */
+  workflows: boolean;
+  /** Effective Web offer; true for the global switch or this organization's complimentary admin grant. */
+  idexalOsWeb: boolean;
+  cloud: boolean;
+  /** The organization's one-chat assistant; absent (off) on older servers. */
+  workbot?: boolean;
+};
+
+export type DenOrganizationMetadata = {
+  allowedDesktopVersions?: string[];
+  requireSso?: boolean;
+  brandAppName?: string;
+  brandLogoUrl?: string;
+  brandIconUrl?: string;
+  brandLogoAsset?: DenManagedBrandAsset;
+  brandIconAsset?: DenManagedBrandAsset;
+  brandAccentColor?: string;
+} & Record<string, unknown>;
+
+export type DenManagedBrandAsset = {
+  kind: "logo" | "icon";
+  version: string;
+  extension: "png" | "jpg";
+  contentType: "image/png" | "image/jpeg";
+  url: string;
+  width: number;
+  height: number;
+  byteLength: number;
+  originalName: string;
+  uploadedAt: string;
+};
+
+export const PENDING_ORG_INVITATION_STORAGE_KEY = "idexalos:web:pending-org-invitation";
+export const PENDING_WORKSPACE_CLAIM_STORAGE_KEY = "idexalos:web:pending-workspace-claim";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function asIsoString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function asBoolean(value: unknown): boolean {
+  return value === true;
+}
+
+function parseAdminTeams(value: unknown): { id: string; name: string }[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((team) => isRecord(team) && typeof team.id === "string" && typeof team.name === "string"
+    ? [{ id: team.id, name: team.name }]
+    : []);
+}
+
+function asString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function asStringArray(value: unknown): string[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+
+  return value.filter((entry): entry is string => typeof entry === "string");
+}
+
+function normalizeDesktopVersionString(value: string): string | null {
+  const normalized = value.trim().replace(/^v/i, "");
+  return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(normalized)
+    ? normalized
+    : null;
+}
+
+export function parseOrganizationMetadata(metadata: string | null): DenOrganizationMetadata | null {
+  if (!metadata) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(metadata) as unknown;
+    return isRecord(parsed) ? (parsed as DenOrganizationMetadata) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function getAllowedDesktopVersionsFromMetadata(metadata: string | null): string[] | null {
+  const parsed = parseOrganizationMetadata(metadata);
+  const values = asStringArray(parsed?.allowedDesktopVersions);
+
+  if (!values) {
+    return null;
+  }
+
+  return [...new Set(values.map((entry) => normalizeDesktopVersionString(entry)).filter((entry): entry is string => Boolean(entry)))];
+}
+
+export function getRequireSsoFromMetadata(metadata: string | null): boolean {
+  const parsed = parseOrganizationMetadata(metadata);
+  return parsed?.requireSso === true;
+}
+
+export function getManagedBrandAssetFromMetadata(
+  metadata: string | null,
+  kind: "logo" | "icon",
+): DenManagedBrandAsset | null {
+  const parsed = parseOrganizationMetadata(metadata);
+  const value = kind === "logo" ? parsed?.brandLogoAsset : parsed?.brandIconAsset;
+  if (!isRecord(value) || value.kind !== kind) {
+    return null;
+  }
+  if (
+    typeof value.version !== "string" ||
+    (value.extension !== "png" && value.extension !== "jpg") ||
+    (value.contentType !== "image/png" && value.contentType !== "image/jpeg") ||
+    typeof value.url !== "string" ||
+    typeof value.width !== "number" ||
+    typeof value.height !== "number" ||
+    typeof value.byteLength !== "number" ||
+    typeof value.originalName !== "string" ||
+    typeof value.uploadedAt !== "string"
+  ) {
+    return null;
+  }
+  return {
+    kind,
+    version: value.version,
+    extension: value.extension,
+    contentType: value.contentType,
+    url: value.url,
+    width: value.width,
+    height: value.height,
+    byteLength: value.byteLength,
+    originalName: value.originalName,
+    uploadedAt: value.uploadedAt,
+  };
+}
+
+export function getManagedBrandIconUrl(metadata: string | null): string | null {
+  return getManagedBrandAssetFromMetadata(metadata, "icon")?.url ?? null;
+}
+
+function parsePermissionKeys(value: unknown): PermissionKey[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  return value.filter((entry): entry is PermissionKey => typeof entry === "string" && isPermissionKey(entry));
+}
+
+export function splitRoleString(value: string): string[] {
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function normalizeCanonicalRole(value: string): DenCanonicalRole | null {
+  const normalized = value.trim().toLowerCase().replace(/[\s_]+/g, "-");
+  if (normalized === "owner") return "owner";
+  // Super-admin was merged into admin; a stray value reads as admin.
+  if (normalized === "admin" || normalized === "super-admin") return "admin";
+  if (normalized === "member") return "member";
+  return null;
+}
+
+function getCanonicalRoleSet(roleValue: string) {
+  const roles = new Set<DenCanonicalRole>();
+  for (const roleName of splitRoleString(roleValue)) {
+    const canonicalRole = normalizeCanonicalRole(roleName);
+    if (canonicalRole) {
+      roles.add(canonicalRole);
+    }
+  }
+  return roles;
+}
+
+export function roleIncludesCanonicalRole(roleValue: string, role: DenCanonicalRole): boolean {
+  return getCanonicalRoleSet(roleValue).has(role);
+}
+
+export function getHighestCanonicalRole(roleValue: string, isOwner: boolean): DenCanonicalRole {
+  const canonicalRoles = getCanonicalRoleSet(roleValue);
+  if (isOwner || canonicalRoles.has("owner")) return "owner";
+  if (canonicalRoles.has("admin")) return "admin";
+  return "member";
+}
+
+/** The picker value for a stored role: admin when it names admin, else member. */
+export function assignableOrgRole(roleValue: string): (typeof ASSIGNABLE_ORG_ROLES)[number] {
+  return getHighestCanonicalRole(roleValue, false) === "admin" ? "admin" : "member";
+}
+
+export function canRefreshInvitationRole(role: string, access: Pick<DenOrgAccessFlags, "canInviteMembers" | "canManageRoles">): boolean {
+  return access.canInviteMembers && (access.canManageRoles || getHighestCanonicalRole(role, false) === "member");
+}
+
+/**
+ * Access flags for a member. Pass `permissions` (`currentMember.permissions`
+ * from GET /v1/org) for the signed-in member. Without it, as for other members
+ * or an older server, flags follow the default permissions of the role, which
+ * is what the API applies while the Permissions feature is off.
+ */
+export function getOrgAccessFlags(roleValue: string, isOwner: boolean, permissions?: readonly PermissionKey[] | null): DenOrgAccessFlags {
+  const canonicalRole = getHighestCanonicalRole(roleValue, isOwner);
+  const resolvedIsOwner = canonicalRole === "owner";
+  const isAdmin = resolvedIsOwner || canonicalRole === "admin";
+  const held = new Set<PermissionKey>(
+    resolvedIsOwner
+      ? PERMISSION_KEYS
+      : permissions ?? [...permissionDefaultKeys("member"), ...(isAdmin ? permissionDefaultKeys("admin") : [])],
+  );
+  const can = (key: PermissionKey) => held.has(key);
+
+  return {
+    canonicalRole,
+    isOwner: resolvedIsOwner,
+    isMember: canonicalRole === "member",
+    isAdmin,
+    canViewSettings: isAdmin || held.size > 0,
+    canManageSettings: can("organization.update"),
+    canManageSecurityConfiguration: can("sso.manage") || can("scim.manage"),
+    canInviteMembers: can("invitations.manage"),
+    canCancelInvitations: can("invitations.manage"),
+    canManageMembers: can("members.update"),
+    canRemoveMembers: can("members.delete"),
+    canManageRoles: can("members.update"),
+    canViewTeams: can("teams.view"),
+    canManageTeams: can("teams.manage"),
+    canManageAdminTeams: can("teams.manage_admin"),
+    canViewPermissions: can("permissions.view"),
+    canManagePermissions: can("permissions.manage"),
+    canViewAgentPermissions: can("agent_permissions.view"),
+    canManageAgentPermissions: can("agent_permissions.manage"),
+    canViewApiKeys: can("api_keys.view"),
+    canManageApiKeys: can("api_keys.manage"),
+    canViewScim: can("scim.view"),
+    canManageScim: can("scim.manage"),
+    canViewSso: can("sso.view"),
+    canManageSso: can("sso.manage"),
+    canManageBranding: can("branding.update"),
+    canViewWebOrigins: can("web_origins.view"),
+    canManageWebOrigins: can("web_origins.manage"),
+    canViewDesktopPolicies: can("desktop_policies.view"),
+    canManageDesktopPolicies: can("desktop_policies.manage"),
+    canViewDeployments: can("deployments.view"),
+    canViewUsageAnalytics: can("usage_analytics.view"),
+    canManageDeployments: can("deployments.manage"),
+    canViewEgressDiagnostics: can("egress_diagnostics.view"),
+    canManageEgressDiagnostics: can("egress_diagnostics.manage"),
+    canViewBilling: can("billing.view"),
+    canManageBilling: can("billing.manage"),
+    canOpenBillingPortal: can("billing_portal.use"),
+    canViewAuditLogs: can("audit.view"),
+    canManageAuditCapture: can("audit.manage"),
+    canViewModelsSettings: can("inference.view"),
+    canManageModelsSettings: can("inference.manage"),
+    canViewAllLlmProviders: can("llm_providers.view"),
+    canViewGatewayProviders: can("gateway_providers.view"),
+    canManageGatewayProviders: can("gateway_providers.manage"),
+    canViewGatewayUsage: can("gateway_usage.view"),
+    canViewGatewayLimits: can("gateway_limits.view"),
+    canManageGatewayLimits: can("gateway_limits.manage"),
+    canViewAllConnections: can("connections.view"),
+    canManageConnections: can("connections.manage"),
+    canEditAnyConnection: can("connections.update"),
+    canDisconnectAnyConnection: can("connections.disconnect"),
+    canRemoveAnyConnection: can("connections.delete"),
+    canManageMarketplaces: can("marketplaces.manage"),
+    canImportPlugins: can("plugins.import"),
+    canManageSyncSources: can("connectors.manage"),
+    canManageAllShared: can("sharing.manage_all"),
+    canShareWithEveryone: can("sharing.share_org_wide"),
+    canTransferOwnership: resolvedIsOwner,
+    canDeleteOrganization: resolvedIsOwner,
+    canStartSeatCheckout: can("billing.manage"),
+  };
+}
+
+/** Plain reason for a control locked by a missing permission (DESIGN.md P4). */
+export function permissionLockReason(key: PermissionKey): string {
+  const needs = `Needs the “${getPermissionDefinition(key).label}” permission.`;
+  return isPermissionOwnerOnlyByDefault(key) ? `${needs} Ask the organization owner.` : `${needs} Ask an organization owner or admin for access.`;
+}
+
+export function formatRoleLabel(role: string): string {
+  const canonicalRole = normalizeCanonicalRole(role);
+  if (canonicalRole === "admin") return "Admin";
+  return role
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+    .map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
+    .join(" ");
+}
+
+export function getOrgDashboardRoute(_orgSlug?: string | null): string {
+  return "/dashboard";
+}
+
+export function getMarketplaceOnboardingRoute(_orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(_orgSlug)}/onboarding`;
+}
+
+export function getOnboardingToolsRoute(orgSlug?: string | null): string {
+  return `${getMarketplaceOnboardingRoute(orgSlug)}/tools`;
+}
+
+export function getOnboardingPeopleRoute(orgSlug?: string | null): string {
+  return `${getMarketplaceOnboardingRoute(orgSlug)}/people`;
+}
+
+export function getJoinOrgRoute(invitationId: string): string {
+  return `/join-org?invite=${encodeURIComponent(invitationId)}`;
+}
+
+export function getWorkspaceClaimRoute(token: string): string {
+  return `/workspace-claim?token=${encodeURIComponent(token)}`;
+}
+
+export function getAuditLogsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/audit-logs`;
+}
+
+export function getAnalyticsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/analytics`;
+}
+
+export function getModelsAnalyticsRoute(orgSlug?: string | null): string {
+  return `${getAnalyticsRoute(orgSlug)}/models`;
+}
+
+export function getLibraryUsageRoute(orgSlug?: string | null): string {
+  return `${getAnalyticsRoute(orgSlug)}/library`;
+}
+
+export function getMembersRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/members`;
+}
+
+export function getTeamRoute(orgSlug: string | null | undefined, teamId: string): string {
+  return `${getMembersRoute(orgSlug)}/teams/${encodeURIComponent(teamId)}`;
+}
+
+/** A team's Agents tab: what agents can do for people in the team. */
+export function getTeamAgentsRoute(orgSlug: string | null | undefined, teamId: string): string {
+  return `${getTeamRoute(orgSlug, teamId)}?tab=agents`;
+}
+
+/** Members › Teams › Everyone: every member, including people in no team. */
+export function getEveryoneRoute(orgSlug?: string | null): string {
+  return `${getMembersRoute(orgSlug)}/teams/everyone`;
+}
+
+export function getEveryoneAgentsRoute(orgSlug?: string | null): string {
+  return `${getEveryoneRoute(orgSlug)}?tab=agents`;
+}
+
+/** Everyone's Browser tab: the pages agents and the built-in browser can open, for every member. */
+export function getEveryoneBrowserRoute(orgSlug?: string | null): string {
+  return `${getEveryoneRoute(orgSlug)}?tab=browser`;
+}
+
+export function getMembersTeamsRoute(orgSlug?: string | null): string {
+  return `${getMembersRoute(orgSlug)}?tab=teams`;
+}
+
+export function getNewRoleRoute(orgSlug?: string | null): string {
+  return `${getMembersRoute(orgSlug)}/roles/new`;
+}
+
+export function getWorkflowRunsRoute(orgSlug?: string | null): string {
+  return `${getAnalyticsRoute(orgSlug)}/workflow-runs`;
+}
+
+export function getAutomationsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/automations`;
+}
+
+export function getCustomLlmProvidersRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/custom-llm-providers`;
+}
+
+export function getInferenceRoute(orgSlug?: string | null): string {
+  return `${getAiGatewayRoute(orgSlug)}?tab=idexal-os-models`;
+}
+
+export function getWebRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/web`;
+}
+
+export function getLlmProvidersRoute(orgSlug?: string | null): string {
+  return getCustomLlmProvidersRoute(orgSlug);
+}
+
+export function getDesktopPoliciesRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/desktop-policies`;
+}
+
+export function getWorkbotSettingsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/workbot-settings`;
+}
+
+export function getPermissionsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/permissions`;
+}
+
+export function getNewTeamPermissionsRoute(orgSlug?: string | null): string {
+  return `${getPermissionsRoute(orgSlug)}/new`;
+}
+
+export function getPermissionSetRoute(orgSlug: string | null | undefined, permissionSetId: string): string {
+  return `${getPermissionsRoute(orgSlug)}/${encodeURIComponent(permissionSetId)}`;
+}
+
+export function getPermissionKeysRoute(orgSlug?: string | null): string {
+  return `${getPermissionsRoute(orgSlug)}/keys`;
+}
+
+export function getPermissionKeyRoute(orgSlug: string | null | undefined, permissionKey: string): string {
+  return `${getPermissionKeysRoute(orgSlug)}/${encodeURIComponent(permissionKey)}`;
+}
+
+export function getNewDesktopPolicyRoute(orgSlug?: string | null): string {
+  return `${getDesktopPoliciesRoute(orgSlug)}/new`;
+}
+
+export function getDesktopPolicyRoute(orgSlug: string | null | undefined, desktopPolicyId: string): string {
+  return `${getDesktopPoliciesRoute(orgSlug)}/${encodeURIComponent(desktopPolicyId)}`;
+}
+
+export function getLlmProviderRoute(orgSlug: string | null | undefined, llmProviderId: string): string {
+  return `${getLlmProvidersRoute(orgSlug)}/${encodeURIComponent(llmProviderId)}`;
+}
+
+export function getEditLlmProviderRoute(orgSlug: string | null | undefined, llmProviderId: string): string {
+  return `${getLlmProviderRoute(orgSlug, llmProviderId)}/edit`;
+}
+
+export function getNewLlmProviderRoute(orgSlug?: string | null): string {
+  return `${getLlmProvidersRoute(orgSlug)}/new`;
+}
+
+export function getAiGatewayRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/ai-gateway`;
+}
+
+export function getAiGatewayProvidersRoute(orgSlug?: string | null): string {
+  return `${getAiGatewayRoute(orgSlug)}?tab=ai-providers`;
+}
+
+export function getNewAiGatewayProviderRoute(orgSlug?: string | null, providerId?: string): string {
+  const base = `${getAiGatewayRoute(orgSlug)}/providers/new`;
+  return providerId ? `${base}?provider=${encodeURIComponent(providerId)}` : base;
+}
+
+export function getAiGatewayProviderRoute(orgSlug: string | null | undefined, inferenceProviderId: string): string {
+  return `${getAiGatewayRoute(orgSlug)}/providers/${encodeURIComponent(inferenceProviderId)}`;
+}
+
+export function getEditAiGatewayProviderRoute(orgSlug: string | null | undefined, inferenceProviderId: string): string {
+  return `${getAiGatewayProviderRoute(orgSlug, inferenceProviderId)}/edit`;
+}
+
+export function getAiGatewayLimitsRoute(orgSlug?: string | null, deletedPolicyId?: string): string {
+  const base = `${getAiGatewayRoute(orgSlug)}?tab=limits`;
+  return deletedPolicyId ? `${base}&deleted=${encodeURIComponent(deletedPolicyId)}` : base;
+}
+
+export function getNewAiGatewayLimitRoute(orgSlug?: string | null, target?: { memberId: string } | { teamId: string }): string {
+  const base = `${getAiGatewayRoute(orgSlug)}/limits/new`;
+  if (!target) return base;
+  return "memberId" in target
+    ? `${base}?memberId=${encodeURIComponent(target.memberId)}`
+    : `${base}?teamId=${encodeURIComponent(target.teamId)}`;
+}
+
+export function getAiGatewayLimitRoute(orgSlug: string | null | undefined, policyId: string): string {
+  return `${getAiGatewayRoute(orgSlug)}/limits/${encodeURIComponent(policyId)}`;
+}
+
+export function getAiGatewayUsersTeamsRoute(orgSlug?: string | null, filter?: { view: "teams" } | { teamId: string }): string {
+  const base = `${getAiGatewayRoute(orgSlug)}?tab=users-and-teams`;
+  if (!filter) return base;
+  return "teamId" in filter ? `${base}&team=${encodeURIComponent(filter.teamId)}` : `${base}&view=teams`;
+}
+
+export function getAiGatewayPersonRoute(orgSlug: string | null | undefined, memberId: string): string {
+  return `${getAiGatewayRoute(orgSlug)}/people/${encodeURIComponent(memberId)}`;
+}
+
+export function getBillingRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/billing`;
+}
+
+export function getOrgSettingsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/org-settings`;
+}
+
+export function getDeploymentsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/deployments`;
+}
+
+export function getDiagnosticsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/diagnostics`;
+}
+
+export function getBrandAppearanceRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/brand-appearance`;
+}
+
+export function getApiKeysRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/api-keys`;
+}
+
+export function getScimRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/scim`;
+}
+
+export function getSsoRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/sso`;
+}
+
+export function getPluginsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/plugins`;
+}
+
+export function getPluginRoute(orgSlug: string | null | undefined, pluginId: string): string {
+  return `${getPluginsRoute(orgSlug)}/${encodeURIComponent(pluginId)}`;
+}
+
+export function getPluginSkillRoute(orgSlug: string | null | undefined, pluginId: string, skillId: string): string {
+  return `${getPluginRoute(orgSlug, pluginId)}/skills/${encodeURIComponent(skillId)}`;
+}
+
+export function getNewPluginSkillRoute(orgSlug: string | null | undefined, pluginId: string): string {
+  return `${getPluginRoute(orgSlug, pluginId)}/skills/new`;
+}
+
+export function getEditPluginSkillRoute(orgSlug: string | null | undefined, pluginId: string, skillId: string): string {
+  return `${getPluginSkillRoute(orgSlug, pluginId, skillId)}/edit`;
+}
+
+/** The full plugin editor: hooks, agents, marketplaces and skill files. */
+export function getPluginDetailsRoute(orgSlug: string | null | undefined, pluginId: string): string {
+  return `${getPluginRoute(orgSlug, pluginId)}/details`;
+}
+
+export function getNewPluginRoute(orgSlug?: string | null): string {
+  return `${getPluginsRoute(orgSlug)}/new`;
+}
+
+export function getImportPluginRoute(orgSlug?: string | null): string {
+  return `${getPluginsRoute(orgSlug)}/import`;
+}
+
+export function getMarketplacesRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/marketplaces`;
+}
+
+export function getMarketplaceRoute(orgSlug: string | null | undefined, marketplaceId: string): string {
+  return `${getMarketplacesRoute(orgSlug)}/${encodeURIComponent(marketplaceId)}`;
+}
+
+export function getIntegrationsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/integrations`;
+}
+
+export function getPluginSourcesRoute(orgSlug?: string | null): string {
+  return `${getPluginsRoute(orgSlug)}?view=sources`;
+}
+
+export function getGithubIntegrationRoute(orgSlug?: string | null): string {
+  return `${getIntegrationsRoute(orgSlug)}/github`;
+}
+
+export function getMcpConnectionsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/mcp-connections`;
+}
+
+/** A configured connector's page in Manage, Google Workspace and Microsoft 365 included. */
+export function getMcpConnectionRoute(orgSlug: string | null | undefined, connectorId: string): string {
+  return `${getMcpConnectionsRoute(orgSlug)}/${encodeURIComponent(connectorId)}`;
+}
+
+export function getYourConnectionsRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/your-connections`;
+}
+
+export function getToolTesterRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/tool-tester`;
+}
+
+export function getLibraryRoute(orgSlug?: string | null): string {
+  return `${getOrgDashboardRoute(orgSlug)}/library`;
+}
+
+export function getLibraryPluginRoute(orgSlug: string | null | undefined, pluginId: string): string {
+  return `${getLibraryRoute(orgSlug)}/plugins/${encodeURIComponent(pluginId)}`;
+}
+
+export function getLibraryPluginShareRoute(orgSlug: string | null | undefined, pluginId: string): string {
+  return `${getLibraryPluginRoute(orgSlug, pluginId)}/share`;
+}
+
+export function getLibraryNewPluginRoute(orgSlug?: string | null, start?: "skill"): string {
+  return `${getLibraryRoute(orgSlug)}/plugins/new${start ? `?start=${start}` : ""}`;
+}
+
+export function getLibraryModelsRoute(orgSlug?: string | null): string {
+  return `${getLibraryRoute(orgSlug)}?show=models`;
+}
+
+export function getLibraryModelRoute(orgSlug: string | null | undefined, providerId: string): string {
+  return `${getLibraryRoute(orgSlug)}/models/${encodeURIComponent(providerId)}`;
+}
+
+export function getLibraryConnectorRoute(orgSlug: string | null | undefined, connectionId: string): string {
+  return `${getLibraryRoute(orgSlug)}/connectors/${encodeURIComponent(connectionId)}`;
+}
+
+export function getLibraryConnectorShareRoute(orgSlug: string | null | undefined, connectionId: string): string {
+  return `${getLibraryConnectorRoute(orgSlug, connectionId)}/share`;
+}
+
+/** The connector catalog, or one entry's setup checks when a catalog id is given. */
+export function getLibraryAddConnectorRoute(orgSlug?: string | null, catalogId?: string): string {
+  return `${getLibraryRoute(orgSlug)}/connectors/new${catalogId ? `/${encodeURIComponent(catalogId)}` : ""}`;
+}
+
+export function getAddConnectorRoute(orgSlug?: string | null, catalogId?: string): string {
+  return `${getMcpConnectionsRoute(orgSlug)}/new${catalogId ? `/${encodeURIComponent(catalogId)}` : ""}`;
+}
+
+export function getGithubIntegrationSetupRoute(orgSlug: string | null | undefined, connectorInstanceId: string): string {
+  return `${getGithubIntegrationRoute(orgSlug)}?connectorInstanceId=${encodeURIComponent(connectorInstanceId)}`;
+}
+
+export function getGithubIntegrationAccountRoute(orgSlug: string | null | undefined, connectorAccountId: string): string {
+  return `${getGithubIntegrationRoute(orgSlug)}?connectorAccountId=${encodeURIComponent(connectorAccountId)}`;
+}
+
+export function parseOrgListPayload(payload: unknown): {
+  orgs: DenOrgSummary[];
+  activeOrgId: string | null;
+  activeOrgSlug: string | null;
+} {
+  if (!isRecord(payload) || !Array.isArray(payload.orgs)) {
+    return { orgs: [], activeOrgId: null, activeOrgSlug: null };
+  }
+
+  const orgs = payload.orgs
+    .map((entry) => {
+      if (!isRecord(entry)) {
+        return null;
+      }
+
+      const id = asString(entry.id);
+      const name = asString(entry.name);
+      const slug = asString(entry.slug);
+      const role = asString(entry.role);
+      const orgMemberId = asString(entry.orgMemberId);
+      const membershipId = asString(entry.membershipId);
+      if (!id || !name || !slug || !role || !orgMemberId || !membershipId) {
+        return null;
+      }
+
+      return {
+        id,
+        name,
+        slug,
+        logo: asString(entry.logo),
+        metadata: asString(entry.metadata),
+        role,
+        orgMemberId,
+        membershipId,
+        memberCount: typeof entry.memberCount === "number" ? entry.memberCount : 0,
+        createdAt: asIsoString(entry.createdAt),
+        updatedAt: asIsoString(entry.updatedAt),
+        isActive: asBoolean(entry.isActive),
+      } satisfies DenOrgSummary;
+    })
+    .filter((entry): entry is DenOrgSummary => entry !== null);
+
+  return {
+    orgs,
+    activeOrgId: asString(payload.activeOrgId),
+    activeOrgSlug: asString(payload.activeOrgSlug),
+  };
+}
+
+export function parseOrgContextPayload(payload: unknown): DenOrgContext | null {
+  if (!isRecord(payload) || !isRecord(payload.organization) || !isRecord(payload.currentMember)) {
+    return null;
+  }
+
+  const organization = payload.organization;
+  const currentMember = payload.currentMember;
+  const organizationId = asString(organization.id);
+  const organizationName = asString(organization.name);
+  const organizationSlug = asString(organization.slug);
+  const organizationOwner = isRecord(organization.owner) ? organization.owner : null;
+  const organizationOwnerMemberId = organizationOwner ? asString(organizationOwner.memberId) : null;
+  const organizationOwnerUserId = organizationOwner ? asString(organizationOwner.userId) : null;
+  const currentMemberId = asString(currentMember.id);
+  const currentMemberUserId = asString(currentMember.userId);
+  const currentMemberRole = asString(currentMember.role);
+
+  if (!organizationId || !organizationName || !organizationSlug || !currentMemberId || !currentMemberUserId || !currentMemberRole) {
+    return null;
+  }
+
+  const members = Array.isArray(payload.members)
+    ? payload.members
+        .map((entry) => {
+          if (!isRecord(entry) || !isRecord(entry.user)) {
+            return null;
+          }
+
+          const id = asString(entry.id);
+          const userId = asString(entry.userId);
+          const role = asString(entry.role);
+          const user = entry.user;
+          const userEmail = asString(user.email);
+          const userName = asString(user.name);
+          const userIdentity = asString(user.id);
+          if (!id || !role || !userEmail || !userName || !userIdentity) {
+            return null;
+          }
+
+          return {
+            id,
+            userId,
+            inviteId: asString(entry.inviteId),
+            role,
+            effectiveRole: asString(entry.effectiveRole) ?? role,
+            adminTeams: parseAdminTeams(entry.adminTeams),
+            createdAt: asIsoString(entry.createdAt),
+            joinedAt: asIsoString(entry.joinedAt),
+            isOwner: asBoolean(entry.isOwner),
+            user: {
+              id: userIdentity,
+              email: userEmail,
+              name: userName,
+              image: asString(user.image),
+            },
+          } satisfies DenOrgMember;
+        })
+        .filter((entry): entry is DenOrgMember => entry !== null)
+    : [];
+
+  const invitations = Array.isArray(payload.invitations)
+    ? payload.invitations
+        .map((entry) => {
+          if (!isRecord(entry)) {
+            return null;
+          }
+
+          const id = asString(entry.id);
+          const email = asString(entry.email);
+          const role = asString(entry.role);
+          const status = asString(entry.status);
+          if (!id || !email || !role || !status) {
+            return null;
+          }
+
+          return {
+            id,
+            email,
+            role,
+            status,
+            expiresAt: asIsoString(entry.expiresAt),
+            createdAt: asIsoString(entry.createdAt),
+          } satisfies DenOrgInvitation;
+        })
+        .filter((entry): entry is DenOrgInvitation => entry !== null)
+    : [];
+
+  const teams = Array.isArray(payload.teams)
+    ? payload.teams
+        .map((entry) => {
+          if (!isRecord(entry) || typeof entry.id !== "string" || typeof entry.name !== "string") {
+            return null;
+          }
+
+          const memberIds = Array.isArray(entry.memberIds)
+            ? entry.memberIds.filter((value): value is string => typeof value === "string")
+            : [];
+
+          return {
+            id: entry.id,
+            name: entry.name,
+            createdAt: asIsoString(entry.createdAt),
+            updatedAt: asIsoString(entry.updatedAt),
+            memberIds,
+            managedByScim: asBoolean(entry.managedByScim),
+            grantsOrganizationAdmin: asBoolean(entry.grantsOrganizationAdmin),
+          } satisfies DenOrgTeam;
+        })
+        .filter((entry): entry is DenOrgTeam => entry !== null)
+    : [];
+
+  const currentMemberTeams = Array.isArray(payload.currentMemberTeams)
+    ? payload.currentMemberTeams
+        .map((entry) => {
+          if (!isRecord(entry)) {
+            return null;
+          }
+
+          const id = asString(entry.id);
+          const name = asString(entry.name);
+          const organizationId = asString(entry.organizationId);
+          if (!id || !name || !organizationId) {
+            return null;
+          }
+
+          return {
+            id,
+            name,
+            organizationId,
+            createdAt: asIsoString(entry.createdAt),
+            updatedAt: asIsoString(entry.updatedAt),
+          } satisfies DenCurrentMemberTeam;
+        })
+        .filter((entry): entry is DenCurrentMemberTeam => entry !== null)
+    : [];
+
+  return {
+    organization: {
+      id: organizationId,
+      name: organizationName,
+      slug: organizationSlug,
+      logo: asString(organization.logo),
+      allowedEmailDomains: asStringArray(organization.allowedEmailDomains),
+      metadata: asString(organization.metadata),
+      createdAt: asIsoString(organization.createdAt),
+      updatedAt: asIsoString(organization.updatedAt),
+      owner: organizationOwner && organizationOwnerMemberId && organizationOwnerUserId
+        ? {
+          memberId: organizationOwnerMemberId,
+          userId: organizationOwnerUserId,
+          name: asString(organizationOwner.name),
+          email: asString(organizationOwner.email),
+          image: asString(organizationOwner.image),
+        }
+        : null,
+    },
+    currentMember: {
+      id: currentMemberId,
+      userId: currentMemberUserId,
+      role: currentMemberRole,
+      directRole: asString(currentMember.directRole) ?? currentMemberRole,
+      adminTeams: parseAdminTeams(currentMember.adminTeams),
+      createdAt: asIsoString(currentMember.createdAt),
+      isOwner: asBoolean(currentMember.isOwner),
+      permissions: parsePermissionKeys(currentMember.permissions),
+    },
+    members,
+    invitations,
+    teams,
+    currentMemberTeams,
+    entitlements: parseOrgEntitlements(payload.entitlements),
+    authMethods: parseOrgAuthMethods(payload.authMethods),
+    capabilities: parseOrgCapabilities(payload.capabilities),
+    features: parseOrgFeatures(payload.features),
+    deploymentCapabilities: parseDeploymentCapabilities(payload.deploymentCapabilities),
+  };
+}
+
+function parseOrgAuthMethods(value: unknown): DenOrgAuthMethods {
+  if (!isRecord(value)) {
+    return { sso: false, scim: false };
+  }
+
+  return {
+    sso: value.sso === true,
+    scim: value.scim === true,
+  };
+}
+
+/** Fail closed: a feature the server did not report (older server) is off. */
+function parseOrgFeatures(value: unknown): FeatureMap {
+  const reported = isRecord(value) ? value : {};
+  return mapFeatures((key) => reported[key] === true);
+}
+
+/** Whether a registry feature is on for the active organization. Use this for every new feature gate. */
+export function orgFeatureEnabled(orgContext: Pick<DenOrgContext, "features"> | null | undefined, key: keyof FeatureMap): boolean {
+  return orgContext?.features[key] === true;
+}
+
+function parseOrgCapabilities(value: unknown): DenOrgCapabilities {
+  if (!isRecord(value)) {
+    return { auditLogs: false, installLinks: false, mcpConnections: false, appMcpServers: false, workflows: true, idexalOsWeb: false, cloud: false, workbot: false };
+  }
+
+  return {
+    auditLogs: value.auditLogs === true,
+    installLinks: value.installLinks === true,
+    mcpConnections: value.mcpConnections === true,
+    appMcpServers: value.appMcpServers === true,
+    // Workflows are enabled everywhere on current servers; only an explicit
+    // false from an older server still hides the surface.
+    workflows: value.workflows !== false,
+    idexalOsWeb: value.idexalOsWeb === true,
+    cloud: value.cloud === true,
+    workbot: value.workbot === true,
+  };
+}
+
+function parseOrgEntitlements(value: unknown): DenOrgEntitlements {
+  if (!isRecord(value)) {
+    return { sso: true, desktopPolicies: true, orgControls: true, analytics: true, auditLogs: false };
+  }
+
+  return {
+    sso: value.sso !== false,
+    desktopPolicies: value.desktopPolicies !== false,
+    orgControls: value.orgControls !== false,
+    analytics: value.analytics !== false,
+    auditLogs: value.auditLogs === true,
+  };
+}
+
+export function parseInvitationPreviewPayload(payload: unknown): DenInvitationPreview | null {
+  if (!isRecord(payload) || !isRecord(payload.invitation) || !isRecord(payload.organization)) {
+    return null;
+  }
+
+  const invitation = payload.invitation;
+  const organization = payload.organization;
+  const invitationId = asString(invitation.id);
+  const invitationEmail = asString(invitation.email);
+  const invitationRole = asString(invitation.role);
+  const invitationStatus = asString(invitation.status);
+  const organizationId = asString(organization.id);
+  const organizationName = asString(organization.name);
+  const organizationSlug = asString(organization.slug);
+  const branding = isRecord(organization.branding) ? organization.branding : null;
+
+  if (!invitationId || !invitationEmail || !invitationRole || !invitationStatus || !organizationId || !organizationName || !organizationSlug) {
+    return null;
+  }
+
+  return {
+    invitation: {
+      id: invitationId,
+      email: invitationEmail,
+      role: invitationRole,
+      status: invitationStatus,
+      expiresAt: asIsoString(invitation.expiresAt),
+      createdAt: asIsoString(invitation.createdAt),
+    },
+    organization: {
+      id: organizationId,
+      name: organizationName,
+      slug: organizationSlug,
+      allowedEmailDomains: asStringArray(organization.allowedEmailDomains),
+      branding: {
+        appName: asString(branding?.appName) ?? "idexal Os",
+        logoUrl: asString(branding?.logoUrl),
+        iconUrl: asString(branding?.iconUrl),
+      },
+    },
+  };
+}
+
+export function isEmailAllowedForOrganization(allowedEmailDomains: readonly string[] | null | undefined, email: string): boolean {
+  if (!allowedEmailDomains || allowedEmailDomains.length === 0) {
+    return true;
+  }
+
+  const normalized = email.trim().toLowerCase();
+  const atIndex = normalized.lastIndexOf("@");
+  if (atIndex === -1 || atIndex + 1 >= normalized.length) {
+    return false;
+  }
+
+  return allowedEmailDomains.includes(normalized.slice(atIndex + 1));
+}
+
+export function parseOrgApiKeysPayload(payload: unknown): DenOrgApiKey[] {
+  if (!isRecord(payload) || !Array.isArray(payload.apiKeys)) {
+    return [];
+  }
+
+  return payload.apiKeys
+    .map((entry) => {
+      if (!isRecord(entry) || !isRecord(entry.owner)) {
+        return null;
+      }
+
+      const id = asString(entry.id);
+      const configId = asString(entry.configId);
+      const owner = entry.owner;
+      const ownerUserId = asString(owner.userId);
+      const ownerMemberId = asString(owner.memberId);
+      const ownerName = asString(owner.name);
+      const ownerEmail = asString(owner.email);
+
+      if (!id || !configId || !ownerUserId || !ownerMemberId || !ownerName || !ownerEmail) {
+        return null;
+      }
+
+      return {
+        id,
+        configId,
+        name: asString(entry.name),
+        start: asString(entry.start),
+        prefix: asString(entry.prefix),
+        enabled: asBoolean(entry.enabled),
+        rateLimitEnabled: asBoolean(entry.rateLimitEnabled),
+        rateLimitMax: typeof entry.rateLimitMax === "number" ? entry.rateLimitMax : null,
+        rateLimitTimeWindow: typeof entry.rateLimitTimeWindow === "number" ? entry.rateLimitTimeWindow : null,
+        lastRequest: asIsoString(entry.lastRequest),
+        expiresAt: asIsoString(entry.expiresAt),
+        createdAt: asIsoString(entry.createdAt),
+        updatedAt: asIsoString(entry.updatedAt),
+        owner: {
+          userId: ownerUserId,
+          memberId: ownerMemberId,
+          name: ownerName,
+          email: ownerEmail,
+          image: asString(owner.image),
+        },
+      } satisfies DenOrgApiKey;
+    })
+    .filter((entry): entry is DenOrgApiKey => entry !== null);
+}
+
+export function parseOrgScimPayload(payload: unknown): {
+  baseUrl: string | null;
+  ssoReady: boolean;
+  connection: DenOrgScimConnection | null;
+  health: DenOrgScimHealth;
+  scimToken: string | null;
+} {
+  if (!isRecord(payload)) {
+    return {
+      baseUrl: null,
+      ssoReady: false,
+      connection: null,
+      health: {
+        unresolvedFailureCount: 0,
+        lastFailureAt: null,
+        lastFailureAction: null,
+        lastFailureMessage: null,
+        nextRetryAt: null,
+        lastSuccessfulSyncAt: null,
+      },
+      scimToken: null,
+    };
+  }
+
+  const rawConnection = isRecord(payload.connection) ? payload.connection : null;
+  const connection = rawConnection
+    ? (() => {
+        const id = asString(rawConnection.id);
+        const providerId = asString(rawConnection.providerId);
+        const organizationId = asString(rawConnection.organizationId);
+        const groupMappingMode = rawConnection.groupMappingMode === "create_teams"
+          ? "create_teams"
+          : "metadata_only";
+
+        if (!id || !providerId || !organizationId) {
+          return null;
+        }
+
+        return {
+          id,
+          providerId,
+          organizationId,
+          groupMappingMode,
+          createdAt: asIsoString(rawConnection.createdAt),
+          updatedAt: asIsoString(rawConnection.updatedAt),
+        } satisfies DenOrgScimConnection;
+      })()
+    : null;
+
+  const rawHealth = isRecord(payload.health) ? payload.health : null;
+  const health = {
+    unresolvedFailureCount: typeof rawHealth?.unresolvedFailureCount === "number"
+      ? rawHealth.unresolvedFailureCount
+      : 0,
+    lastFailureAt: asIsoString(rawHealth?.lastFailureAt),
+    lastFailureAction: asString(rawHealth?.lastFailureAction),
+    lastFailureMessage: asString(rawHealth?.lastFailureMessage),
+    nextRetryAt: asIsoString(rawHealth?.nextRetryAt),
+    lastSuccessfulSyncAt: asIsoString(rawHealth?.lastSuccessfulSyncAt),
+  } satisfies DenOrgScimHealth;
+
+  return {
+    baseUrl: asString(payload.baseUrl),
+    ssoReady: payload.ssoReady === true,
+    connection,
+    health,
+    scimToken: asString(payload.scimToken),
+  };
+}
+
+export function parseOrgSsoPayload(payload: unknown): {
+  connection: DenOrgSsoConnection | null;
+  domainVerificationToken: string | null;
+} {
+  if (!isRecord(payload)) {
+    return { connection: null, domainVerificationToken: null };
+  }
+
+  const rawConnection = isRecord(payload.connection) ? payload.connection : null;
+  const connection = rawConnection
+    ? (() => {
+        const id = asString(rawConnection.id);
+        const providerId = asString(rawConnection.providerId);
+        const kind = asString(rawConnection.kind);
+        const issuer = asString(rawConnection.issuer);
+        const domain = asString(rawConnection.domain);
+        const status = asString(rawConnection.status);
+        const testStatus = asString(rawConnection.testStatus);
+        const signInPath = asString(rawConnection.signInPath);
+        const signInUrl = asString(rawConnection.signInUrl);
+        const redirectUrl = asString(rawConnection.redirectUrl);
+        const domainVerificationHost = asString(rawConnection.domainVerificationHost);
+        const domainVerificationDnsName = asString(rawConnection.domainVerificationDnsName);
+        const rawOidc = isRecord(rawConnection.oidc) ? rawConnection.oidc : null;
+        const rawSaml = isRecord(rawConnection.saml) ? rawConnection.saml : null;
+        const tokenEndpointAuthentication = asString(rawOidc?.tokenEndpointAuthentication);
+
+        if (!id || !providerId || !issuer || !domain || (status !== "disabled" && status !== "enabled") || (testStatus !== "untested" && testStatus !== "testing" && testStatus !== "succeeded" && testStatus !== "failed") || !signInPath || !signInUrl || !redirectUrl || !domainVerificationHost || !domainVerificationDnsName || (kind !== "oidc" && kind !== "saml")) {
+          return null;
+        }
+
+        return {
+          id,
+          providerId,
+          kind,
+          issuer,
+          domain,
+          status,
+          testStatus,
+          testExpiresAt: asIsoString(rawConnection.testExpiresAt),
+          signInPath,
+          signInUrl,
+          redirectUrl,
+          acsUrl: asString(rawConnection.acsUrl),
+          metadataUrl: asString(rawConnection.metadataUrl),
+          domainVerified: asBoolean(rawConnection.domainVerified),
+          domainVerificationHost,
+          domainVerificationDnsName,
+          oidc: rawOidc
+            ? {
+                clientId: asString(rawOidc.clientId),
+                scopes: asStringArray(rawOidc.scopes) ?? [],
+                skipDiscovery: asBoolean(rawOidc.skipDiscovery),
+                authorizationEndpoint: asString(rawOidc.authorizationEndpoint),
+                tokenEndpoint: asString(rawOidc.tokenEndpoint),
+                jwksEndpoint: asString(rawOidc.jwksEndpoint),
+                userInfoEndpoint: asString(rawOidc.userInfoEndpoint),
+                tokenEndpointAuthentication: tokenEndpointAuthentication === "client_secret_basic" || tokenEndpointAuthentication === "client_secret_post"
+                  ? tokenEndpointAuthentication
+                  : null,
+              }
+            : null,
+          saml: rawSaml
+            ? {
+                entryPoint: asString(rawSaml.entryPoint),
+                audience: asString(rawSaml.audience),
+                wantAssertionsSigned: asBoolean(rawSaml.wantAssertionsSigned),
+              }
+            : null,
+          lastTestedAt: asIsoString(rawConnection.lastTestedAt),
+          lastError: asString(rawConnection.lastError),
+          createdAt: asIsoString(rawConnection.createdAt),
+          updatedAt: asIsoString(rawConnection.updatedAt),
+        } satisfies DenOrgSsoConnection;
+      })()
+    : null;
+
+  return { connection, domainVerificationToken: asString(payload.domainVerificationToken) };
+}

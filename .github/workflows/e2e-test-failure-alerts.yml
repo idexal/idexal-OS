@@ -1,0 +1,45 @@
+name: Test alerts
+
+on:
+  workflow_run:
+    # Den DB Migrate retries pending production migrations every 30 minutes;
+    # without an alert a broken migration fails silently while den-api already
+    # runs code that needs it (#4895). Only its scheduled ticks notify.
+    workflows: [Build and core checks, Freestyle world check, Den DB Migrate]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: test-alerts-${{ github.event.workflow_run.workflow_id }}
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    if: github.repository == 'idexal/idexalOs' && github.event.workflow_run.event == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Execute trusted default-branch code, never code/artifacts from a PR.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+      - name: Report failures or recovery to the team
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_TEST_ALERT_CHANNEL_ID: ${{ vars.SLACK_TEST_ALERT_CHANNEL_ID }}
+          SLACK_TEST_ALERT_TEAM_ID: ${{ vars.SLACK_TEST_ALERT_TEAM_ID }}
+        run: node evals/scripts/notify-journeys.mjs
+      - name: Preserve incident thread for the next scheduled run
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-alert-state-${{ github.event.workflow_run.workflow_id }}
+          path: alert-state/state.json
+          retention-days: 90
+          if-no-files-found: error

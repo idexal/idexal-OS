@@ -1,0 +1,1120 @@
+import { peopleMemberCondition } from "./setup-agent-members.js"
+import { asc, and, eq, gt, isNull, lt, lte } from "@idexal-ee/den-db/drizzle"
+import { readFeatureRollouts, readOrganizationFeatureOverrides } from "@idexal-ee/den-db/organization-features"
+import { AuthSessionTable, AuthUserTable, InvitationTable, MemberTable, OAuthConsentTable, OrganizationTable, TeamTable } from "@idexal-ee/den-db/schema"
+import { isFeatureKey, type FeatureOverrides, type FeatureRollouts } from "@idexal/features"
+import { normalizeDenTypeId, type DenTypeId, type DenTypeIdName } from "@idexal-ee/utils/typeid"
+import { createHash } from "node:crypto"
+import Redis from "ioredis"
+import { db } from "./db.js"
+import { env } from "./env.js"
+import { bumpGeneration, readManyThroughGeneration, readThroughGeneration, type GenerationCacheEntry } from "./generation-cache.js"
+import { roleIncludesOwner } from "./organization-member-guards.js"
+import { getDenSessionExpiresAt, getDenSessionRefreshCutoff } from "./session-lifetime.js"
+
+type OrgId = typeof OrganizationTable.$inferSelect.id
+type MemberId = typeof MemberTable.$inferSelect.id
+type UserId = typeof AuthUserTable.$inferSelect.id
+type OAuthConsentId = typeof OAuthConsentTable.$inferSelect.id
+
+type CacheParent = "auth" | "features" | "org"
+type CacheChild = "generation" | "inventory-generation" | "grant" | "grant-revoked" | "member" | "member-revoked" | "members" | "member-teams" | "overrides" | "rollouts" | "session" | "session-id" | "session-revoked" | "session-id-revoked"
+
+type CacheKeyInput = {
+  parent: CacheParent
+  child: CacheChild
+  id: string
+}
+
+type CacheRedisClient = {
+  get(key: string): Promise<string | null>
+  set(key: string, value: string, mode: "EX", ttl: number): Promise<unknown>
+  del(...keys: string[]): Promise<unknown>
+  mget?(...keys: string[]): Promise<Array<string | null>>
+  eval?(script: string, numberOfKeys: number, ...args: Array<string | number>): Promise<unknown>
+  scan?(cursor: string, mode: "MATCH", pattern: string, countMode: "COUNT", count: number): Promise<[string, string[]]>
+}
+
+type CacheResult<T> = {
+  value: T
+  source: "cache" | "loader"
+}
+
+export type CachedAuthSession = {
+  session: {
+    id: DenTypeId<"session">
+    token: string
+    userId: DenTypeId<"user">
+    activeOrganizationId: DenTypeId<"organization"> | null
+    activeTeamId: DenTypeId<"team"> | null
+    expiresAt: Date
+    createdAt: Date
+    updatedAt: Date
+    ipAddress: string | null
+    userAgent: string | null
+  }
+  user: {
+    id: DenTypeId<"user">
+    name: string
+    email: string
+    emailVerified: boolean
+    image: string | null
+    createdAt: Date
+    updatedAt: Date
+  }
+}
+
+export type CachedOrgMembership = {
+  id: MemberId
+  role: string
+  isOwner: boolean
+}
+
+export type CachedOrgMember = {
+  id: MemberId
+  userId: UserId | null
+  inviteId: typeof InvitationTable.$inferSelect.id | null
+  role: string
+  createdAt: Date
+  joinedAt: Date | null
+  isOwner: boolean
+  user: {
+    id: UserId | MemberId
+    email: string
+    name: string
+    image: string | null
+  }
+}
+
+type CachedMemberTeam = Pick<typeof TeamTable.$inferSelect, "id" | "name" | "organizationId" | "createdAt" | "updatedAt">
+
+function parseCachedMemberTeams(raw: string | null): CachedMemberTeam[] | null {
+  if (!raw) return null
+  let parsed: unknown
+  try { parsed = JSON.parse(raw) } catch { return null }
+  if (!Array.isArray(parsed)) return null
+  const teams: CachedMemberTeam[] = []
+  for (const value of parsed) {
+    if (!isRecord(value)) return null
+    const id = readDenId("team", value.id)
+    const organizationId = readDenId("organization", value.organizationId)
+    const name = readString(value.name)
+    const createdAt = readDate(value.createdAt)
+    const updatedAt = readDate(value.updatedAt)
+    if (!id || !organizationId || name === null || !createdAt || !updatedAt) return null
+    teams.push({ id, organizationId, name, createdAt, updatedAt })
+  }
+  return teams
+}
+
+async function getMemberTeams(input: {
+  organizationId: OrgId
+  memberId: MemberId
+  revision: () => Promise<string | null>
+  enabled: () => Promise<boolean>
+  load: () => Promise<CachedMemberTeam[]>
+}) {
+  if (!activeRedisClient || !await input.enabled()) return input.load()
+  // This indexed PRIMARY read is never cached. It checks both active membership
+  // and the DB-authoritative team revision before trusting any Redis entry.
+  // DB failure rejects, even if Redis has a previously valid authorization.
+  const revision = await input.revision()
+  if (revision === null) return []
+  return getOrSet({
+    parent: "org",
+    child: "member-teams",
+    id: `${input.organizationId}:${revision}:${input.memberId}`,
+    ttlSeconds: DEFAULT_CACHE_TTL_SECONDS,
+    parse: parseCachedMemberTeams,
+    load: input.load,
+  })
+}
+
+const DEFAULT_CACHE_TTL_SECONDS = 60
+const ORG_CACHE_TTL_SECONDS = 5 * 60
+const AUTH_SESSION_MAX_TTL_SECONDS = 60 * 60
+const redisClient = env.databaseRedisUrl
+  ? new Redis(env.databaseRedisUrl, {
+      lazyConnect: true,
+      maxRetriesPerRequest: 2,
+    })
+  : null
+
+redisClient?.on("error", (error) => {
+  console.error("idexal_os_cache_redis_error", error)
+})
+
+let activeRedisClient: CacheRedisClient | null = redisClient
+let activeOrgMembersLoader = loadOrgMembers
+let activeOrgMembershipLoader = loadOrgMembership
+let activeAuthSessionLoader = loadAuthSession
+let activeAuthSessionIdLoader = loadActiveSessionId
+let activeAuthGrantLoader = loadActiveGrant
+
+function cacheKey(input: CacheKeyInput) {
+  return `cache:${input.parent}:${input.child}:${input.id}`
+}
+
+function hashCacheId(id: string) {
+  return createHash("sha256").update(id).digest("hex").slice(0, 12)
+}
+
+function cacheLogDetails(input: CacheKeyInput) {
+  return input.parent === "auth" && (input.child === "session" || input.child === "session-revoked")
+    ? { cacheParent: input.parent, cacheChild: input.child, idHash: hashCacheId(input.id) }
+    : { cacheParent: input.parent, cacheChild: input.child, id: input.id }
+}
+
+async function setUnlessRevoked(input: {
+  redis: CacheRedisClient
+  key: string
+  revokedKey: string
+  value: string
+  ttlSeconds: number
+}) {
+  if (input.redis.eval) {
+    const result = await input.redis.eval(
+      "if redis.call('exists', KEYS[2]) == 1 then return 0 else redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[2]) return 1 end",
+      2,
+      input.key,
+      input.revokedKey,
+      input.value,
+      input.ttlSeconds,
+    )
+    return result === 1
+  }
+
+  if (await input.redis.get(input.revokedKey)) {
+    return false
+  }
+  await input.redis.set(input.key, input.value, "EX", input.ttlSeconds)
+  if (await input.redis.get(input.revokedKey)) {
+    await input.redis.del(input.key)
+    return false
+  }
+  return true
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
+}
+
+function readString(value: unknown) {
+  return typeof value === "string" ? value : null
+}
+
+function readNullableString(value: unknown) {
+  return value === null || value === undefined ? null : readString(value)
+}
+
+function readDate(value: unknown) {
+  if (value instanceof Date && Number.isFinite(value.getTime())) {
+    return value
+  }
+  if (typeof value !== "string" && typeof value !== "number") {
+    return null
+  }
+  const date = new Date(value)
+  return Number.isFinite(date.getTime()) ? date : null
+}
+
+function readDenId<TName extends DenTypeIdName>(name: TName, value: unknown) {
+  const id = readString(value)
+  if (!id) {
+    return null
+  }
+  try {
+    return normalizeDenTypeId(name, id)
+  } catch {
+    return null
+  }
+}
+
+function readNullableDenId<TName extends DenTypeIdName>(name: TName, value: unknown) {
+  return value === null || value === undefined ? null : readDenId(name, value)
+}
+
+function getInvitedMemberName(email: string) {
+  return email.slice(0, email.indexOf("@")) || "Invited member"
+}
+
+function parseCachedOrgMember(value: unknown): CachedOrgMember | null {
+  if (!isRecord(value) || !isRecord(value.user)) {
+    return null
+  }
+
+  const id = readDenId("member", value.id)
+  const userId = readNullableDenId("user", value.userId)
+  const inviteId = readNullableDenId("invitation", value.inviteId)
+  const role = readString(value.role)
+  const createdAt = readDate(value.createdAt)
+  const joinedAt = value.joinedAt === null || value.joinedAt === undefined ? null : readDate(value.joinedAt)
+  const userIdValue = readDenId("user", value.user.id) ?? readDenId("member", value.user.id)
+  const email = readString(value.user.email)
+  const name = readString(value.user.name)
+  if (!id || !role || !createdAt || joinedAt === undefined || !userIdValue || !email || !name) {
+    return null
+  }
+
+  return {
+    id,
+    userId,
+    inviteId,
+    role,
+    createdAt,
+    joinedAt,
+    isOwner: typeof value.isOwner === "boolean" ? value.isOwner : roleIncludesOwner(role),
+    user: {
+      id: userIdValue,
+      email,
+      name,
+      image: readNullableString(value.user.image),
+    },
+  }
+}
+
+function parseCachedOrgMembers(raw: string | null) {
+  if (!raw) {
+    return null
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return null
+  }
+
+  if (!Array.isArray(parsed)) {
+    return null
+  }
+
+  const members = parsed.map(parseCachedOrgMember)
+  return members.every((member) => member !== null) ? members : null
+}
+
+function parseCachedOrgMembership(raw: string | null): CachedOrgMembership | null {
+  if (!raw) {
+    return null
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (!isRecord(parsed)) {
+    return null
+  }
+
+  const id = readDenId("member", parsed.id)
+  const role = readString(parsed.role)
+  const isOwner = typeof parsed.isOwner === "boolean" ? parsed.isOwner : null
+  return id && role && isOwner !== null ? { id, role, isOwner } : null
+}
+
+function parseJsonRecord(raw: string | null): Record<string, unknown> | null {
+  if (!raw) {
+    return null
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  return isRecord(parsed) && !Array.isArray(parsed) ? parsed : null
+}
+
+// Unknown keys (a feature removed from the registry since the write) are
+// dropped, as the database readers drop them; a malformed value rejects the entry.
+function parseCachedFeatureRollouts(raw: string | null): FeatureRollouts | null {
+  const parsed = parseJsonRecord(raw)
+  if (!parsed) {
+    return null
+  }
+  const rollouts: FeatureRollouts = {}
+  for (const [key, value] of Object.entries(parsed)) {
+    if (!isRecord(value) || typeof value.enabled !== "boolean" || typeof value.killed !== "boolean") {
+      return null
+    }
+    if (isFeatureKey(key)) rollouts[key] = { enabled: value.enabled, killed: value.killed }
+  }
+  return rollouts
+}
+
+function parseCachedFeatureOverrides(raw: string | null): FeatureOverrides | null {
+  const parsed = parseJsonRecord(raw)
+  if (!parsed) {
+    return null
+  }
+  const overrides: FeatureOverrides = {}
+  for (const [key, value] of Object.entries(parsed)) {
+    if (typeof value !== "boolean") {
+      return null
+    }
+    if (isFeatureKey(key)) overrides[key] = value
+  }
+  return overrides
+}
+
+function parseCachedActiveSessionId(raw: string | null) {
+  if (!raw) {
+    return null
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (!isRecord(parsed)) {
+    return null
+  }
+
+  const id = readDenId("session", parsed.id)
+  const expiresAt = readDate(parsed.expiresAt)
+  return id && expiresAt && expiresAt > new Date() ? { id, expiresAt } : null
+}
+
+function parseCachedActiveGrant(raw: string | null) {
+  if (!raw) {
+    return null
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (!isRecord(parsed)) {
+    return null
+  }
+
+  const id = readDenId("oauthConsent", parsed.id)
+  return id ? { id } : null
+}
+
+function parseCachedAuthSession(raw: string | null, now: Date): CachedAuthSession | null {
+  if (!raw) {
+    return null
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (!isRecord(parsed) || !isRecord(parsed.session) || !isRecord(parsed.user)) {
+    return null
+  }
+
+  const session = parsed.session
+  const user = parsed.user
+  const id = readDenId("session", session.id)
+  const token = readString(session.token)
+  const userId = readDenId("user", session.userId)
+  const expiresAt = readDate(session.expiresAt)
+  const createdAt = readDate(session.createdAt)
+  const updatedAt = readDate(session.updatedAt)
+  const normalizedUserId = readDenId("user", user.id)
+  const name = readString(user.name)
+  const email = readString(user.email)
+  const emailVerified = typeof user.emailVerified === "boolean" ? user.emailVerified : null
+  const userCreatedAt = readDate(user.createdAt)
+  const userUpdatedAt = readDate(user.updatedAt)
+  if (!id || !token || !userId || !expiresAt || expiresAt <= now || !createdAt || !updatedAt
+    || !normalizedUserId || !name || !email || emailVerified === null || !userCreatedAt || !userUpdatedAt) {
+    return null
+  }
+
+  return {
+    session: {
+      id,
+      token,
+      userId,
+      activeOrganizationId: readNullableDenId("organization", session.activeOrganizationId),
+      activeTeamId: readNullableDenId("team", session.activeTeamId),
+      expiresAt,
+      createdAt,
+      updatedAt,
+      ipAddress: readNullableString(session.ipAddress),
+      userAgent: readNullableString(session.userAgent),
+    },
+    user: {
+      id: normalizedUserId,
+      name,
+      email,
+      emailVerified,
+      image: readNullableString(user.image),
+      createdAt: userCreatedAt,
+      updatedAt: userUpdatedAt,
+    },
+  }
+}
+
+async function getOrSet<T>(input: {
+  parent: CacheParent
+  child: CacheChild
+  id: string
+  ttlSeconds?: number
+  parse: (raw: string | null) => T | null
+  load: () => Promise<T>
+}) {
+  const redis = activeRedisClient
+  if (!redis) {
+    return input.load()
+  }
+
+  const key = cacheKey(input)
+  try {
+    const cached = input.parse(await redis.get(key))
+    if (cached) {
+      return cached
+    }
+  } catch (error) {
+    console.error("idexal_os_cache_get_failed", { key, error })
+  }
+
+  const loaded = await input.load()
+  try {
+    await redis.set(key, JSON.stringify(loaded), "EX", input.ttlSeconds ?? DEFAULT_CACHE_TTL_SECONDS)
+  } catch (error) {
+    console.error("idexal_os_cache_set_failed", { key, error })
+  }
+  return loaded
+}
+
+async function loadOrgMembers(organizationId: OrgId): Promise<CachedOrgMember[]> {
+  const members = await db
+    .select({
+      id: MemberTable.id,
+      userId: MemberTable.userId,
+      inviteId: MemberTable.inviteId,
+      role: MemberTable.role,
+      createdAt: MemberTable.createdAt,
+      joinedAt: MemberTable.joinedAt,
+      user: {
+        id: AuthUserTable.id,
+        email: AuthUserTable.email,
+        name: AuthUserTable.name,
+        image: AuthUserTable.image,
+      },
+      invitation: {
+        email: InvitationTable.email,
+      },
+    })
+    .from(MemberTable)
+    .leftJoin(AuthUserTable, eq(MemberTable.userId, AuthUserTable.id))
+    .leftJoin(InvitationTable, eq(MemberTable.inviteId, InvitationTable.id))
+    .where(and(eq(MemberTable.organizationId, organizationId), peopleMemberCondition()))
+    .orderBy(asc(MemberTable.createdAt))
+
+  return members.map((member) => {
+    const email = member.user?.email ?? member.invitation?.email ?? "invited@example.com"
+    const name = member.user?.name ?? getInvitedMemberName(email)
+    return {
+      id: member.id,
+      userId: member.userId,
+      inviteId: member.inviteId,
+      role: member.role,
+      createdAt: member.createdAt,
+      joinedAt: member.joinedAt,
+      isOwner: roleIncludesOwner(member.role),
+      user: {
+        id: member.user?.id ?? member.id,
+        email,
+        name,
+        image: member.user?.image ?? null,
+      },
+    }
+  })
+}
+
+async function loadAuthSession(token: string, now: Date): Promise<CachedAuthSession | null> {
+  const rows = await db
+    .select({
+      session: {
+        id: AuthSessionTable.id,
+        token: AuthSessionTable.token,
+        userId: AuthSessionTable.userId,
+        activeOrganizationId: AuthSessionTable.activeOrganizationId,
+        activeTeamId: AuthSessionTable.activeTeamId,
+        expiresAt: AuthSessionTable.expiresAt,
+        createdAt: AuthSessionTable.createdAt,
+        updatedAt: AuthSessionTable.updatedAt,
+        ipAddress: AuthSessionTable.ipAddress,
+        userAgent: AuthSessionTable.userAgent,
+      },
+      user: {
+        id: AuthUserTable.id,
+        name: AuthUserTable.name,
+        email: AuthUserTable.email,
+        emailVerified: AuthUserTable.emailVerified,
+        image: AuthUserTable.image,
+        createdAt: AuthUserTable.createdAt,
+        updatedAt: AuthUserTable.updatedAt,
+      },
+    })
+    .from(AuthSessionTable)
+    .innerJoin(AuthUserTable, eq(AuthSessionTable.userId, AuthUserTable.id))
+    .where(and(eq(AuthSessionTable.token, token), gt(AuthSessionTable.expiresAt, now)))
+    .limit(1)
+
+  const row = rows[0]
+  if (!row) {
+    return null
+  }
+  return {
+    session: {
+      ...row.session,
+      id: normalizeDenTypeId("session", row.session.id),
+      userId: normalizeDenTypeId("user", row.session.userId),
+      activeOrganizationId: row.session.activeOrganizationId
+        ? normalizeDenTypeId("organization", row.session.activeOrganizationId)
+        : null,
+      activeTeamId: row.session.activeTeamId ? normalizeDenTypeId("team", row.session.activeTeamId) : null,
+    },
+    user: {
+      ...row.user,
+      id: normalizeDenTypeId("user", row.user.id),
+    },
+  }
+}
+
+async function loadActiveSessionId(sessionId: DenTypeId<"session">, now: Date) {
+  const nextExpiresAt = getDenSessionExpiresAt(now)
+  await db
+    .update(AuthSessionTable)
+    .set({
+      expiresAt: nextExpiresAt,
+      updatedAt: now,
+    })
+    .where(and(
+      eq(AuthSessionTable.id, sessionId),
+      gt(AuthSessionTable.expiresAt, now),
+      lte(AuthSessionTable.expiresAt, getDenSessionRefreshCutoff(now)),
+      lt(AuthSessionTable.expiresAt, nextExpiresAt),
+    ))
+
+  const rows = await db
+    .select({
+      id: AuthSessionTable.id,
+      expiresAt: AuthSessionTable.expiresAt,
+    })
+    .from(AuthSessionTable)
+    .where(and(eq(AuthSessionTable.id, sessionId), gt(AuthSessionTable.expiresAt, now)))
+    .limit(1)
+
+  const row = rows[0]
+  if (!row) {
+    return null
+  }
+  return {
+    id: normalizeDenTypeId("session", row.id),
+    expiresAt: row.expiresAt,
+  }
+}
+
+async function loadActiveGrant(grantId: OAuthConsentId) {
+  const rows = await db
+    .select({ id: OAuthConsentTable.id })
+    .from(OAuthConsentTable)
+    .where(eq(OAuthConsentTable.id, grantId))
+    .limit(1)
+
+  const row = rows[0]
+  return row ? { id: normalizeDenTypeId("oauthConsent", row.id) } : null
+}
+
+async function loadOrgMembership(input: { organizationId: OrgId; userId: UserId }): Promise<CachedOrgMembership | null> {
+  const rows = await db
+    .select({ id: MemberTable.id, role: MemberTable.role })
+    .from(MemberTable)
+    .where(and(
+      eq(MemberTable.userId, input.userId),
+      eq(MemberTable.organizationId, input.organizationId),
+      isNull(MemberTable.removedAt),
+    ))
+    .limit(1)
+  const member = rows[0]
+  return member ? { id: member.id, role: member.role, isOwner: roleIncludesOwner(member.role) } : null
+}
+
+const FEATURES_GENERATION_KEY = cacheKey({ parent: "features", child: "generation", id: "deployment" })
+
+function logFeatureCacheError(stage: "get" | "set", child: CacheChild, id: string, error: unknown) {
+  console.error(`idexal_os_cache_${stage}_failed`, { cacheParent: "features", cacheChild: child, id, error })
+}
+
+/**
+ * Feature flags are resolved on every org request. Every replica shares one
+ * generation for all feature rows, bumped by den-api's feature writers
+ * (features.ts updateFeatureRollout / updateOrganizationFeatureOverrides) after
+ * the write. Successful bumps invalidate every replica immediately; the TTL
+ * bounds failed bumps and external writes for ordinary flags. Permission
+ * authorization MUST use features.ts, which overrides cached permissions with
+ * a live database read regardless of whether invalidation succeeded.
+ */
+const featureRolloutsEntry: GenerationCacheEntry<FeatureRollouts> = {
+  entryKey: (generation) => cacheKey({ parent: "features", child: "rollouts", id: generation }),
+  parse: parseCachedFeatureRollouts,
+  load: () => readFeatureRollouts(db),
+}
+
+function featureOverridesEntry(organizationId: OrgId): GenerationCacheEntry<FeatureOverrides> {
+  return {
+    entryKey: (generation) => cacheKey({ parent: "features", child: "overrides", id: `${generation}:${organizationId}` }),
+    parse: parseCachedFeatureOverrides,
+    load: () => readOrganizationFeatureOverrides(db, organizationId),
+  }
+}
+
+function getFeatureRollouts(): Promise<FeatureRollouts> {
+  return readThroughGeneration({
+    redis: activeRedisClient,
+    generationKey: FEATURES_GENERATION_KEY,
+    ttlSeconds: DEFAULT_CACHE_TTL_SECONDS,
+    ...featureRolloutsEntry,
+    onError: (stage, error) => logFeatureCacheError(stage, "rollouts", "deployment", error),
+  })
+}
+
+function getOrganizationFeatureOverrides(organizationId: OrgId): Promise<FeatureOverrides> {
+  return readThroughGeneration({
+    redis: activeRedisClient,
+    generationKey: FEATURES_GENERATION_KEY,
+    ttlSeconds: DEFAULT_CACHE_TTL_SECONDS,
+    ...featureOverridesEntry(organizationId),
+    onError: (stage, error) => logFeatureCacheError(stage, "overrides", organizationId, error),
+  })
+}
+
+/** Rollouts and one organization's overrides together: one Redis round trip while the generation is unchanged. */
+async function getOrganizationFeatureState(organizationId: OrgId): Promise<{ rollouts: FeatureRollouts; overrides: FeatureOverrides }> {
+  const [rollouts, overrides] = await readManyThroughGeneration<[FeatureRollouts, FeatureOverrides]>({
+    redis: activeRedisClient,
+    generationKey: FEATURES_GENERATION_KEY,
+    entries: [featureRolloutsEntry, featureOverridesEntry(organizationId)],
+    ttlSeconds: DEFAULT_CACHE_TTL_SECONDS,
+    onError: (stage, error) => logFeatureCacheError(stage, "generation", organizationId, error),
+  })
+  return { rollouts, overrides }
+}
+
+async function invalidateFeatures() {
+  const redis = activeRedisClient
+  if (!redis) {
+    return
+  }
+  try {
+    await bumpGeneration(redis, FEATURES_GENERATION_KEY)
+  } catch (error) {
+    console.error("idexal_os_cache_delete_failed", { cacheParent: "features", cacheChild: "generation", error })
+  }
+}
+
+async function getAuthSessionResult(token: string): Promise<CacheResult<CachedAuthSession | null>> {
+  const now = new Date()
+  const keyInput = { parent: "auth", child: "session", id: token } as const
+  const revokedKeyInput = { parent: "auth", child: "session-revoked", id: token } as const
+  const key = cacheKey(keyInput)
+  const revokedKey = cacheKey(revokedKeyInput)
+  const redis = activeRedisClient
+  if (redis) {
+    try {
+      if (await redis.get(revokedKey)) {
+        return { value: null, source: "cache" }
+      }
+      const cached = parseCachedAuthSession(await redis.get(key), now)
+      if (cached) {
+        return { value: cached, source: "cache" }
+      }
+    } catch (error) {
+      console.error("idexal_os_cache_get_failed", { ...cacheLogDetails(keyInput), error })
+    }
+  }
+
+  const loaded = await activeAuthSessionLoader(token, now)
+  if (!loaded || !redis) {
+    return { value: loaded, source: "loader" }
+  }
+
+  const ttl = Math.min(AUTH_SESSION_MAX_TTL_SECONDS, Math.ceil((loaded.session.expiresAt.getTime() - now.getTime()) / 1000))
+  if (ttl > 0) {
+    try {
+      await setUnlessRevoked({ redis, key, revokedKey, value: JSON.stringify(loaded), ttlSeconds: ttl })
+    } catch (error) {
+      console.error("idexal_os_cache_set_failed", { ...cacheLogDetails(keyInput), error })
+    }
+  }
+  return { value: loaded, source: "loader" }
+}
+
+async function getAuthSession(token: string) {
+  return (await getAuthSessionResult(token)).value
+}
+
+async function getActiveSessionId(sessionId: DenTypeId<"session">) {
+  const now = new Date()
+  const keyInput = { parent: "auth", child: "session-id", id: sessionId } as const
+  const revokedKeyInput = { parent: "auth", child: "session-id-revoked", id: sessionId } as const
+  const key = cacheKey(keyInput)
+  const revokedKey = cacheKey(revokedKeyInput)
+  const redis = activeRedisClient
+  if (redis) {
+    try {
+      if (await redis.get(revokedKey)) {
+        return null
+      }
+      const cached = parseCachedActiveSessionId(await redis.get(key))
+      if (cached) {
+        return cached
+      }
+    } catch (error) {
+      console.error("idexal_os_cache_get_failed", { ...cacheLogDetails(keyInput), error })
+    }
+  }
+
+  const loaded = await activeAuthSessionIdLoader(sessionId, now)
+  if (!loaded || !redis) {
+    return loaded
+  }
+
+  const ttl = Math.min(DEFAULT_CACHE_TTL_SECONDS, Math.ceil((loaded.expiresAt.getTime() - now.getTime()) / 1000))
+  if (ttl > 0) {
+    try {
+      await setUnlessRevoked({ redis, key, revokedKey, value: JSON.stringify(loaded), ttlSeconds: ttl })
+    } catch (error) {
+      console.error("idexal_os_cache_set_failed", { ...cacheLogDetails(keyInput), error })
+    }
+  }
+  return loaded
+}
+
+async function getActiveGrant(grantId: OAuthConsentId) {
+  const keyInput: CacheKeyInput = { parent: "auth", child: "grant", id: grantId }
+  const revokedKeyInput: CacheKeyInput = { parent: "auth", child: "grant-revoked", id: grantId }
+  const key = cacheKey(keyInput)
+  const revokedKey = cacheKey(revokedKeyInput)
+  const redis = activeRedisClient
+  if (redis) {
+    try {
+      if (await redis.get(revokedKey)) {
+        return null
+      }
+      const cached = parseCachedActiveGrant(await redis.get(key))
+      if (cached) {
+        return cached
+      }
+    } catch (error) {
+      console.error("idexal_os_cache_get_failed", { ...cacheLogDetails(keyInput), error })
+    }
+  }
+
+  const loaded = await activeAuthGrantLoader(grantId)
+  if (!loaded || !redis) {
+    return loaded
+  }
+
+  try {
+    await setUnlessRevoked({ redis, key, revokedKey, value: JSON.stringify(loaded), ttlSeconds: DEFAULT_CACHE_TTL_SECONDS })
+  } catch (error) {
+    console.error("idexal_os_cache_set_failed", { ...cacheLogDetails(keyInput), error })
+  }
+  return loaded
+}
+
+async function deleteAuthSession(token: string) {
+  const keyInput = { parent: "auth", child: "session", id: token } as const
+  const key = cacheKey(keyInput)
+  try {
+    const cached = parseCachedAuthSession(await activeRedisClient?.get(key) ?? null, new Date())
+    await activeRedisClient?.del(key)
+    if (cached) {
+      await deleteAuthSessionId(cached.session.id)
+    }
+  } catch (error) {
+    console.error("idexal_os_cache_delete_failed", { ...cacheLogDetails(keyInput), error })
+  }
+}
+
+async function revokeAuthSession(token: string) {
+  const revokedKeyInput = { parent: "auth", child: "session-revoked", id: token } as const
+  // Revocation tombstones stop a concurrent cache-miss loader from repopulating
+  // a deleted session without adding a live DB check to cache hits. Write the
+  // tombstone and delete the entry independently, as revokeAuthGrant does:
+  // Redis can refuse writes (out of memory) while it still accepts deletes.
+  try {
+    await activeRedisClient?.set(cacheKey(revokedKeyInput), "1", "EX", AUTH_SESSION_MAX_TTL_SECONDS)
+  } catch (error) {
+    console.error("idexal_os_cache_delete_failed", { ...cacheLogDetails(revokedKeyInput), error })
+  }
+  await deleteAuthSession(token)
+}
+
+async function deleteAuthSessionId(sessionId: DenTypeId<"session">) {
+  const keyInput = { parent: "auth", child: "session-id", id: sessionId } as const
+  try {
+    await activeRedisClient?.del(cacheKey(keyInput))
+  } catch (error) {
+    console.error("idexal_os_cache_delete_failed", { ...cacheLogDetails(keyInput), error })
+  }
+}
+
+async function revokeAuthSessionId(sessionId: DenTypeId<"session">) {
+  const revokedKeyInput = { parent: "auth", child: "session-id-revoked", id: sessionId } as const
+  try {
+    await activeRedisClient?.set(cacheKey(revokedKeyInput), "1", "EX", AUTH_SESSION_MAX_TTL_SECONDS)
+  } catch (error) {
+    console.error("idexal_os_cache_delete_failed", { ...cacheLogDetails(revokedKeyInput), error })
+  }
+  await deleteAuthSessionId(sessionId)
+}
+
+async function revokeAuthGrant(grantId: OAuthConsentId) {
+  const keyInput: CacheKeyInput = { parent: "auth", child: "grant", id: grantId }
+  const revokedKeyInput: CacheKeyInput = { parent: "auth", child: "grant-revoked", id: grantId }
+  // The database row is already gone; these writes only bound cache staleness.
+  // Attempt both independently so a failed tombstone write still clears the
+  // positive entry — a lone tombstone or a lone delete each end acceptance,
+  // and a total Redis outage converges at the positive entry's TTL.
+  try {
+    await activeRedisClient?.set(cacheKey(revokedKeyInput), "1", "EX", AUTH_SESSION_MAX_TTL_SECONDS)
+  } catch (error) {
+    console.error("idexal_os_cache_delete_failed", { ...cacheLogDetails(revokedKeyInput), error })
+  }
+  try {
+    await activeRedisClient?.del(cacheKey(keyInput))
+  } catch (error) {
+    console.error("idexal_os_cache_delete_failed", { ...cacheLogDetails(keyInput), error })
+  }
+}
+
+async function deleteByPrefix(prefix: string) {
+  const redis = activeRedisClient
+  if (!redis?.scan) {
+    return
+  }
+
+  let cursor = "0"
+  do {
+    const [nextCursor, keys] = await redis.scan(cursor, "MATCH", `${prefix}*`, "COUNT", 500)
+    cursor = nextCursor
+    if (keys.length > 0) {
+      await redis.del(...keys)
+    }
+  } while (cursor !== "0")
+}
+
+async function deleteOrgMemberList(organizationId: OrgId) {
+  const key = cacheKey({ parent: "org", child: "members", id: organizationId })
+  try {
+    await activeRedisClient?.del(key)
+  } catch (error) {
+    console.error("idexal_os_cache_delete_failed", { key, error })
+  }
+}
+
+async function deleteOrgMembers(organizationId: OrgId) {
+  const key = cacheKey({ parent: "org", child: "members", id: organizationId })
+  try {
+    await activeRedisClient?.del(key)
+    await deleteByPrefix(cacheKey({ parent: "org", child: "member", id: `${organizationId}:` }))
+  } catch (error) {
+    console.error("idexal_os_cache_delete_failed", { key, error })
+  }
+}
+
+async function deleteOrgMembership(input: { organizationId: OrgId; userId: UserId }) {
+  const keyInput = { parent: "org", child: "member", id: `${input.organizationId}:${input.userId}` } as const
+  try {
+    await activeRedisClient?.del(cacheKey(keyInput))
+  } catch (error) {
+    console.error("idexal_os_cache_delete_failed", { ...cacheLogDetails(keyInput), error })
+  }
+}
+
+async function revokeOrgMembership(input: { organizationId: OrgId; userId: UserId }) {
+  const id = `${input.organizationId}:${input.userId}`
+  const keyInput = { parent: "org", child: "member", id } as const
+  const revokedKeyInput = { parent: "org", child: "member-revoked", id } as const
+  // A membership can come back (re-invite), so the tombstone never denies: it
+  // only stops a loader that read the old row from caching it again, for as long
+  // as that entry could live. Reads in that window go to the database.
+  try {
+    await activeRedisClient?.set(cacheKey(revokedKeyInput), "1", "EX", ORG_CACHE_TTL_SECONDS)
+  } catch (error) {
+    console.error("idexal_os_cache_delete_failed", { ...cacheLogDetails(revokedKeyInput), error })
+  }
+  await deleteOrgMembership(input)
+}
+
+async function getOrgMembership(input: { organizationId: OrgId; userId: UserId }) {
+  const id = `${input.organizationId}:${input.userId}`
+  const keyInput = { parent: "org", child: "member", id } as const
+  const key = cacheKey(keyInput)
+  const redis = activeRedisClient
+  if (redis) {
+    try {
+      const cached = parseCachedOrgMembership(await redis.get(key))
+      if (cached) {
+        return cached
+      }
+    } catch (error) {
+      console.error("idexal_os_cache_get_failed", { ...cacheLogDetails(keyInput), error })
+    }
+  }
+
+  const loaded = await activeOrgMembershipLoader(input)
+  if (!loaded || !redis) {
+    return loaded
+  }
+
+  try {
+    await setUnlessRevoked({
+      redis,
+      key,
+      revokedKey: cacheKey({ parent: "org", child: "member-revoked", id }),
+      value: JSON.stringify(loaded),
+      ttlSeconds: ORG_CACHE_TTL_SECONDS,
+    })
+  } catch (error) {
+    console.error("idexal_os_cache_set_failed", { ...cacheLogDetails(keyInput), error })
+  }
+  return loaded
+}
+
+async function deleteAuthSessionsForUser(userId: UserId) {
+  const sessions = await db
+    .select({ id: AuthSessionTable.id, token: AuthSessionTable.token })
+    .from(AuthSessionTable)
+    .where(eq(AuthSessionTable.userId, userId))
+  await Promise.all(sessions.flatMap((session) => [deleteAuthSession(session.token), deleteAuthSessionId(normalizeDenTypeId("session", session.id))]))
+}
+
+/**
+ * Shared Den API read-through cache.
+ *
+ * All entries use the Redis URL configured by DATABASE_REDIS_URL, but live
+ * outside Better Auth's keyspace. Keys are intentionally predictable:
+ * `cache:${cacheParent}:${cacheChild}:${id}`.
+ *
+ * Add expensive read helpers here instead of scattering ad-hoc Redis calls.
+ * Every getter must be safe when Redis is absent: it should run its DB loader,
+ * attempt to populate Redis when available, and return the loaded value either
+ * way. Auth sessions are DB-authoritative and cached for at most one hour;
+ * Cached hits must not perform live DB checks. Any operation that changes the
+ * source rows instead calls the dedicated invalidators below: user sign-out and
+ * session mutation clear auth session keys; consent deletion writes grant
+ * tombstones; org deletion, member removal, member addition, role transfer, and
+ * role edits clear org member/membership keys, and every membership credential
+ * revocation also writes a membership tombstone.
+ */
+function inventoryGenerationKey(organizationId: string) {
+  return cacheKey({ parent: "org", child: "inventory-generation", id: organizationId })
+}
+
+/**
+ * An opaque value that changes whenever the organization's member inventory
+ * may have changed: its inventory generation (bumped after writes, see
+ * inventory-writes.ts), the feature flag generation, and the running build.
+ * Null when Redis is not configured or cannot answer, so callers reload.
+ */
+async function getInventoryRevision(organizationId: OrgId): Promise<string | null> {
+  const redis = activeRedisClient
+  if (!redis) return null
+  try {
+    const keys = [inventoryGenerationKey(organizationId), FEATURES_GENERATION_KEY]
+    const [inventory, features] = redis.mget ? await redis.mget(...keys) : await Promise.all(keys.map((key) => redis.get(key)))
+    return createHash("sha256").update(JSON.stringify([inventory ?? "0", features ?? "0", env.serviceVersion])).digest("hex").slice(0, 32)
+  } catch (error) {
+    console.error("idexal_os_cache_get_failed", { cacheParent: "org", cacheChild: "inventory-generation", id: organizationId, error })
+    return null
+  }
+}
+
+/** Call only after the writes have committed (at the end of the request). */
+async function bumpInventoryRevisions(organizationIds: string[]) {
+  const redis = activeRedisClient
+  if (!redis || organizationIds.length === 0) return
+  await Promise.all(organizationIds.map(async (organizationId) => {
+    try {
+      await bumpGeneration(redis, inventoryGenerationKey(organizationId))
+    } catch (error) {
+      console.error("idexal_os_cache_delete_failed", { cacheParent: "org", cacheChild: "inventory-generation", id: organizationId, error })
+    }
+  }))
+}
+
+export const cache = {
+  auth: {
+    session: getAuthSession,
+    sessionResult: getAuthSessionResult,
+    activeSessionId: getActiveSessionId,
+    grant: getActiveGrant,
+    deleteSession: deleteAuthSession,
+    revokeSession: revokeAuthSession,
+    deleteSessionId: deleteAuthSessionId,
+    revokeSessionId: revokeAuthSessionId,
+    revokeGrant: revokeAuthGrant,
+    deleteSessionsForUser: deleteAuthSessionsForUser,
+  },
+  org: {
+    membership: getOrgMembership,
+    members(organizationId: OrgId) {
+      return getOrSet({
+        parent: "org",
+        child: "members",
+        id: organizationId,
+        ttlSeconds: ORG_CACHE_TTL_SECONDS,
+        parse: parseCachedOrgMembers,
+        load: () => activeOrgMembersLoader(organizationId),
+      })
+    },
+    deleteMemberList: deleteOrgMemberList,
+    deleteMembers: deleteOrgMembers,
+    deleteMembership: deleteOrgMembership,
+    revokeMembership: revokeOrgMembership,
+    memberTeams: getMemberTeams,
+  },
+  features: {
+    rollouts: getFeatureRollouts,
+    overrides: getOrganizationFeatureOverrides,
+    state: getOrganizationFeatureState,
+    invalidate: invalidateFeatures,
+  },
+  inventory: {
+    revision: getInventoryRevision,
+    bump: bumpInventoryRevisions,
+  },
+}
+
+export function setCacheDependenciesForTest(input: {
+  redis?: CacheRedisClient | null
+  authSessionLoader?: (token: string, now: Date) => Promise<CachedAuthSession | null>
+  orgMembershipLoader?: (input: { organizationId: OrgId; userId: UserId }) => Promise<CachedOrgMembership | null>
+}) {
+  const previousRedis = activeRedisClient
+  const previousAuthSessionLoader = activeAuthSessionLoader
+  const previousOrgMembershipLoader = activeOrgMembershipLoader
+  if ("redis" in input) {
+    activeRedisClient = input.redis ?? null
+  }
+  if (input.authSessionLoader) {
+    activeAuthSessionLoader = input.authSessionLoader
+  }
+  if (input.orgMembershipLoader) {
+    activeOrgMembershipLoader = input.orgMembershipLoader
+  }
+  return () => {
+    activeRedisClient = previousRedis
+    activeAuthSessionLoader = previousAuthSessionLoader
+    activeOrgMembershipLoader = previousOrgMembershipLoader
+  }
+}
+
