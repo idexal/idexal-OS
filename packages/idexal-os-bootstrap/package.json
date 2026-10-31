@@ -1,0 +1,23 @@
+{
+  "name": "idexal-os-bootstrap",
+  "version": "0.1.0",
+  "description": "Script-installable idexal Os bootstrap CLI for agents",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "idexal-os-bootstrap": "bin/idexal-os.mjs"
+  },
+  "files": [
+    "bin",
+    "README.md",
+    "start.md",
+    "migrate.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check bin/idexal-os.mjs && node --check evals/agent-test-evidence-idexal-os-bootstrap.mjs && node --check evals/agent-test-evidence-idexal-os-app-install.mjs && node --check evals/agent-test-evidence-linux-container.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

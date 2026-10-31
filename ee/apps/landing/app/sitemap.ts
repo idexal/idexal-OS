@@ -1,0 +1,33 @@
+import type { MetadataRoute } from "next";
+import { GUIDES_PATH, guidePath, guides } from "../lib/guides";
+
+const BASE_URL = "https://os.idexal.com";
+
+const paths: { path: string; priority: number }[] = [
+  { path: "/", priority: 1 },
+  { path: "/alternatives/claude-cowork", priority: 0.9 },
+  { path: "/alternatives/claude-cowork-3p", priority: 0.8 },
+  { path: GUIDES_PATH, priority: 0.8 },
+  ...guides.map((guide) => ({ path: guidePath(guide), priority: 0.8 })),
+  { path: "/glm-5.2", priority: 0.8 },
+  { path: "/connect", priority: 0.8 },
+  { path: "/cloud", priority: 0.8 },
+  { path: "/dashboard", priority: 0.8 },
+  { path: "/download", priority: 0.7 },
+  { path: "/enterprise", priority: 0.7 },
+  { path: "/pricing", priority: 0.7 },
+  { path: "/roadmap", priority: 0.7 },
+  { path: "/docs/start-here/migrate-from-claude-cowork", priority: 0.7 },
+  { path: "/trust", priority: 0.7 },
+  { path: "/docs/start-here/get-started", priority: 0.7 },
+  { path: "/privacy", priority: 0.3 },
+  { path: "/terms", priority: 0.3 },
+];
+
+export default function sitemap(): MetadataRoute.Sitemap {
+  return paths.map(({ path, priority }) => ({
+    url: `${BASE_URL}${path}`,
+    changeFrequency: "weekly",
+    priority,
+  }));
+}

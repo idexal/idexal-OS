@@ -1,0 +1,52 @@
+---
+title: "Installer delivery"
+description: "Choose how the install page delivers standard idexal Os desktop installers."
+---
+
+The install page (`/install`) helps members install the standard idexal Os desktop for their Den organization: they sign in, download, then sign in to the app with the same account. Den does not build a customer-specific installer or wrap the installer in a ZIP. The implementation and security details remain in the repository's [Desktop install guide](https://github.com/idexal/idexalOs/blob/dev/docs/org-install-links.md#installer-delivery).
+
+## Delivery matrix
+
+| Deployment style | Download behavior | Required client access |
+| --- | --- | --- |
+| Internet-connected | Den checks the signed-in member's organization, then redirects the browser to the exact GitHub release asset under `IDEXAL_INSTALLER_RELEASE_REPO` for the resolved version (see [Which version is installed](#which-version-is-installed)). | Den web/API, `github.com`, `release-assets.githubusercontent.com`, and `objects.githubusercontent.com` for legacy or rollback paths. |
+| Semi-air-gapped installer delivery | Den streams the matching standard installer from `IDEXAL_INSTALLER_ARTIFACTS_DIR`. | Den web/API only for installer download. Desktop runtime dependencies may still need internet unless mirrored or disabled. |
+| Fully internal installer delivery | Same mounted-artifact path, with Den web/API and installer bytes available entirely inside the isolated network. | Internal Den web/API only for installer download. Full product isolation still requires the broader checklist in [Air-gapped deployment](/start-here/air-gapped-deployment). |
+
+## Mounted artifact behavior
+
+When `IDEXAL_INSTALLER_ARTIFACTS_DIR` points at a mounted directory and the expected file exists, Den streams that file directly. It does not fetch from GitHub, cache on first request, rewrap, ZIP, or hold the whole installer in memory.
+
+The expected filename depends on the deployment. A self-hosted Den (single-org mode, the default) serves the enterprise distribution; the hosted multi-org idexal Os Cloud serves the cloud distribution. The install page never serves the public `idexal-os-<platform>-<version>` filenames. The version in the filename is the resolved release tag without a leading `v`:
+
+- `idexal-os-enterprise-mac-arm64-<version>.dmg`
+- `idexal-os-enterprise-mac-x64-<version>.dmg`
+- `idexal-os-enterprise-win-x64-<version>.exe`
+- `idexal-os-enterprise-linux-x86_64-<version>.AppImage`
+- `idexal-os-enterprise-linux-arm64-<version>.AppImage`
+
+On hosted idexal Os Cloud the prefix is `idexal-os-cloud-` instead of `idexal-os-enterprise-`. A mounted file with any other name is ignored and the request falls through to the GitHub redirect.
+
+`IDEXAL_INSTALLER_RELEASE_REPO` controls the GitHub redirect path when Den does not find a mounted artifact. It is not an internal artifact registry setting.
+
+## Which version is installed
+
+Den resolves one release version per download request, in this order:
+
+1. If the organization's `allowedDesktopVersions` desktop policy is set, the highest listed version wins. This is the way to pin a fleet or to opt into a newer desktop than the Den itself.
+2. Otherwise, if `IDEXAL_INSTALLER_RELEASE_TAG` is set on Den API, that tag wins.
+3. Otherwise, a self-hosted Den running a published release image installs its own release version (the `version` reported by `GET /health` on Den API), so a self-hosted control plane never hands out a desktop newer than itself by default. Hosted idexal Os Cloud, and Den builds without a release version, install the latest published stable release instead.
+
+Mounted artifacts must match the resolved version. When you rely on the default in step 3, place the files for the Den release you run; when you set a policy or an override, place the files for that version.
+
+For multi-replica Den API deployments, mount the same read-only PVC at the same path on every replica. Installer bytes must be equally visible to each replica.
+
+## One-origin steady state
+
+For normal signed-in desktop traffic, prefer one desktop-facing Den web origin. The desktop derives API and MCP paths through that origin's `/api/den` proxy.
+
+If `DEN_API_PUBLIC_URL` is configured as a separate API origin, browsers downloading from the install page and external MCP clients that use the published MCP URL must reach it. This does not mean every steady-state desktop request needs both origins in the single-origin topology.
+
+## Managed fleets: enterprise binary + MDM
+
+This page covers install-link delivery of the standard installer. Managed fleets typically skip the install-link handoff entirely: deploy the **idexal Os Enterprise binary** through MDM and write `desktop-bootstrap.json` during provisioning so the first launch already targets your Den server. See [Enterprise desktop deployment](/start-here/enterprise-desktop-deployment) for the artifact names, bootstrap file reference, and what MDM does not need to push.

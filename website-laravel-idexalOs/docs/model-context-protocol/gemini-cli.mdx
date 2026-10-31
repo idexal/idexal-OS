@@ -1,0 +1,32 @@
+---
+title: "Connect Gemini CLI"
+sidebarTitle: "Gemini CLI"
+description: "Add idexal Os MCP to Gemini CLI with one command: gemini mcp add --transport http idexalos https://api.idexal.com/mcp/agent, then /mcp auth idexal-os."
+---
+
+Give Gemini CLI your organization's idexal Os skills, plugins, and connections.
+
+<Steps>
+<Step title="Add the server">
+
+```sh
+gemini mcp add --transport http idexalos https://api.idexal.com/mcp/agent
+```
+
+</Step>
+<Step title="Sign in">
+Start `gemini`, run `/mcp auth idexalos`, sign in to idexal Os in the browser, and pick your organization.
+</Step>
+<Step title="Try it">
+Ask: "Which idexal Os organization am I connected to?"
+</Step>
+</Steps>
+
+<AccordionGroup>
+  <Accordion title="Switch organizations">
+    Remove the stored `idexalos` token, run `/mcp auth idexalos` again, and pick another organization.
+  </Accordion>
+  <Accordion title="Support status">
+    Setup only: these steps follow idexal Os's OAuth profile, but native end-to-end proof is not complete. See the [MCP Gateway reference](/cloud/run-in-the-cloud/cloud-mcp#reference).
+  </Accordion>
+</AccordionGroup>

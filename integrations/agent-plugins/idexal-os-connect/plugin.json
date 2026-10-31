@@ -1,0 +1,19 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "idexal-os-connect",
+  "version": "1.0.0",
+  "description": "Use the skills, MCP connections, and connected services assigned to you through idexal Os.",
+  "author": {
+    "name": "idexal Os",
+    "url": "https://os.idexal.com"
+  },
+  "homepage": "https://os.idexal.com/docs/cloud/run-in-the-cloud/cloud-mcp",
+  "repository": "https://github.com/idexal/idexalOs",
+  "license": "MIT",
+  "keywords": [
+    "idexalos",
+    "mcp",
+    "agent-skills",
+    "organization"
+  ]
+}

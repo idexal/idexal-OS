@@ -1,0 +1,55 @@
+{
+  "name": "@idexal-ee/cloud-runtime",
+  "private": true,
+  "type": "module",
+  "description": "Provider-neutral contract, bootstrap, and conformance suite for idexal Os Cloud sandbox hosts.",
+  "exports": {
+    ".": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/index.d.ts",
+        "default": "./src/index.ts"
+      },
+      "development": "./src/index.ts",
+      "default": "./dist/index.js"
+    },
+    "./bootstrap": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/bootstrap/index.d.ts",
+        "default": "./src/bootstrap/index.ts"
+      },
+      "development": "./src/bootstrap/index.ts",
+      "default": "./dist/bootstrap/index.js"
+    },
+    "./orchestrator": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/orchestrator/index.d.ts",
+        "default": "./src/orchestrator/index.ts"
+      },
+      "development": "./src/orchestrator/index.ts",
+      "default": "./dist/orchestrator/index.js"
+    },
+    "./testing": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/testing/index.d.ts",
+        "default": "./src/testing/index.ts"
+      },
+      "development": "./src/testing/index.ts",
+      "default": "./dist/testing/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit --pretty false"
+  },
+  "dependencies": {
+    "@idexal/sandbox": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "tsup": "^8.5.0",
+    "typescript": "^5.5.4"
+  },
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "source": "./src/index.ts"
+}

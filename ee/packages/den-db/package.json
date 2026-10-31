@@ -1,0 +1,189 @@
+{
+  "name": "@idexal-ee/den-db",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "source": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/index.d.ts",
+        "default": "./src/index.ts"
+      },
+      "development": "./src/index.ts",
+      "default": "./dist/index.js"
+    },
+    "./schema": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/schema.d.ts",
+        "default": "./src/schema.ts"
+      },
+      "development": "./src/schema.ts",
+      "default": "./dist/schema.js"
+    },
+    "./schema/auth": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/schema/auth.d.ts",
+        "default": "./src/schema/auth.ts"
+      },
+      "development": "./src/schema/auth.ts",
+      "default": "./dist/schema/auth.js"
+    },
+    "./schema/desktop-policies": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/schema/desktop-policies.d.ts",
+        "default": "./src/schema/desktop-policies.ts"
+      },
+      "development": "./src/schema/desktop-policies.ts",
+      "default": "./dist/schema/desktop-policies.js"
+    },
+    "./schema/inference": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/schema/inference.d.ts",
+        "default": "./src/schema/inference.ts"
+      },
+      "development": "./src/schema/inference.ts",
+      "default": "./dist/schema/inference.js"
+    },
+    "./schema/org": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/schema/org.d.ts",
+        "default": "./src/schema/org.ts"
+      },
+      "development": "./src/schema/org.ts",
+      "default": "./dist/schema/org.js"
+    },
+    "./schema/remote-session-commands": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/schema/remote-session-commands.d.ts",
+        "default": "./src/schema/remote-session-commands.ts"
+      },
+      "development": "./src/schema/remote-session-commands.ts",
+      "default": "./dist/schema/remote-session-commands.js"
+    },
+    "./schema/teams": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/schema/teams.d.ts",
+        "default": "./src/schema/teams.ts"
+      },
+      "development": "./src/schema/teams.ts",
+      "default": "./dist/schema/teams.js"
+    },
+    "./schema/subscriptions": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/schema/subscriptions.d.ts",
+        "default": "./src/schema/subscriptions.ts"
+      },
+      "development": "./src/schema/subscriptions.ts",
+      "default": "./dist/schema/subscriptions.js"
+    },
+    "./schema/workers": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/schema/workers.d.ts",
+        "default": "./src/schema/workers.ts"
+      },
+      "development": "./src/schema/workers.ts",
+      "default": "./dist/schema/workers.js"
+    },
+    "./schema/system": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/schema/system.d.ts",
+        "default": "./src/schema/system.ts"
+      },
+      "development": "./src/schema/system.ts",
+      "default": "./dist/schema/system.js"
+    },
+    "./schema/telemetry": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/schema/telemetry.d.ts",
+        "default": "./src/schema/telemetry.ts"
+      },
+      "development": "./src/schema/telemetry.ts",
+      "default": "./dist/schema/telemetry.js"
+    },
+    "./audit-accounting": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/audit-accounting.d.ts",
+        "default": "./src/audit-accounting.ts"
+      },
+      "development": "./src/audit-accounting.ts",
+      "default": "./dist/audit-accounting.js"
+    },
+    "./organization-features": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/organization-features.d.ts",
+        "default": "./src/organization-features.ts"
+      },
+      "development": "./src/organization-features.ts",
+      "default": "./dist/organization-features.js"
+    },
+    "./audit-log": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/audit-log.d.ts",
+        "default": "./src/audit-log.ts"
+      },
+      "development": "./src/audit-log.ts",
+      "default": "./dist/audit-log.js"
+    },
+    "./gateway-usage-limits": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/gateway-usage-limits.d.ts",
+        "default": "./src/gateway-usage-limits.ts"
+      },
+      "development": "./src/gateway-usage-limits.ts",
+      "default": "./dist/gateway-usage-limits.js"
+    },
+    "./permission-states": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/permission-states.d.ts",
+        "default": "./src/permission-states.ts"
+      },
+      "development": "./src/permission-states.ts",
+      "default": "./dist/permission-states.js"
+    },
+    "./permissions": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/permissions.d.ts",
+        "default": "./src/permissions.ts"
+      },
+      "development": "./src/permissions.ts",
+      "default": "./dist/permissions.js"
+    },
+    "./drizzle": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/drizzle.d.ts",
+        "default": "./src/drizzle.ts"
+      },
+      "development": "./src/drizzle.ts",
+      "default": "./dist/drizzle.js"
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:utils": "pnpm --dir ../utils run build",
+    "db:baseline": "node --import tsx scripts/baseline-migrations.ts",
+    "db:migrate:local": "node --import tsx scripts/dev-migrate.ts",
+    "db:bootstrap": "pnpm run build && node dist/scripts/bootstrap.js",
+    "db:generate": "node --conditions=development --import tsx ./node_modules/drizzle-kit/bin.cjs generate --config drizzle.config.ts",
+    "db:migrate": "node --conditions=development --import tsx ./node_modules/drizzle-kit/bin.cjs migrate --config drizzle.config.ts && node --conditions=development --import tsx scripts/ensure-schema-repairs.ts && node --conditions=development --import tsx scripts/reconcile-permissions.ts",
+    "db:push": "node --conditions=development --import tsx ./node_modules/drizzle-kit/bin.cjs push --config drizzle.config.ts && node --conditions=development --import tsx scripts/ensure-schema-repairs.ts && node --conditions=development --import tsx scripts/reconcile-permissions.ts",
+    "db:reconcile-permissions": "node --conditions=development --import tsx scripts/reconcile-permissions.ts",
+    "benchmark:admin-scale:mysql": "node --import tsx scripts/admin-scale-benchmark.ts"
+  },
+  "dependencies": {
+    "@idexal-ee/utils": "workspace:*",
+    "@idexal/features": "workspace:*",
+    "@idexal/types": "workspace:*",
+    "@planetscale/database": "^1.19.0",
+    "drizzle-orm": "^0.45.2",
+    "mysql2": "^3.23.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "drizzle-kit": "^0.31.9",
+    "tsup": "^8.5.0",
+    "tsx": "^4.23.1",
+    "typescript": "^5.5.4"
+  }
+}

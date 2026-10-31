@@ -1,0 +1,157 @@
+---
+title: "Team quickstart: from new org to a team skill"
+description: "Create an idexal Os Cloud organization, invite teammates, publish a skill plugin through a Collection, and use it from the desktop app"
+---
+
+Set up a team on [os.idexal.com](https://os.idexal.com), publish your first skill, and trigger it from the desktop app — in about 15 minutes.
+
+By the end of this walkthrough you will have:
+
+1. Created an organization on idexal Os Cloud.
+2. Invited a few teammates and organized them into teams.
+3. Created a Collection and added a plugin with a simple test skill to it.
+4. Granted the Collection to the relevant team.
+5. Signed in to the org from the idexal Os desktop app and triggered the skill with a plain-language prompt.
+
+<Note>
+**Seats:** every workspace includes **5 free seats**. Team adds unlimited seats and SSO. For early access to analytics, [reach out](mailto:info@idexal.com).
+</Note>
+
+---
+
+## 1. Create your organization
+
+Head to [os.idexal.com](https://os.idexal.com). Enter your work email and press **Next** — idexal Os routes you to the right sign-in step automatically.
+
+<Frame>
+  ![Start using idexal Os — email step](/images/cloud-team-quickstart/01-signin-email.png)
+</Frame>
+
+New emails get the **Create your account.** step. Pick a name and password, then **Sign up**.
+
+<Frame>
+  ![Create your account](/images/cloud-team-quickstart/02-create-account.png)
+</Frame>
+
+Right after sign-up, idexal Os asks you to **name your team**. This creates your organization — you can rename it later, and no credit card is required.
+
+<Frame>
+  ![Name your team](/images/cloud-team-quickstart/03-name-your-team.png)
+</Frame>
+
+You land in the admin dashboard with a short setup checklist. You can follow it now or come back later — this tutorial covers the important parts.
+
+<Frame>
+  ![Setup checklist](/images/cloud-team-quickstart/04-onboarding-checklist.png)
+</Frame>
+
+## 2. Invite teammates and create teams
+
+Open **Members** in the sidebar. Click **Add member**, enter your teammate's email, pick a role (usually Member), and hit **Send invite**. The owner can choose elevated roles; admins can invite only members.
+
+<Frame>
+  ![Invite a teammate](/images/cloud-team-quickstart/05-invite-member-form.png)
+</Frame>
+
+Repeat for a few teammates. Invited people show up as **Pending** until they accept. From the row menu (⋯) you can **Copy invite link**, **Resend invite**, or **Cancel invite**.
+
+<Frame>
+  ![Members list with pending invites](/images/cloud-team-quickstart/06-members-pending.png)
+</Frame>
+
+Your teammate opens the invite link, sets a password, and joins with one click:
+
+<Frame>
+  ![Join screen — what your teammate sees](/images/cloud-team-quickstart/07-join-org-amy.png)
+</Frame>
+
+<Frame>
+  ![Welcome after joining](/images/cloud-team-quickstart/08-amy-welcome.png)
+</Frame>
+
+Now organize people into teams. Switch to the **Teams** tab, click **Create Team**, name it (for example `Sales`), and tap the members who belong in it.
+
+<Frame>
+  ![Create the Sales team](/images/cloud-team-quickstart/09-create-team-sales.png)
+</Frame>
+
+Teams show up with their members at a glance:
+
+<Frame>
+  ![Teams list](/images/cloud-team-quickstart/10-teams-list.png)
+</Frame>
+
+Leave the organization Admin checkbox off for ordinary resource-sharing teams
+such as `Sales`. If a team should grant organization-wide administration, the
+owner must explicitly approve it. See
+[Team Admin access](/cloud/members-and-rbac#team-admin-access).
+
+## 3. Create a plugin with a test skill
+
+Skills are step-by-step instructions the agent loads when a task matches — think of them as runbooks your whole team can share. A skill lives inside a **plugin**, and a **Collection** groups one or more plugins for assignment.
+
+First open **Settings › Advanced › Collections**, click **New collection**, and create one for your team — for example `Sales Enablement`.
+
+The new Collection opens. On its **Plugins** tab, click **Add a plugin**. Fill in the **Plugin name** and **Description**, then click **Skill** under **What's inside**.
+
+Write the skill like a great runbook:
+
+- **Name** — e.g. `Prep a sales call`
+- **Description** — when should the agent use this? e.g. *"Use when someone asks to prepare for a sales call or customer meeting."*
+- **Instructions** — plain markdown with the steps you want the agent to follow.
+
+In the **Share** section, check that **Collection** shows **Sales Enablement**. If only selected teams should receive it, leave **Share with everyone in the organization** off. Click **Create plugin**. The creator keeps access automatically.
+
+## 4. Give teams access to the Collection
+
+Open **Settings › Advanced › Collections › Sales Enablement** and select the **Members** tab. Under **Who can access this**, click **Add team** and pick `Sales`. You can instead turn on access for everyone in the organization or click **Add people**.
+
+That's the whole admin loop: **skill inside a plugin → Collection → team or member**. Anyone added to the team later inherits access to the Collection.
+
+## 5. Trigger the skill from the desktop app
+
+Now switch to the [idexal Os desktop app](https://os.idexal.com). On the welcome screen, click **Joining a team? Sign in** and sign in with the same account.
+
+<Frame>
+  ![Desktop welcome](/images/cloud-team-quickstart/18-desktop-welcome.png)
+</Frame>
+
+Pick your organization:
+
+<Frame>
+  ![Choose your organization](/images/cloud-team-quickstart/19-desktop-choose-org.png)
+</Frame>
+
+You can confirm the connection any time under **Settings › Account**:
+
+<Frame>
+  ![Signed in to Acme Labs](/images/cloud-team-quickstart/21-desktop-account-connected.png)
+</Frame>
+
+Open **Settings › Library** and filter to **Skills**. The skill assigned through `Sales Enablement` appears there automatically; click the refresh button (tooltip **Refresh**) if the admin changed access moments ago.
+
+Now just ask for the thing the skill knows how to do. Type a prompt that matches the skill's description and hit **Run task**:
+
+> *Prep me for tomorrow's sales call with Northwind Traders. 30 minutes with their operations lead, goal is a paid pilot.*
+
+<Frame>
+  ![Prompt that triggers the skill](/images/cloud-team-quickstart/23-desktop-prompt.png)
+</Frame>
+
+The agent picks up the skill and follows your runbook — research, a timed agenda, discovery questions, objection handling, and a clear next step, saved as a doc in your workspace:
+
+<Frame>
+  ![The skill in action](/images/cloud-team-quickstart/24-desktop-skill-result.png)
+</Frame>
+
+## What's next
+
+- Add more skills to the plugin as your team's playbooks grow — everyone gets updates automatically.
+- Import existing plugins from GitHub (open a Collection, click **Add a plugin**, then **Import from GitHub**), including Anthropic-compatible plugin repositories.
+- Wire up **Sources** to keep Collections in sync with a repository.
+- To share a single plugin without a Collection, open it under **Manage › Plugins** and use **Who can use it**. See [Publish and copy a skill](/start-here/do-work-with-it/publish-and-copy-a-skill).
+- Read [Collections](/cloud/share-with-your-team/collections) when you need several plugins, reusable audiences, or more complex assignments.
+
+<Note>
+**Need more?** The first 5 seats are free; additional seats are $10 per seat per month. SSO is included in Team. For early analytics access, [contact us](mailto:info@idexal.com).
+</Note>

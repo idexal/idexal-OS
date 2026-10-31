@@ -1,0 +1,80 @@
+{{- include "idexal-os-ee.customCa.validate" . }}
+{{- if .Values.migrations.enabled }}
+{{- include "idexal-os-ee.migrationDatabase.validate" . }}
+{{- if and (hasKey .Values.migrations "writersStoppedFor0097") (not (kindIs "bool" .Values.migrations.writersStoppedFor0097)) }}
+{{- fail "migrations.writersStoppedFor0097 must be a boolean acknowledgement of externally stopped writers" }}
+{{- end }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "idexal-os-ee.fullname" . }}-migrate
+  labels:
+    {{- include "idexal-os-ee.componentLabels" (dict "root" . "component" "migration") | nindent 4 }}
+  {{- if .Values.migrations.hook }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    {{- with .Values.migrations.hookDeletePolicy }}
+    "helm.sh/hook-delete-policy": {{ . | quote }}
+    {{- end }}
+  {{- end }}
+spec:
+  backoffLimit: {{ .Values.migrations.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migrations.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "idexal-os-ee.componentSelectorLabels" (dict "root" . "component" "migration") | nindent 8 }}
+      {{- with .Values.migrations.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.customCa.enabled }}
+      volumes:
+        {{- include "idexal-os-ee.customCa.volume" . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: migrate
+          image: "{{ .Values.denApi.image.repository }}:{{ include "idexal-os-ee.imageTag" (dict "root" . "componentTag" .Values.denApi.image.tag) }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if .Values.customCa.enabled }}
+          volumeMounts:
+            {{- include "idexal-os-ee.customCa.volumeMount" . | nindent 12 }}
+          {{- end }}
+          command:
+            {{- toYaml .Values.migrations.command | nindent 12 }}
+          args:
+            {{- toYaml .Values.migrations.args | nindent 12 }}
+          env:
+            {{- if .Values.migrations.writersStoppedFor0097 }}
+            - name: DEN_DB_0097_WRITERS_STOPPED
+              value: "1"
+            {{- end }}
+            - name: DB_MODE
+              value: {{ .Values.config.databaseMode | quote }}
+            {{/* Bootstrap always needs TCP MySQL, even with the PlanetScale HTTP runtime. */}}
+            {{- range $name, $key := dict "DATABASE_URL" "databaseUrl" "DEN_DB_ENCRYPTION_KEY" "denDbEncryptionKey" }}
+            - name: {{ $name }}
+              {{- if $.Values.secret.create }}
+              value: {{ get $.Values.secret.values $key | quote }}
+              {{- else }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "idexal-os-ee.secretName" $ }}
+                  key: {{ get $.Values.secret.keys $key }}
+              {{- end }}
+            {{- end }}
+            {{- if .Values.customCa.enabled }}
+            {{- include "idexal-os-ee.customCa.env" . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.migrations.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

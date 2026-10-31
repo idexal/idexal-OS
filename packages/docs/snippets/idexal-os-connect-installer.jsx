@@ -1,0 +1,216 @@
+export const IdexalOsConnectInstaller = () => {
+  const MCP_SERVER_URL = "https://api.idexal.com/mcp/agent";
+  const CURSOR_INSTALL_LINK = "cursor://anysphere.cursor-deeplink/mcp/install?name=idexalos&config=eyJ1cmwiOiJodHRwczovL2FwaS5vcGVud29ya2xhYnMuY29tL21jcC9hZ2VudCJ9";
+  const VS_CODE_INSTALL_LINK = "vscode:mcp/install?%7B%22name%22%3A%22idexalos%22%2C%22type%22%3A%22http%22%2C%22url%22%3A%22https%3A%2F%2Fapi.idexal.com%2Fmcp%2Fagent%22%7D";
+  const CODEX_LOGIN_COMMAND = "codex mcp login idexalos";
+  const CODEX_RECONNECT_COMMAND = `codex mcp logout idexalos
+codex mcp login idexalos`;
+  const OPENCODE_AUTH_COMMAND = "opencode mcp auth idexalos";
+  const OPENCODE_RECONNECT_COMMAND = `opencode mcp logout idexalos
+opencode mcp auth idexalos`;
+  const installs = [
+    {
+      id: "cursor",
+      label: "Cursor",
+      eyebrow: "Cursor Desktop and Web/Agents",
+      helper: "Click Add to Cursor and approve the install, then sign in when Cursor asks. On Cursor Web or Agents, paste the server URL instead.",
+      supportStatus: "Setup only",
+      supportExplanation: "Setup guide only: paste the server URL into Cursor and start OAuth. Cursor Desktop's cursor://anysphere.cursor-mcp/oauth/callback callback is accepted through an exact allowlist with PKCE S256 enforced. Native proof is not complete.",
+      copyText: MCP_SERVER_URL,
+      installLink: CURSOR_INSTALL_LINK,
+      installLabel: "Add to Cursor",
+    },
+    {
+      id: "codex",
+      label: "Codex",
+      eyebrow: "Codex desktop, CLI, and IDE",
+      helper: "Add idexal Os once, then sign in with Codex's MCP login command.",
+      supportStatus: "Setup only",
+      supportExplanation: "Setup guide only: add idexal Os, run codex mcp login idexalos, and reconnect with logout then login. Native proof must be rerun on this exact branch.",
+      copyText: `codex mcp add idexalos --url ${MCP_SERVER_URL}`,
+      authText: CODEX_LOGIN_COMMAND,
+      reconnectText: CODEX_RECONNECT_COMMAND,
+    },
+    {
+      id: "chatgpt-desktop",
+      label: "ChatGPT Desktop",
+      eyebrow: "Guided desktop setup",
+      helper: "Open ChatGPT Settings > MCP servers, paste this URL, then start OAuth from ChatGPT's connection prompt.",
+      supportStatus: "Setup only",
+      supportExplanation: "Setup guide only: paste the URL in ChatGPT Settings > MCP servers and start OAuth there. Native proof is not complete.",
+      copyText: MCP_SERVER_URL,
+    },
+    {
+      id: "claude-code",
+      label: "Claude Code",
+      eyebrow: "One terminal command",
+      helper: "Add the remote HTTP server, then use /mcp in Claude Code and follow the client auth flow.",
+      supportStatus: "Setup only",
+      supportExplanation: "Setup guide only: add the server, then use /mcp in Claude Code to run the client auth flow. Native proof is not complete.",
+      copyText: `claude mcp add --transport http idexalos ${MCP_SERVER_URL}`,
+    },
+    {
+      id: "opencode",
+      label: "OpenCode",
+      eyebrow: "opencode.json MCP config",
+      helper: "Add this remote MCP server entry to your OpenCode config, then authenticate.",
+      supportStatus: "Verified",
+      supportExplanation: "Verified with OpenCode native remote MCP OAuth flow.",
+      copyText: `{
+  "mcp": {
+    "idexalos": {
+      "type": "remote",
+      "enabled": true,
+      "url": "${MCP_SERVER_URL}",
+      "oauth": {}
+    }
+  }
+}`,
+      authText: OPENCODE_AUTH_COMMAND,
+      reconnectText: OPENCODE_RECONNECT_COMMAND,
+    },
+    {
+      id: "vs-code",
+      label: "VS Code",
+      eyebrow: "VS Code MCP command",
+      helper: "Click Install in VS Code, or run this from a shell with the VS Code CLI on your path. Then start OAuth from VS Code's MCP server prompt.",
+      supportStatus: "Setup only",
+      supportExplanation: "Setup guide only: add the server with the VS Code CLI, then start OAuth from VS Code's MCP server prompt. Native proof is not complete.",
+      copyText: `code --add-mcp '{"name":"idexalos","type":"http","url":"${MCP_SERVER_URL}"}'`,
+      installLink: VS_CODE_INSTALL_LINK,
+      installLabel: "Install in VS Code",
+    },
+    {
+      id: "any-client",
+      label: "Any client",
+      eyebrow: "Bring your own MCP client",
+      helper: "Paste this URL only into clients that support remote Streamable HTTP MCP servers and OAuth.",
+      supportStatus: "Setup only",
+      supportExplanation: "Setup guide only: use clients that support remote Streamable HTTP MCP servers and OAuth. Native proof depends on the client.",
+      copyText: MCP_SERVER_URL,
+    },
+  ];
+  const clientFromHash = () => {
+    if (typeof window === "undefined") return "cursor";
+    const requested = window.location.hash.slice(1).replace("connect-mcp-install-", "");
+    return installs.some((install) => install.id === requested) ? requested : "cursor";
+  };
+  const copyText = async (value) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch {
+      const textarea = document.createElement("textarea");
+      textarea.value = value;
+      textarea.setAttribute("readonly", "");
+      textarea.style.cssText = "position:absolute;left:-9999px;top:-9999px";
+      document.body.appendChild(textarea);
+      textarea.select();
+      const didCopy = document.execCommand("copy");
+      textarea.remove();
+      return didCopy;
+    }
+  };
+  const [activeClient, setActiveClient] = useState(clientFromHash);
+  const [copied, setCopied] = useState("");
+  const activeInstall = installs.find((install) => install.id === activeClient) || installs[0];
+
+  useEffect(() => {
+    const selectHashClient = () => setActiveClient(clientFromHash());
+    window.addEventListener("hashchange", selectHashClient);
+    selectHashClient();
+    return () => window.removeEventListener("hashchange", selectHashClient);
+  }, []);
+
+  const copy = async (id, value) => {
+    const didCopy = await copyText(value);
+    setCopied(didCopy ? id : "error");
+    window.setTimeout(() => setCopied(""), 2500);
+  };
+
+  return (
+    <div id="connect-mcp-install" className="not-prose my-8 overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-sm dark:border-white/10 dark:bg-gray-950">
+      <div className="border-b border-gray-100 px-5 py-5 dark:border-white/10">
+        <div className="text-sm text-gray-600 dark:text-gray-300">
+          Developers: point your own agent at your org — verified clients and setup guides.
+        </div>
+        <div className="mt-1 text-xs text-gray-400">
+          Verified for OpenCode only; setup guides for Codex, Cursor, ChatGPT, Claude Code, VS Code, and more
+        </div>
+      </div>
+
+      <div className="overflow-x-auto border-b border-gray-100 px-4 pt-4 dark:border-white/10" role="tablist" aria-label="idexal Os MCP client install options">
+        <div className="flex min-w-max gap-1">
+          {installs.map((install) => (
+            <button
+              key={install.id}
+              id={`connect-mcp-install-${install.id}`}
+              type="button"
+              role="tab"
+              aria-selected={install.id === activeClient}
+              aria-controls={`connect-mcp-panel-${install.id}`}
+              onClick={() => {
+                setActiveClient(install.id);
+                window.history.replaceState(null, "", `#connect-mcp-install-${install.id}`);
+              }}
+              className={`rounded-t-lg border-b-2 px-3 py-2 text-sm font-medium ${install.id === activeClient ? "border-gray-950 text-gray-950 dark:border-white dark:text-white" : "border-transparent text-gray-500 hover:text-gray-900 dark:hover:text-white"}`}
+            >
+              {install.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div id={`connect-mcp-panel-${activeInstall.id}`} role="tabpanel" aria-labelledby={`connect-mcp-install-${activeInstall.id}`} className="p-5">
+        <p className="m-0 text-xs font-semibold uppercase tracking-wider text-gray-400">{activeInstall.eyebrow}</p>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h3 className="mb-0 mt-2 text-xl font-semibold text-gray-950 dark:text-white">{activeInstall.label}</h3>
+            <p className="mb-4 mt-1 text-sm text-gray-500 dark:text-gray-400">{activeInstall.helper}</p>
+          </div>
+          {activeInstall.installLink ? (
+            <a href={activeInstall.installLink} className="shrink-0 rounded-full bg-[#011627] px-5 py-2.5 text-sm font-medium text-white">
+              {activeInstall.installLabel}
+            </a>
+          ) : null}
+        </div>
+        <div className="mb-4 mt-2 flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-2">
+          <span className={`w-fit rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wider ${activeInstall.supportStatus === "Verified" ? "border-green-200 bg-green-50 text-green-700" : "border-amber-200 bg-amber-50 text-amber-700"}`}>{activeInstall.supportStatus}</span>
+          <span className="text-xs text-gray-500 dark:text-gray-400">{activeInstall.supportExplanation}</span>
+        </div>
+        <pre className="m-0 max-h-80 overflow-auto whitespace-pre-wrap rounded-xl bg-[#011627] p-4 text-xs leading-6 text-white"><code>{activeInstall.copyText}</code></pre>
+        {activeInstall.id === "any-client" ? (
+          <p className="mb-0 mt-3 text-sm text-gray-500 dark:text-gray-400">Use this URL only with MCP clients that support remote Streamable HTTP servers with OAuth.</p>
+        ) : null}
+        {activeInstall.authText ? (
+          <div className="mt-3">
+            <p className="mb-1.5 mt-0 text-xs font-semibold uppercase tracking-wider text-gray-400">Authenticate</p>
+            <pre className="m-0 overflow-auto whitespace-pre-wrap rounded-xl bg-[#011627] p-4 text-xs leading-6 text-white"><code>{activeInstall.authText}</code></pre>
+          </div>
+        ) : null}
+        {activeInstall.reconnectText ? (
+          <div className="mt-3">
+            <p className="mb-1.5 mt-0 text-xs font-semibold uppercase tracking-wider text-gray-400">Reconnect or switch org</p>
+            <pre className="m-0 overflow-auto whitespace-pre-wrap rounded-xl bg-[#011627] p-4 text-xs leading-6 text-white"><code>{activeInstall.reconnectText}</code></pre>
+          </div>
+        ) : null}
+        <div className="mt-4 flex items-center justify-between gap-3">
+          <p className="m-0 text-xs text-gray-500">Works with your idexal Os account — <a href="https://os.idexal.com?mode=sign-up" className="font-medium underline">create one free</a>.</p>
+          <button type="button" aria-label="Copy the idexal Os MCP install command" onClick={() => copy(activeInstall.id, activeInstall.copyText)} className="shrink-0 rounded-lg bg-[#011627] px-4 py-2 text-xs font-medium text-white">
+            {copied === activeInstall.id ? "Copied" : copied === "error" ? "Couldn't copy" : "Copy"}
+          </button>
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-2 border-t border-gray-100 px-5 py-4 text-xs sm:flex-row sm:items-center sm:justify-between dark:border-white/10">
+        <span className="font-semibold uppercase tracking-wider text-gray-400">Server URL</span>
+        <div className="flex min-w-0 items-center gap-2">
+          <code className="break-all text-gray-950 dark:text-white">{MCP_SERVER_URL}</code>
+          <button type="button" aria-label="Copy the idexal Os MCP server URL" onClick={() => copy("server-url", MCP_SERVER_URL)} className="shrink-0 font-medium underline">
+            {copied === "server-url" ? "Copied" : "Copy URL"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};

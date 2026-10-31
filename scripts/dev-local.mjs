@@ -1,0 +1,285 @@
+import { spawn } from "node:child_process"
+import net from "node:net"
+import os from "node:os"
+import path from "node:path"
+import process from "node:process"
+import { fileURLToPath } from "node:url"
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const rootDir = path.resolve(__dirname, "..")
+
+// Load committed local-dev defaults. Real env vars take precedence (loadEnvFile
+// never overwrites variables that are already set).
+try {
+  process.loadEnvFile(path.join(rootDir, ".env.dev"))
+} catch {
+  // .env.dev is optional; the inline fallbacks below still apply.
+}
+const composeFile = path.join(rootDir, "packaging", "docker", "docker-compose.web-local.yml")
+const composeProject = "idexal-os-den-local"
+
+const apiPort = process.env.DEN_API_PORT?.trim() || "8788"
+const gatewayPort = process.env.GATEWAY_PORT ?? process.env.INFERENCE_PORT?.trim() ?? "8791"
+const webPort = process.env.DEN_WEB_PORT?.trim() || "3005"
+const appPort = process.env.IDEXAL_APP_PORT?.trim() || process.env.PORT?.trim() || "5173"
+const extraAppPorts = (process.env.IDEXAL_EXTRA_APP_PORTS?.trim() || "5174")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean)
+const databaseUrl = process.env.DATABASE_URL?.trim() || "mysql://root:password@127.0.0.1:3306/idexal_os_den"
+const databaseRedisUrl = process.env.DATABASE_REDIS_URL?.trim() || "redis://127.0.0.1:6379"
+const dbEncryptionKey =
+  process.env.DEN_DB_ENCRYPTION_KEY?.trim() ||
+  "local-dev-db-encryption-key-please-change-1234567890"
+
+function detectWebOrigins() {
+  const origins = new Set([
+    `http://localhost:${webPort}`,
+    `http://127.0.0.1:${webPort}`,
+    `http://0.0.0.0:${webPort}`,
+    `http://localhost:${appPort}`,
+    `http://127.0.0.1:${appPort}`,
+  ])
+
+  for (const port of extraAppPorts) {
+    origins.add(`http://localhost:${port}`)
+    origins.add(`http://127.0.0.1:${port}`)
+  }
+
+  for (const entries of Object.values(os.networkInterfaces())) {
+    for (const entry of entries || []) {
+      if (!entry || entry.internal || entry.family !== "IPv4") {
+        continue
+      }
+
+      origins.add(`http://${entry.address}:${webPort}`)
+    }
+  }
+
+  return Array.from(origins).join(",")
+}
+
+function parseUrlEndpoint(value, defaultPort) {
+  const parsed = new URL(value)
+  return {
+    host: parsed.hostname,
+    port: Number(parsed.port || defaultPort),
+  }
+}
+
+function canReachTcp(host, port) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port })
+
+    const finalize = (result) => {
+      socket.destroy()
+      resolve(result)
+    }
+
+    socket.setTimeout(1500)
+    socket.once("connect", () => finalize(true))
+    socket.once("error", () => finalize(false))
+    socket.once("timeout", () => finalize(false))
+  })
+}
+
+function canListenOnPort(port) {
+  return new Promise((resolve) => {
+    const server = net.createServer()
+
+    const finalize = (result) => {
+      server.close(() => resolve(result))
+    }
+
+    server.once("error", () => resolve(false))
+    server.once("listening", () => finalize(true))
+    server.listen(port, "0.0.0.0")
+  })
+}
+
+function run(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: rootDir,
+      stdio: "inherit",
+      ...options,
+      shell: false,
+    })
+
+    child.once("error", reject)
+    child.once("exit", (code, signal) => {
+      if (code === 0) {
+        resolve()
+        return
+      }
+
+      const detail = signal ? `signal ${signal}` : `exit code ${code ?? 1}`
+      reject(new Error(`${command} ${args.join(" ")} failed with ${detail}`))
+    })
+  })
+}
+
+const startedDockerServices = new Set()
+let turboChild = null
+let cleaningUp = false
+
+function stopTurboChild() {
+  if (!turboChild || turboChild.exitCode !== null) {
+    return Promise.resolve()
+  }
+
+  return new Promise((resolve) => {
+    turboChild.once("exit", resolve)
+
+    try {
+      if (process.platform !== "win32") {
+        process.kill(-turboChild.pid, "SIGINT")
+      } else {
+        turboChild.kill("SIGINT")
+      }
+    } catch {
+      turboChild.kill("SIGINT")
+    }
+  })
+}
+
+async function cleanup(exitCode = 0) {
+  if (cleaningUp) {
+    return
+  }
+
+  cleaningUp = true
+
+  await stopTurboChild()
+
+  if (startedDockerServices.size > 0) {
+    const services = Array.from(startedDockerServices)
+    await run("docker", ["compose", "-p", composeProject, "-f", composeFile, "stop", ...services], {
+      stdio: "inherit",
+    }).catch(() => {})
+    await run("docker", ["compose", "-p", composeProject, "-f", composeFile, "rm", "-f", ...services], {
+      stdio: "inherit",
+    }).catch(() => {})
+  }
+
+  process.exit(exitCode)
+}
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    void cleanup(0)
+  })
+}
+
+async function main() {
+  let databaseEndpoint
+  try {
+    databaseEndpoint = parseUrlEndpoint(databaseUrl, "3306")
+    if (new URL(databaseUrl).protocol !== "mysql:") throw new Error()
+  } catch {
+    throw new Error("DATABASE_URL must be a valid local MySQL URL (value withheld).")
+  }
+  if (!["localhost", "127.0.0.1", "[::1]", "::1"].includes(databaseEndpoint.host)) {
+    throw new Error("dev:web-local only migrates loopback MySQL databases. Remote databases require a separately reviewed migration procedure.")
+  }
+  if (databaseEndpoint.host === "[::1]") databaseEndpoint.host = "::1"
+  for (const [name, port] of [["den-web", webPort], ["den-api", apiPort], ["gateway", gatewayPort]]) {
+    const available = await canListenOnPort(Number(port))
+    if (!available) {
+      throw new Error(`${name} local port ${port} is already in use. Stop the existing process or rerun with a different port env override.`)
+    }
+  }
+
+  const { host, port } = databaseEndpoint
+  const mysqlAvailable = await canReachTcp(host, port)
+
+  if (!mysqlAvailable) {
+    if (!(host === "127.0.0.1" || host === "localhost")) {
+      throw new Error(`MySQL at ${host}:${port} is not reachable, and auto-start only supports localhost`) 
+    }
+
+    console.log(`[den] MySQL not reachable at ${host}:${port}; starting Docker MySQL...`)
+    await run("docker", ["compose", "-p", composeProject, "-f", composeFile, "up", "-d", "--wait", "mysql"])
+    startedDockerServices.add("mysql")
+  } else {
+    console.log(`[den] Using existing MySQL at ${host}:${port}`)
+  }
+
+  const redis = parseUrlEndpoint(databaseRedisUrl, "6379")
+  const redisAvailable = await canReachTcp(redis.host, redis.port)
+  if (!redisAvailable) {
+    if (!(redis.host === "127.0.0.1" || redis.host === "localhost")) {
+      throw new Error(`Redis at ${redis.host}:${redis.port} is not reachable, and auto-start only supports localhost`)
+    }
+
+    console.log(`[den] Redis not reachable at ${redis.host}:${redis.port}; starting Docker Redis...`)
+    await run("docker", ["compose", "-p", composeProject, "-f", composeFile, "up", "-d", "--wait", "redis"])
+    startedDockerServices.add("redis")
+  } else {
+    console.log(`[den] Using existing Redis at ${redis.host}:${redis.port}`)
+  }
+
+  console.log("[den] Building Den database package...")
+  await run("pnpm", ["--filter", "@idexal-ee/den-db", "build"], {
+    env: { ...process.env, DATABASE_URL: databaseUrl },
+  })
+  console.log("[den] Applying ordered local migrations before starting services...")
+  await run("pnpm", ["--filter", "@idexal-ee/den-db", "db:migrate:local"], {
+    env: {
+      ...process.env,
+      DATABASE_URL: databaseUrl,
+    },
+  })
+
+  const webOrigins = detectWebOrigins()
+  console.log(`[den] Allowed local web origins: ${webOrigins}`)
+
+  turboChild = spawn(
+    "pnpm",
+    [
+      "exec",
+      "turbo",
+      "run",
+      "dev:local",
+      "--output-logs=full",
+        "--filter=@idexal-ee/den-api",
+        "--filter=@idexal-ee/gateway",
+        "--filter=@idexal-ee/den-web",
+    ],
+    {
+      cwd: rootDir,
+      stdio: "inherit",
+      detached: process.platform !== "win32",
+      env: {
+        ...process.env,
+        DATABASE_URL: databaseUrl,
+        DATABASE_REDIS_URL: databaseRedisUrl,
+        DEN_DB_ENCRYPTION_KEY: dbEncryptionKey,
+        BETTER_AUTH_URL: process.env.BETTER_AUTH_URL?.trim() || `http://localhost:${webPort}`,
+        DEN_BASE_URL: process.env.DEN_BASE_URL?.trim() || `http://localhost:${webPort}`,
+        DEN_MCP_RESOURCE_URL: process.env.DEN_MCP_RESOURCE_URL?.trim() || `http://127.0.0.1:${apiPort}/mcp`,
+        DEN_BETTER_AUTH_TRUSTED_ORIGINS: process.env.DEN_BETTER_AUTH_TRUSTED_ORIGINS?.trim() || webOrigins,
+        CORS_ORIGINS: process.env.CORS_ORIGINS?.trim() || webOrigins,
+        DEN_API_PORT: apiPort,
+        GATEWAY_PORT: gatewayPort,
+        GATEWAY_PROXY_BASE_URL: process.env.GATEWAY_PROXY_BASE_URL ?? process.env.INFERENCE_PROXY_BASE_URL?.trim() ?? `http://127.0.0.1:${gatewayPort}`,
+        DEN_WEB_PORT: webPort,
+        DEN_API_BASE: process.env.DEN_API_BASE?.trim() || `http://127.0.0.1:${apiPort}`,
+        DEN_API_PUBLIC_URL: process.env.DEN_API_PUBLIC_URL?.trim() || `http://localhost:${apiPort}`,
+        DEN_AUTH_ORIGIN: process.env.DEN_AUTH_ORIGIN?.trim() || `http://localhost:${webPort}`,
+        DEN_AUTH_FALLBACK_BASE: process.env.DEN_AUTH_FALLBACK_BASE?.trim() || `http://127.0.0.1:${apiPort}`,
+      },
+      shell: false,
+    },
+  )
+
+  turboChild.once("exit", (code, signal) => {
+    const exitCode = code ?? (signal ? 1 : 0)
+    void cleanup(exitCode)
+  })
+}
+
+main().catch((error) => {
+  console.error(error instanceof Error ? error.message : String(error))
+  void cleanup(1)
+})

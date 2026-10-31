@@ -1,0 +1,152 @@
+---
+title: "Deploy to your cloud"
+description: "Run idexal Os in your AWS, Azure, or Google Cloud account with managed MySQL and either Kubernetes or Cloud Run."
+---
+
+idexal Os's primary private-cloud shape uses the published Helm chart, a managed Kubernetes cluster, and a MySQL-compatible database in your own account. A Google Cloud Run starter is also available for Den Web and Den API. You control the network, DNS, certificates, database, backups, identity provider, and secrets.
+
+<CardGroup cols={3}>
+  <Card title="AWS" icon="cloud" href="/self-host/deploy-to-your-cloud/aws">
+    Deploy on EKS or ECS Fargate with Amazon RDS for MySQL.
+  </Card>
+  <Card title="Azure" icon="cloud" href="/self-host/deploy-to-your-cloud/azure">
+    Deploy on AKS or Container Apps with Azure Database for MySQL.
+  </Card>
+  <Card title="Google Cloud" icon="cloud" href="/self-host/deploy-to-your-cloud/google-cloud">
+    Deploy on GKE or Cloud Run with Cloud SQL for MySQL.
+  </Card>
+</CardGroup>
+
+## Terraform modules (beta)
+
+<Warning>
+  idexal Os's Terraform modules are **beta**. If you hit an issue:
+
+  - **Customers with a support agreement:** contact your idexal Os team through your usual support channel.
+  - **Everyone else:** [open a GitHub issue](https://github.com/idexal/idexalOs/issues/new/choose).
+  - **Security issues:** report them privately ([SECURITY.md](https://github.com/idexal/idexalOs/blob/dev/SECURITY.md)).
+
+  Pin the module source to a reviewed commit and check its tested scenarios,
+  upgrade notes, and known limitations before deploying. Do not include secrets
+  or private state in reports.
+</Warning>
+
+These cloud-native options deploy the core Den web and Den API services without
+Kubernetes. They do not imply support for every optional Helm component or the
+hosted managed installer. All three modules are available on `dev` with the same
+beta support level; their tested scenarios and cloud-specific limits differ:
+
+| Cloud | What the module deploys | Support and availability | Guide and source |
+| --- | --- | --- | --- |
+| AWS | ECS Fargate services, HTTPS ALB, RDS for MySQL, Secrets Manager, and a dedicated migration task | **Beta**; on `dev` | [AWS guide](/self-host/deploy-to-your-cloud/aws), [module](https://github.com/idexal/idexalOs/tree/dev/infra/terraform/modules/idexal-os-aws-ecs) |
+| Google Cloud | Cloud Run services, Cloud SQL for MySQL, Secret Manager, and a dedicated migration job | **Beta**; on `dev` | [Google Cloud guide](/self-host/deploy-to-your-cloud/google-cloud), [module](https://github.com/idexal/idexalOs/tree/dev/infra/terraform/modules/idexal-os-gcp-cloud-run) |
+| Azure | Container Apps services, MySQL Flexible Server, secret references, and a dedicated migration job | **Beta**; on `dev` | [Azure guide](/self-host/deploy-to-your-cloud/azure), [module](https://github.com/idexal/idexalOs/tree/dev/infra/terraform/modules/idexal-os-azure-container-apps) |
+
+The [shared module contract](https://github.com/idexal/idexalOs/blob/dev/infra/terraform/MODULE_CONTRACT.md)
+describes migration ordering, secrets preservation, tool compatibility, and the
+per-cloud limits. A successful core smoke run is not production load, backup
+restoration, or legacy-upgrade certification. Follow the source revision's README
+for exact inputs and test coverage. Availability on `dev` does not imply a tagged
+module release or production qualification.
+
+## Managed installation from hosted idexal Os
+
+The default-off **Deployments** rollout lets workspace owners approve an AWS
+installer in their own account and track health and approved updates. The GCP
+implementation additionally uses the default-off `managedDeploymentsGcp`
+rollout and customer-approved Google Cloud Shell. It requires a dedicated
+billing-enabled project, public Cloud DNS, and an operator-published immutable
+installer release. Local tests are not a live deployment receipt; the GCP
+rollout must stay off until a real release and approved installation are verified.
+Azure is not supported by the managed installer yet.
+
+A locked installer message is server-side publication/configuration—not a
+request for your cloud keys. Signing in to AWS or Google Cloud on your Mac
+cannot publish the installer. Operators follow
+[the managed-deployment runbook](https://github.com/idexal/idexalOs/blob/dev/docs/managed-deployments.md);
+manual deployments below remain independent of the rollout.
+
+## Common architecture
+
+Every provider guide uses the same idexal Os boundaries:
+
+- Den web listens on port `3005` and serves the browser experience.
+- Den API listens on port `8788` and owns authentication, organizations, policy, and control-plane APIs.
+- A MySQL 8-compatible database stores shared control-plane state.
+- The default migration Job is a pre-install/pre-upgrade hook, not an automatic safe rolling schema cutover.
+- idexal Os Gateway is optional and disabled by default; it retains the `idexal-os-inference` image and `*-inference` resource names. It is not the separate `den-gateway` Web proxy.
+- HTTPS hostnames expose web and API traffic through the provider's load-balancing layer.
+
+Use private database networking in production. Require TLS for public application traffic, encrypt storage and backups, and keep database and authentication secrets in the provider secret store or a Kubernetes Secret—not in a Helm values file.
+
+## Reverse-proxy client addresses
+
+Set `DEN_TRUSTED_PROXIES` on Den API to a comma-separated list of your reverse
+proxies' IP addresses or CIDRs (for example, `192.0.2.10,192.0.2.11`). Better Auth
+uses this list to resolve forwarded client addresses for authentication rate
+limits. Without it, clients can share a fallback rate-limit bucket.
+
+Only include the proxies you operate, not broad ranges containing clients. Your
+origin must accept traffic only from those proxies, and the proxies must overwrite
+or safely append forwarded headers. This setting interprets the forwarded chain;
+it cannot verify the direct sender. Leave it unset when there is no trusted proxy.
+Keep rate limiting enabled in production.
+
+## Deployment sequence
+
+1. Create the Kubernetes cluster and private MySQL database in compatible networks.
+2. Reserve the public address or load-balancer entry point.
+3. Create the database, database user, and Kubernetes namespace.
+4. Generate independent database, Better Auth, and Den encryption secrets.
+5. Prepare provider-specific Helm values for the web and API hostnames.
+6. For a fresh database, install the matching chart/images and verify initialization before opening traffic. For an existing database, follow the release-specific migration and rollout procedure; Gateway requires the [quiesced upgrade guide](/self-host/gateway-upgrade), not an unattended rolling upgrade.
+7. Point DNS at the load balancer and verify trusted HTTPS.
+8. [Create the first administrator](/self-host/deploy-to-your-cloud/first-administrator).
+9. Configure SAML or OIDC SSO and invite or provision members.
+
+## Before you start
+
+You need:
+
+- a cloud account with permission to create Kubernetes, networking, load-balancing, managed MySQL, DNS, certificates, and secrets;
+- `kubectl` and Helm, plus the provider CLI and Kubernetes authentication plugin;
+- two DNS names, normally one for Den web and one for Den API;
+- a real email address for the initial owner;
+- a backup, restore, upgrade, and rollback plan.
+
+<Note>
+  The provider pages give the supported architecture and point to the repository's detailed operator runbooks for exact commands. Pin a chart version in production and use the runbook from the matching release or branch.
+</Note>
+
+## After deployment
+
+To configure Gateway, follow [Enable idexal Os Gateway](/self-host/gateway). This requires the Gateway-capable chart implementation introduced in `0.2.0` or later, matching release images, and an authenticated capability-version-1 response. Gateway is GA for admins in every organization when configured; no platform-admin organization grant or organization API toggle is needed. `GATEWAY_ENABLED` and `deploymentCapabilities.aiGateway` remain installation configuration checks. Neither legacy service enablement nor existing idexal Os Models billing enables the deployment automatically.
+
+## Scheduled maintenance jobs
+
+Two maintenance tasks run on a schedule instead of on every request, so busy write paths never queue behind a shared totals row. Other background work (SCIM cleanup, Automations, worker reconciliation, provider token refresh) runs inside Den API or the Gateway and needs no setup.
+
+| Job | What it does | Hosted schedule | Helm values | Endpoint and token |
+| --- | --- | --- | --- | --- |
+| Gateway usage rollup | Folds Gateway request logs older than two days into hourly usage rollups and deletes the folded rows; folds hourly rollups older than 90 days into daily ones. | Hourly, `5 * * * *` | `gateway.retention.*` (off by default) | Gateway `POST /internal/rollups/run`, `GATEWAY_ADMIN_TOKEN` |
+| Audit usage refresh | Recomputes each organization's audit usage totals (retained operations, events, bytes). | Daily | `denApi.auditUsage.*` (off by default, `30 3 * * *`) | Den API `POST /internal/audit/usage/refresh`, `DEN_MAINTENANCE_TOKEN` |
+
+Both endpoints answer `404` when their token is not configured and `401` for a wrong token. Both are safe to rerun.
+
+With Helm, enable each job and its token as described in [Enable idexal Os Gateway](/self-host/gateway#optional-admin-webhook-and-retention) and the chart README's *Audit usage refresh* section. On Cloud Run, ECS Fargate, or Docker Compose, schedule the calls yourself with Cloud Scheduler, EventBridge Scheduler, or host cron, from a network location that can reach the internal service:
+
+```sh
+# Hourly, only when Gateway is enabled
+curl -fsS -X POST -H "Authorization: Bearer $GATEWAY_ADMIN_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"maxBucketsPerRun":48,"maxSourceRowsPerBucket":5000}' \
+  http://<gateway-internal-host>:8791/internal/rollups/run
+
+# Daily
+curl -fsS -X POST -H "Authorization: Bearer $DEN_MAINTENANCE_TOKEN" \
+  http://<den-api-internal-host>:8788/internal/audit/usage/refresh
+```
+
+Without the rollup job, Gateway request logs are never compacted and grow without limit. Without the audit refresh, the audit usage screen keeps showing its last measured totals.
+
+Use [Private network deployment](/start-here/private-network-deployment) when Den is reachable only through a VPN or private network. Review [Outbound network access](/start-here/outbound-network-access), [Certificate trust and proxies](/start-here/certificate-trust-and-proxies), and [Air-gapped deployment](/start-here/air-gapped-deployment) before restricting egress.

@@ -1,0 +1,65 @@
+# Build outputs
+dist/
+build/
+*.tgz
+*.tar.gz
+*.zip
+!.gitkeep
+
+# Electron specific
+dist-electron-*/
+**/dist-electron-*
+
+# Node modules
+node_modules/
+
+# Cache
+.cache/
+.nyc_output/
+coverage/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+.temp/
+.agnes/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Test coverage
+.nyc_output/
+
+# Misc
+*.pem
+*.key
+*.cert
+_tmp_icons/
+

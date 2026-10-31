@@ -1,0 +1,221 @@
+import type { Hono } from "hono"
+import { describeRoute } from "hono-openapi"
+import { z } from "zod"
+import { ManagedModelsPolicyError } from "@idexal/types/den/managed-models-policy"
+import { assertOrganizationManagedModelsAllowed, updateOrganizationMetadata } from "../../organization-metadata.js"
+import { allowFreeInferenceOffer, getInferenceStatus, setInferenceEnabled, getMemberInferenceAccess, issueMemberFreeInferenceCredential, getFreeInferenceProviderSummary } from "../../inference.js"
+import { INFERENCE_ACCESS_REASONS, freeInferenceProviderSummarySchema, withFreeInferenceDefaultPinned, freeInferenceDefaultPinned } from "@idexal/types/den/inference"
+import { normalizeDenTypeId } from "@idexal-ee/utils/typeid"
+import { env } from "../../env.js"
+import { requireFeature } from "../../features.js"
+import { organizationHasActiveInferenceSubscription } from "../../stripe-billing.js"
+import { jsonValidator, orgMemberRoute, orgPermissionRoute } from "../../middleware/index.js"
+import { forbiddenSchema, invalidRequestSchema, jsonResponse, notFoundSchema, unauthorizedSchema } from "../../openapi.js"
+import type { OrgRouteVariables } from "./shared.js"
+
+const inferenceSettingsSchema = z.object({
+  enabled: z.boolean(),
+  tier: z.enum(["tier1", "tier2"]).optional(),
+})
+
+const inferenceUsageBucketSchema = z.object({
+  windowType: z.enum(["five_hour", "weekly", "monthly"]),
+  windowStartAt: z.string().datetime(),
+  windowEndAt: z.string().datetime(),
+  limitAmount: z.number(),
+  usedAmount: z.number(),
+})
+
+const inferenceStatusSchema = z.object({
+  enabled: z.boolean(),
+  tier: z.enum(["tier1", "tier2"]),
+  memberCount: z.number(),
+  proxyBaseUrl: z.string(),
+  upstreamProviderConfigured: z.boolean(),
+  subscribed: z.boolean().optional(),
+  buckets: z.array(inferenceUsageBucketSchema),
+}).meta({ ref: "InferenceStatus" })
+
+const inferenceStatusResponseSchema = z.object({
+  inference: inferenceStatusSchema,
+}).meta({ ref: "InferenceStatusResponse" })
+
+const inferenceProviderMissingSchema = z.object({
+  error: z.literal("openrouter_management_api_key_missing"),
+  message: z.string(),
+}).meta({ ref: "InferenceProviderMissingError" })
+
+const managedModelsPolicyErrorSchema = z.object({
+  error: z.enum(["managed_models_disabled_for_dpa", "managed_models_policy_unavailable"]),
+  message: z.string(),
+})
+
+const freeAccessSchema = z.object({
+  access: z.object({ kind: z.enum(["free", "paid", "exhausted", "unavailable"]), modelID: z.string().nullable(),
+    weeklyLimitUsd: z.number().nullable(), usedUsd: z.number().nullable(),
+    remainingUsd: z.number().nullable(), resetsAt: z.string().datetime().nullable(), reason: z.enum(INFERENCE_ACCESS_REASONS).nullable(),
+    defaultPinned: z.boolean().optional().describe("Organization-managed Auto pin for this membership. False removes only the organization pin; model access and personal pins are unchanged. Pins never grant access."), canUpgrade: z.literal(false), catalog: z.array(z.object({ modelID: z.string(), displayName: z.string(), providerName: z.string(),
+      summary: z.string(), recommended: z.boolean(), rank: z.number(), capabilities: z.array(z.string()) })).optional() }),
+}).meta({ ref: "InferenceAccessResponse" })
+const freeCredentialSchema = z.object({ credential: z.object({ apiKey: z.string(), baseURL: z.string(), statusURL: z.string(), modelID: z.string() }) })
+
+export function registerOrgInferenceRoutes<T extends { Variables: OrgRouteVariables }>(app: Hono<T>) {
+  // The analytics dashboard has its own gate; Models settings and inference
+  // access remain available when the dashboard is hidden.
+  app.get("/v1/inference/analytics/usage", describeRoute({
+    tags: ["Inference"], summary: "Read Models analytics usage limits",
+    description: "Returns Models usage limits for the analytics dashboard. Requires View idexal Os Models settings and the Models analytics surface feature.",
+    responses: { 200: jsonResponse("Models usage limits.", inferenceStatusResponseSchema),
+      404: jsonResponse("Models analytics surface is disabled.", notFoundSchema) },
+  }), orgPermissionRoute("inference.view"), requireFeature("modelsAnalyticsUi"), async (c) => {
+    const orgId = c.get("organizationContext").organization.id
+    return c.json({ inference: { ...await getInferenceStatus(orgId), subscribed: await organizationHasActiveInferenceSubscription(orgId) } })
+  })
+  app.get("/v1/inference/free/provider", describeRoute({ tags: ["Inference"], summary: "Get organization Free provider summary",
+    description: "Requires the View idexal Os Models settings permission. Returns the organization's Auto pin policy, joined-member allowance counts and recorded free usage attributed to this organization. Allowances are person-wide; usage totals exclude other organizations, anonymous devices and paid inference. No individual balances or identities are returned.",
+    responses: { 200: jsonResponse("Free provider summary returned.", z.object({ provider: freeInferenceProviderSummarySchema })),
+      401: jsonResponse("Authentication required.", unauthorizedSchema), 403: jsonResponse("The caller lacks the View idexal Os Models settings permission.", forbiddenSchema),
+      503: jsonResponse("Free provider summary unavailable.", z.object({ error: z.string() })) },
+  }), orgPermissionRoute("inference.view"), async (c) => {
+    c.header("Cache-Control", "no-store")
+    try { return c.json({ provider: await getFreeInferenceProviderSummary(c.get("organizationContext").organization.id) }) }
+    catch { return c.json({ error: "free_provider_summary_unavailable" }, 503) }
+  })
+  app.patch("/v1/inference/free/pins", describeRoute({ tags: ["Inference"], summary: "Set the organization Auto pin",
+    description: "Requires the Manage idexal Os Models permission and a recent sign-in. Changes only defaultPinned. Unpinning changes picker curation, not free model availability or personal pins. The atomic metadata update preserves DPA, offerAllowed and all unrelated organization configuration.",
+    responses: { 200: jsonResponse("Auto pin saved.", z.object({ defaultPinned: z.boolean() })),
+      400: jsonResponse("Provide only defaultPinned.", invalidRequestSchema), 401: jsonResponse("Authentication required.", unauthorizedSchema),
+      403: jsonResponse("The caller lacks the Manage idexal Os Models permission or needs to sign in again.", forbiddenSchema),
+      503: jsonResponse("Organization policy unavailable.", managedModelsPolicyErrorSchema) },
+  }), orgPermissionRoute("inference.manage"), jsonValidator(z.strictObject({ defaultPinned: z.boolean() })), async (c) => {
+    c.header("Cache-Control", "no-store")
+    const { defaultPinned } = c.req.valid("json")
+    try {
+      const metadata = await updateOrganizationMetadata(c.get("organizationContext").organization.id, (current) => withFreeInferenceDefaultPinned(current, defaultPinned))
+      return c.json({ defaultPinned: freeInferenceDefaultPinned(metadata) })
+    } catch (error) {
+      if (error instanceof ManagedModelsPolicyError) return c.json({ error: error.code, message: error.message }, error.status)
+      throw error
+    }
+  })
+  app.get("/v1/inference/access", describeRoute({ tags: ["Inference"], summary: "Get my free Auto allowance",
+    description: "Returns the authenticated joined member's person-wide weekly Auto allowance without credentials.",
+    responses: { 200: jsonResponse("Auto allowance returned.", freeAccessSchema),
+      401: jsonResponse("Authentication required.", unauthorizedSchema), 403: jsonResponse("Active membership required.", forbiddenSchema) },
+  }), orgMemberRoute(), async (c) => {
+    const context = c.get("organizationContext")
+    const user = c.get("user")
+    if (!user) return c.json({ error: "unauthorized" }, 401)
+    c.header("Cache-Control", "no-store")
+    const access = await getMemberInferenceAccess({ organizationId: context.organization.id, memberId: context.currentMember.id,
+      userId: normalizeDenTypeId("user", user.id) })
+    return c.json({ access })
+  })
+  const FREE_REFUSAL_MESSAGES = {
+    free_not_offered: "Your organization has turned off Auto.",
+    not_eligible: "Auto isn't available for this account.",
+  } as const
+  app.post("/v1/inference/free/credential", describeRoute({ tags: ["Inference"], summary: "Get my free Auto credential",
+    description: "Issues or reuses the member's idexal Os Models key for free Auto, within the member's weekly allowance. Organizations with an idexal Os Models subscription get it too; Auto is never billed to them. A refusal names its reason: free_not_offered (the organization turned the free starter model off) or not_eligible.",
+    responses: { 200: jsonResponse("Member Auto credential returned.", freeCredentialSchema),
+      401: jsonResponse("Authentication required.", unauthorizedSchema), 403: jsonResponse("Auto access denied.", forbiddenSchema),
+      503: jsonResponse("Auto unavailable.", z.object({ error: z.string() })) },
+  }), orgMemberRoute(), async (c) => {
+    const context = c.get("organizationContext")
+    const user = c.get("user")
+    if (!user) return c.json({ error: "unauthorized" }, 401)
+    c.header("Cache-Control", "no-store")
+    if (!env.inferenceFree.enabled) return c.json({ error: "free_disabled" }, 503)
+    try {
+      const result = await issueMemberFreeInferenceCredential({ organizationId: context.organization.id, memberId: context.currentMember.id,
+        userId: normalizeDenTypeId("user", user.id) })
+      if ("credential" in result) return c.json({ credential: result.credential })
+      if (result.refusal === "free_disabled") return c.json({ error: "free_disabled" }, 503)
+      return c.json({ error: result.refusal, message: FREE_REFUSAL_MESSAGES[result.refusal] }, 403)
+    } catch (error) {
+      if (error instanceof ManagedModelsPolicyError) return c.json({ error: error.code, message: error.message }, error.status)
+      return c.json({ error: "free_accounting_unavailable" }, 503)
+    }
+  })
+
+  app.get(
+    "/v1/inference",
+    describeRoute({
+      tags: ["Inference"],
+      summary: "Get inference settings",
+      description: "Returns idexal Os Models enablement and limit context for the active organization.",
+      responses: {
+        200: jsonResponse("Inference settings returned successfully.", inferenceStatusResponseSchema),
+        401: jsonResponse("The caller must be signed in to read inference settings.", unauthorizedSchema),
+        403: jsonResponse("The caller lacks the View idexal Os Models settings permission.", forbiddenSchema),
+      },
+    }),
+    orgPermissionRoute("inference.view"),
+    async (c) => {
+      const payload = c.get("organizationContext")
+      return c.json({
+        inference: {
+          ...await getInferenceStatus(payload.organization.id),
+          subscribed: await organizationHasActiveInferenceSubscription(payload.organization.id),
+        },
+      })
+    },
+  )
+
+  app.patch(
+    "/v1/inference",
+    describeRoute({
+      tags: ["Inference"],
+      summary: "Update inference settings",
+      description: "Enables or disables idexal Os Models for the active organization.",
+      responses: {
+        200: jsonResponse("Inference settings updated successfully.", inferenceStatusResponseSchema),
+        400: jsonResponse("The inference settings request was invalid.", z.union([invalidRequestSchema, inferenceProviderMissingSchema])),
+        401: jsonResponse("The caller must be signed in to update inference settings.", unauthorizedSchema),
+        403: jsonResponse("Inference settings access is denied.", z.union([forbiddenSchema, managedModelsPolicyErrorSchema])),
+        503: jsonResponse("Managed Models policy is unavailable.", managedModelsPolicyErrorSchema),
+      },
+    }),
+    orgPermissionRoute("inference.manage"),
+    jsonValidator(inferenceSettingsSchema),
+    async (c) => {
+      const payload = c.get("organizationContext")
+      const input = c.req.valid("json")
+
+      try {
+        if (input.enabled) {
+          await assertOrganizationManagedModelsAllowed(payload.organization.id)
+          const subscribed = await organizationHasActiveInferenceSubscription(payload.organization.id)
+          if (!subscribed) {
+            await allowFreeInferenceOffer(payload.organization.id)
+            return c.json({
+              inference: {
+                ...await getInferenceStatus(payload.organization.id),
+                subscribed: false,
+              },
+            })
+          }
+        }
+
+        const inference = await setInferenceEnabled({
+          organizationId: payload.organization.id,
+          enabled: input.enabled,
+          tier: input.tier,
+          source: "admin",
+        })
+        return c.json({ inference: { ...inference, subscribed: await organizationHasActiveInferenceSubscription(payload.organization.id) } })
+      } catch (error) {
+        if (error instanceof ManagedModelsPolicyError) {
+          return c.json({ error: error.code, message: error.message }, error.status)
+        }
+        if (error instanceof Error && error.message === "openrouter_management_api_key_missing") {
+          return c.json({
+            error: "openrouter_management_api_key_missing",
+            message: "Set OPENROUTER_MANAGEMENT_API_KEY on Den API before enabling idexal Os Models.",
+          }, 400)
+        }
+        throw error
+      }
+    },
+  )
+}
