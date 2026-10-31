@@ -1,0 +1,104 @@
+---
+title: "Pricing and licensing"
+description: "idexal Os's plans — Free, Team, and Enterprise — and how the MIT + idexal Os EE License split works."
+---
+
+Free and Team prices are public. Enterprise is priced per deployment —
+[talk to sales](mailto:info@idexal.com). The same terms apply whether
+you use idexal Os Cloud or self-host. There are no deployment fees, and support
+is included in every paid plan.
+
+## Plans
+
+| | Free | Team | Enterprise |
+| --- | --- | --- | --- |
+| **Price** | $0 | $10 per seat / month | [Talk to sales](mailto:info@idexal.com) |
+| **Billing** | — | Monthly, self-serve | Annual, invoiced |
+| **Users** | Cloud: first 5 seats free; self-hosted: up to 5 users | Unlimited | Unlimited |
+| **Desktop app (MIT, open source)** | ✓ | ✓ | ✓ |
+| **Self-host the full platform** | ✓ | ✓ | ✓ |
+| **Extension Marketplace, shared keys and skills** | — | ✓ | ✓ |
+| **Cloud automations** | — | ✓ | ✓ |
+| **Usage and adoption analytics** | — | Basic | ✓ |
+| **SSO / SAML** | — | ✓ | ✓ |
+| **SCIM provisioning and RBAC** | — | — | ✓ |
+| **Desktop policies and version controls** | — | — | ✓ |
+| **Audit log and spend observability** | — | — | ✓ |
+| **Internal white-labeling (your name, logo, branding)** | — | — | ✓ |
+| **Support** | Community | Standard, included | Standard SLA, included |
+
+### Add-ons
+
+Available on Team and Enterprise, billed per member alongside the plan:
+
+| Add-on | Price | What it is |
+| --- | --- | --- |
+| **idexal Os Cloud Computer** | $50 per member / month | A cloud computer for each member, accessible from the browser. Separate from cloud automations, which are included in Team and Enterprise. |
+| **idexal Os models** | $10 per user / month | Managed inference — use idexal Os-provided models without bringing your own keys. |
+
+Analytics, SCIM, desktop policies, and white-labeling are the
+**Enterprise Features** — defined in the
+[subscription terms](https://os.idexal.com/terms/subscription) and
+reserved for the Enterprise plan (and for evaluations and pilots, so you can
+test what you would buy).
+
+Enterprise white-labeling covers your own internal deployment. External
+distribution, managed service use, or resale under your branding requires a
+separate written agreement.
+
+Enterprise is an annual contract with a 60-day opt-out, so you can leave
+early if it does not work for you. Discounts are by seat count and term only.
+
+## How licensing works
+
+The [repository](https://github.com/idexal/idexalOs) uses a
+directory-split license, similar to GitLab:
+
+- **Everything outside `ee/` is MIT.** The desktop app and core platform are
+  open source and free for any use.
+- **Everything under `ee/` (idexal Os Den, the org control plane) is
+  source-available under the
+  [idexal Os EE License](https://github.com/idexal/idexalOs/blob/dev/ee/LICENSE).**
+  The code is public so your security team can audit exactly what you deploy.
+
+Under the EE License, no subscription is required for:
+
+1. **Production use by organizations with up to 5 users.** Enterprise
+   Features (analytics, SCIM, desktop policies, white-labeling) are excluded and require a plan.
+2. **Internal evaluation for up to 30 days**, at any user count, with all
+   features — extendable in writing.
+3. **Development and testing.**
+
+Beyond those grants, production use requires a subscription per the
+[subscription terms](https://os.idexal.com/terms/subscription). Every
+`ee/` release additionally converts to MIT two years after publication.
+Versions released before the EE License was adopted remain under their
+original license (FSL-1.1-MIT), and each release is governed by the license
+text it shipped with — license updates are never retroactive.
+
+For the promises we make about how this split is stewarded over time — what
+can and cannot move between tiers, and how the MIT conversion works — see
+[Stewardship](/start-here/stewardship).
+
+## Evaluating and pilots
+
+You can evaluate self-serve for free for 30 days. The [pull-only Docker Compose
+stack](/self-host/evaluate-with-docker-compose) is the quickest way to deploy
+the control plane in your own environment without cloning or building the
+repository. Need longer? Evaluation extensions are granted in writing —
+[ask us](mailto:info@idexal.com).
+
+For Enterprise, the standard path is the annual contract with its 60-day
+opt-out — you get the full product and a supported onboarding plan from day
+one, and can leave in the first two months if it is not a fit. Where a
+deployment is integration-heavy (SSO, SCIM, self-hosting), we can run a paid
+30–60 day pilot at your quoted rate with the pilot fee credited to your first
+year. [Talk to sales](mailto:info@idexal.com).
+
+## Why the enterprise code is public
+
+Our buyers are security teams. Publishing the enterprise source means you can
+read every line that runs inside your network before you run it. What a
+subscription pays for is the right to run it in production at scale, plus a
+supported, patched release stream and a vendor who is contractually
+accountable.

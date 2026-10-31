@@ -1,0 +1,100 @@
+# Contributing to idexal Os
+
+## Contributor License Agreement and Developer Certificate of Origin
+
+Contributions to this repository are subject to the
+[Developer Certificate of Origin](https://developercertificate.org/), or the
+[Individual](./legal/individual-contributor-license-agreement.md) or
+[Corporate](./legal/corporate-contributor-license-agreement.md) Contributor
+License Agreement, depending on where the contribution is made and on whose
+behalf, unless otherwise agreed with Idexal, Inc. in writing:
+
+- By submitting code contributions as an individual to the
+  [`ee/` directory](./ee) of this repository, you agree to the
+  [Individual Contributor License Agreement](./legal/individual-contributor-license-agreement.md).
+- By submitting code contributions on behalf of a corporation to the
+  [`ee/` directory](./ee) of this repository, you agree to the
+  [Corporate Contributor License Agreement](./legal/corporate-contributor-license-agreement.md).
+- By submitting code contributions as an individual or on behalf of a
+  corporation to any directory in this repository outside of the
+  [`ee/` directory](./ee), you agree to the
+  [Developer Certificate of Origin](https://developercertificate.org/), and
+  your contribution is licensed under the [MIT license](./LICENSE).
+
+By contributing, you are deemed to have accepted the agreement that applies
+to your contribution. There is nothing separate to sign. You keep ownership
+of your contribution; you grant Idexal, Inc. the permissions in the
+applicable agreement, and those permissions cannot be withdrawn.
+
+`ee/` needs a CLA rather than the DCO because the code there is distributed
+under the [idexal Os EE License](./ee/LICENSE), not an open source license,
+and each released version later converts to MIT. The CLA grants a license
+broad enough to do both.
+
+To put an overarching Corporate CLA in place for everyone contributing on
+behalf of your organization, email info@idexal.com.
+
+_This notice should stay as the first item in this file._
+
+## How CI runs on a pull request from a fork
+
+1. **Automatic checks, on every push.** Before any of your code runs, a
+   screen reads your changes. It blocks hidden or malformed characters
+   (invisible Unicode, bidirectional overrides, look-alike letters, invalid
+   UTF-8), which you must remove. It flags for a maintainer: dependency or
+   lockfile changes, database schema or migration changes, binary files,
+   code that looks encoded or obfuscated, and text that tries to give
+   instructions to an AI reviewer. A comment on the pull request lists what
+   it found. Nothing else runs yet.
+2. **Maintainer review and `/test`.** A maintainer reviews your changes and
+   comments `/test`. That marks the commit they reviewed and starts an AI
+   screen for hidden behavior and supply-chain risk.
+3. **Tests and security review.** If the AI screen is clear (or the
+   maintainer comments `/test` again after reading its findings), the
+   repository approves the waiting test runs for that exact commit. Fork
+   tests have no secrets. Warden reads the diff in a sandbox with no secrets;
+   a separate, restricted proxy uses a spend-limited model key. Before
+   approving the PR, a maintainer checks the screen and Warden results on
+   the current head and the required `idexal-os-tests-required` CI check.
+   Screen/Warden results are advisory, not a separate required merge status.
+   If you push again, screening runs again and a maintainer reviews the new
+   commits before `/test`. Prefer `/test <full-head-sha>` to name the commit
+   you actually reviewed (explicit SHAs must be all 40 characters); a plain
+   `/test` is refused if its head was pushed
+   after the comment or its push time cannot be established.
+
+This contributor flow is **fork-only**, including forks opened by bots.
+Same-repository PRs use normal CI and review; they do not need `/test` or a
+contributor merge status. The repository must require workflow approval for
+**all outside collaborators**, not just first-time contributors. Maintainers
+must not bypass the reviewed-head check by approving fork workflows directly.
+Required CI and approval of the latest push still apply; keep the
+CODEOWNERS-required rule enabled and verify that owners cover sensitive
+paths (the setting alone does not create coverage). Trusted repository
+members/collaborators can be exempt from GitHub's fork-run approval setting;
+see the administrator caveats below.
+Large fork diffs (300 or more changed files) must be carried to a
+same-repository branch because GitHub's immutable comparison API truncates
+file lists at that limit.
+
+For repository administrators: [fork gate deployment and ruleset migration](./docs/fork-contributor-ci.md).
+
+Changes to CI or agent configuration (`.github/`, `.opencode/`,
+`opencode.json`, `warden.toml`, `.warden/`, agent skills) can't be tested
+from a fork. A maintainer moves those commits to a branch in this
+repository, keeping you as the author.
+
+## Paid work
+
+If you are contributing as part of paid work, a work trial, or on behalf of
+an employer, make sure a signed agreement covering intellectual property
+assignment is in place with Idexal, Inc. **before** your first pull
+request — ask your contact at idexal Os if you are unsure. Maintainers will
+not merge substantive contributions from paid engagements without one.
+
+## Practical notes
+
+- Use pnpm, never npm or yarn.
+- Keep diffs as small as possible; propose the simpler solution.
+- Runtime-observable changes need test evidence on the PR (see `AGENTS.md`).
+- Never commit secrets, credentials, or personal data.

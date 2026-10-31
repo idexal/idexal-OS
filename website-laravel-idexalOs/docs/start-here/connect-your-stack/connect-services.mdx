@@ -1,0 +1,200 @@
+---
+title: "Connect your services"
+description: "Sign in to idexal Os and connect the accounts your agent can use"
+keywords: ["connect services", "connectors", "Gmail", "Google Calendar", "Google Drive", "Google Workspace", "Microsoft 365", "Outlook", "Slack", "Notion", "Linear", "sign in", "Library"]
+---
+
+<Info>
+**idexal Os Cloud organization setup.** This path requires an idexal Os Cloud sign-in and an organization that has made services available to you. To stay local, keep using idexal Os for free and [add a custom MCP server](/start-here/connect-your-stack/add-an-mcp-server) to your workspace. Admins can manage team connections with [Connectors](/cloud/share-with-your-team/shared-mcp-connections).
+</Info>
+
+Use **Settings › Library** (the **Connectors** filter) for services your organization makes available,
+including Gmail, Google Calendar, Google Drive, Slack, Notion, and Linear. This
+is the recommended setup for everyday integrations.
+
+## Before you start
+
+Connect requires signing in to an idexal Os account and joining an organization
+that has Connect enabled. This is separate from signing in to an LLM provider
+such as ChatGPT.
+
+1. Open the idexal Os desktop app.
+2. Click **Sign in to idexal Os Cloud**.
+3. Complete sign-in in your browser and return to idexal Os.
+4. Choose the idexal Os organization you want to use if prompted.
+
+## Connect an account
+
+1. Open **Settings › Library** and choose the **Connectors** filter.
+2. Find the service that shows **Sign in**.
+3. Click **Sign in** and approve access on the provider's sign-in page.
+4. Return to idexal Os. The connection's status updates automatically.
+
+Some connections are managed by your organization. A service that shows
+**Set up** is not ready yet; usually an admin still needs to finish it. If a
+service is not listed, ask an organization admin to add it in idexal Os Cloud
+under **Manage › Connectors** and give you access.
+
+## Google Workspace
+
+Gmail, Google Calendar, and Google Drive use only the Google Workspace connection
+in idexal Os Cloud. Follow **Connect an account** above and choose the Google
+connection your organization made available. If it needs administrator setup,
+an admin configures it in idexal Os Cloud under **Manage › Connectors**; members
+then click **Sign in** (desktop) or **Connect** (**Your Connections** in
+idexal Os Cloud) for their own account. Google Workspace is not in the desktop
+**Add to library** › **Connector** list.
+
+There is no local Google Workspace extension, desktop OAuth client form, or
+environment-variable setup path. Previously stored local Google credentials are
+not deleted or migrated to Cloud, and do not enable local Google API access.
+Existing Cloud Google connections continue to work without reconnecting solely
+because the local integration was removed.
+
+Google and Gemini under **AI Providers** are separate model-provider integrations
+and are unchanged. Custom MCP servers and other connectors are also unchanged.
+
+### Enable the Google APIs your permissions use
+
+The Google Workspace connector uses your organization's own Google Cloud OAuth
+client. In the Google Cloud project that owns that client, open **APIs &
+Services › Library** and enable the API for each permission you turn on: Gmail
+API, Google Calendar API, Google Drive API, Google Sheets API, and Google Chat
+API. Until an API is enabled, its actions fail with a message such as “Google
+Sheets API has not been used in project … or it is disabled”, and reconnecting
+does not help.
+
+## Ask your agent to use it
+
+For Microsoft 365 administrator setup, client secrets, and consent, see
+[Connect Microsoft 365](/cloud/share-with-your-team/microsoft-365).
+
+You do not need to know an MCP server name or tool name. Ask for the outcome
+you want, for example:
+
+- “Summarize my five newest emails.”
+- “Find the Q3 launch page in Notion.”
+- “What meetings do I have tomorrow?”
+
+The agent searches the live capabilities available to your signed-in account,
+then executes an exact match. If an account still needs attention, it should
+send you back to **Settings › Library** with the action to take instead of
+telling you to add an MCP server.
+
+### Gmail drafts with attachments
+
+Ask for a draft with files from your workspace, for example: “Draft an email
+with `report.pdf` and `summary.csv` attached. Do not send it.” The same Gmail
+draft capability accepts optional `attachments` paths; a supporting idexal Os
+host uploads the files using your selected Google connection. File bytes stay
+outside the model's context. Review the returned Gmail draft link before sending.
+
+You can attach 1–10 files totaling at most 4 MiB. The files must be inside an
+authorized workspace or folder on the host running the conversation. A remote
+workspace cannot read files that exist only on your desktop.
+
+Attachment fulfillment requires a direct capability call from a compatible
+idexal Os host. Code Mode, saved Workflows, and MCP clients without that host
+support return `file_input_requires_host` and create no draft. Do not retry
+without the requested attachments. If an upload's result is uncertain, check
+Gmail Drafts before attempting creation again.
+
+### Work on whole Drive files
+
+Ask for the outcome, for example: “Fill in row 12 of the supplier workbook in
+Drive and save it.” In idexal Os Desktop the agent pulls the file into your
+workspace (by default `drive/<file name>`), works on that copy with shell tools
+such as Python, and saves it back only when you ask. idexal Os asks you to
+approve each save to Drive, following your allow, ask and deny rules. Desktop
+also confirms downloads, saves and pulls that discard local edits before changing any
+files. The file's content never passes through the
+conversation, so Excel, Word, PowerPoint, PDF, large CSV, and image files work
+the same way.
+
+- Google Docs, Sheets, and Slides are pulled as Word, Excel, and PowerPoint
+  files unless you ask for another format (CSV, which holds only a sheet's first
+  tab, Markdown, text, or PDF). Saving one back creates a new Google file next to
+  the original instead of replacing it; to change a few cells in a Google Sheet
+  in place, ask for that directly.
+- Other files are replaced in place: same link and sharing, with the previous
+  version kept in Drive's version history for 30 days.
+- If someone changed the file in Drive after it was pulled, saving stops instead
+  of overwriting their change. The agent pulls the newer version and reapplies
+  your edits, or saves your edits as a copy.
+- Pulls support files up to 250 MB. Google exports Docs, Sheets, and Slides files
+  up to about 10 MB.
+
+Pulling needs **Read all Drive files**; replacing a file idexal Os did not create
+needs **Full Drive access**. Agents with a shell but without idexal Os Desktop,
+such as a coding agent connected to idexal Os Cloud, get a five-minute download
+link for one file and save edits back through an upload session, following the
+**drive-files** Cloud skill.
+
+## Manage connected services
+
+Google Workspace and Microsoft 365 connections can perform service actions, not
+only retrieve information. An administrator chooses the enabled permissions;
+each member authorizes their own account. Additional sending, mailbox-management,
+and spreadsheet permission choices are **off by default**. Existing draft-only
+access does not automatically enable sending.
+
+| Service | Available actions |
+| --- | --- |
+| Gmail | Search/read messages and attachments; create/read/update drafts; send an existing draft, including its reply threading and attachments; archive/unarchive, mark read/unread, star, trash/restore, and manage user labels. |
+| Google Calendar | List/create events; read, edit/reschedule, and cancel events in a selected calendar; add Meet to an existing event. |
+| Drive | Search/list with date, folder, and pagination controls; read files, pull files into the workspace and save edits back, upload/share, create folders, rename/move, and trash/restore. |
+| Sheets | Create spreadsheets, inspect their tabs, read cell ranges, write cells, and append rows. Writes default to literal values; formula parsing requires explicit approval. |
+| Outlook | Read mail, create drafts and reply drafts, send existing drafts, change read status/categories, and move messages between inbox/archive/deleted items. |
+| Outlook Calendar | List/create, edit/reschedule, cancel, and delete events. |
+| OneDrive | Search/read, write text files, create folders, and rename/move items. |
+
+For Gmail mailbox management enable **Manage Gmail: send, archive, read status, labels, and trash**; for sending without mailbox
+management enable **Send email drafts after confirmation**. Google uses the same
+OAuth grant for draft editing and draft sending, but idexal Os enforces the
+administrator's separate action choices. For Sheets, enable spreadsheet read or
+write access, or use the applicable selected-file Drive access. Microsoft mail
+sending and mailbox management have separate permission choices as well.
+
+After enabling a new provider permission, reconnect and grant the requested
+access. Disabling a write permission in idexal Os blocks the new management
+actions even when an older provider token still carries that grant. A selected
+connection always uses that member's selected account, not another available
+account.
+
+Ask for an outcome, for example “Archive this thread and mark it read,” “Move
+tomorrow's meeting to 3 pm,” or “Append these rows to the budget spreadsheet.”
+Sending mail, deleting/trashing content, notifying meeting guests, and enabling
+spreadsheet formula parsing require explicit requests and the corresponding
+confirmation inputs. Creating or selecting a connector does not authorize them.
+If a write times out, check the service before retrying: it may already have
+completed. Microsoft accepts sends asynchronously, so its receipt means
+**accepted**, not delivered.
+
+Drive's generic file reader exports the first Sheets tab as CSV. Use the Sheets
+metadata and range operations to work with other tabs. Cell operations are
+bounded to 5,000 cells per request; split larger work into explicit ranges.
+These operations do not claim every provider feature: rich Docs/Slides editing,
+spreadsheet formatting/pivots, and permanent mailbox/file deletion are separate
+from the actions above. External MCP connectors expose their provider's actual
+tools and remain subject to that provider's account, plan, and approval rules.
+
+## Connect, connectors, and connections
+
+- **Connect** is the Cloud service for discovering and using connections. In the
+  desktop app, **Settings › Library** (the **Connectors** filter) shows accounts
+  and their readiness.
+- A **connector** is an MCP service your organization adds on its own, without
+  wrapping it in a plugin. Organization admins add connectors in idexal Os Cloud
+  under **Manage › Connectors** and grant member or team access.
+- A **connection** is your own signed-in instance of a connector — one
+  connector, instantiated per user with that user's account.
+- The **MCP Gateway** is the hosted endpoint that lets external MCP clients
+  use capabilities from an idexal Os organization. See
+  [idexal Os MCP Gateway](/cloud/run-in-the-cloud/cloud-mcp).
+- **Add an MCP server** is the advanced path for a custom or local server that
+  your organization does not provide through Connect.
+
+If you are building a custom integration, continue with
+[Add an MCP server](/start-here/connect-your-stack/add-an-mcp-server). If you
+are an organization admin, see
+[Sharing MCP connections with your team](/cloud/share-with-your-team/shared-mcp-connections).

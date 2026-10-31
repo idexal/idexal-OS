@@ -1,0 +1,134 @@
+# idexal Os evaluation stack — pull-only, no repository clone or build:
+#
+#   umask 077
+#   printf 'IDEXAL_AUTH_SECRET=%s\nIDEXAL_DB_ENCRYPTION_KEY=%s\n' \
+#     "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > .env
+#   docker compose -f docker-compose.eval.yml up -d --wait
+#
+# Then open http://localhost:3005 and sign up.
+#
+# No repo clone, no build, no launcher script. Uses the published GHCR images.
+# NOT a production posture: dev-grade MySQL credentials, stub worker provisioner,
+# no cloud sandboxes, no email delivery, public signup enabled by default.
+#
+# Required secrets:
+#   IDEXAL_AUTH_SECRET       Better Auth secret (at least 32 random characters)
+#   IDEXAL_DB_ENCRYPTION_KEY Den DB encryption key (at least 32 random characters)
+#
+# Optional knobs:
+#   IDEXAL_WEB_PORT      host port for the web app                (default: 3005)
+#   IDEXAL_API_PORT      host port for the Den API                (default: 8788)
+#   IDEXAL_ALLOW_SIGNUP  allow public signup for evaluation       (default: true)
+#   IDEXAL_ORG_NAME      single organization name                 (default: idexal Os Evaluation)
+#
+# Private first administrator (instead of public signup), see
+# packages/docs/self-host/deploy-to-your-cloud/first-administrator.mdx:
+#   IDEXAL_OWNER_EMAILS  comma-separated owner emails allowed to claim the
+#                          organization at /setup                    (default: empty, no bootstrap)
+#   IDEXAL_SETUP_CODE    one-time setup code entered at /setup    (default: empty, no bootstrap)
+# Set both together with IDEXAL_ALLOW_SIGNUP=false; leave both empty to keep
+# the default public-signup evaluation.
+
+name: idexal-os-eval
+
+services:
+  mysql:
+    image: mysql:8.4@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb
+    command:
+      - --performance_schema=OFF
+      - --innodb-buffer-pool-size=128M
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: idexal_os_den
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -ppassword --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    volumes:
+      - idexal-os-eval-mysql:/var/lib/mysql
+    # intentionally no host port: MySQL stays internal to the compose network
+
+  den-migrate:
+    image: ghcr.io/idexal/idexal-os-den-api:0.18.46@sha256:e254a3842e7ecb6d0c7128b5f17201e92ac4ee566ad82c70c468938a3faa6407
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["sh", "-lc"]
+    command: ["cd /app/ee/packages/den-db && (node ./dist/scripts/bootstrap.js || node --import tsx ./dist/scripts/bootstrap.js)"]
+    environment:
+      DATABASE_URL: mysql://root:password@mysql:3306/idexal_os_den
+      DEN_DB_ENCRYPTION_KEY: ${IDEXAL_DB_ENCRYPTION_KEY:?Set IDEXAL_DB_ENCRYPTION_KEY to at least 32 random characters}
+
+  den:
+    image: ghcr.io/idexal/idexal-os-den-api:0.18.46@sha256:e254a3842e7ecb6d0c7128b5f17201e92ac4ee566ad82c70c468938a3faa6407
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      den-migrate:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${IDEXAL_API_PORT:-8788}:8788"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8788/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    environment:
+      PORT: "8788"
+      DATABASE_URL: mysql://root:password@mysql:3306/idexal_os_den
+      BETTER_AUTH_SECRET: ${IDEXAL_AUTH_SECRET:?Set IDEXAL_AUTH_SECRET to at least 32 random characters}
+      DEN_DB_ENCRYPTION_KEY: ${IDEXAL_DB_ENCRYPTION_KEY:?Set IDEXAL_DB_ENCRYPTION_KEY to at least 32 random characters}
+      BETTER_AUTH_URL: http://localhost:${IDEXAL_WEB_PORT:-3005}
+      DEN_ORG_MODE: single_org
+      DEN_SINGLE_ORG_NAME: ${IDEXAL_ORG_NAME:-idexal Os Evaluation}
+      DEN_SINGLE_ORG_SLUG: default
+      DEN_SINGLE_ORG_ALLOW_PUBLIC_SIGNUP: ${IDEXAL_ALLOW_SIGNUP:-true}
+      # Initial-administrator bootstrap (/setup). Empty disables the flow.
+      DEN_SINGLE_ORG_OWNER_EMAILS: ${IDEXAL_OWNER_EMAILS:-}
+      DEN_INITIAL_ADMIN_BOOTSTRAP_CODE: ${IDEXAL_SETUP_CODE:-}
+      DEN_REQUIRE_EMAIL_VERIFICATION: "false"
+      DEN_API_PUBLIC_URL: http://localhost:${IDEXAL_API_PORT:-8788}
+      DEN_MCP_RESOURCE_URL: http://localhost:${IDEXAL_API_PORT:-8788}/mcp
+      CORS_ORIGINS: http://localhost:${IDEXAL_WEB_PORT:-3005},http://127.0.0.1:${IDEXAL_WEB_PORT:-3005},http://localhost:${IDEXAL_API_PORT:-8788},http://127.0.0.1:${IDEXAL_API_PORT:-8788}
+      DEN_BETTER_AUTH_TRUSTED_ORIGINS: http://localhost:${IDEXAL_WEB_PORT:-3005},http://127.0.0.1:${IDEXAL_WEB_PORT:-3005},http://localhost:${IDEXAL_API_PORT:-8788},http://127.0.0.1:${IDEXAL_API_PORT:-8788}
+      PROVISIONER_MODE: stub
+      WORKER_URL_TEMPLATE: https://workers.local/{workerId}
+
+  web:
+    image: ghcr.io/idexal/idexal-os-den-web:0.18.46@sha256:82affe9e09523852dbdb8ffd8c9ac36763a4f7d5d4e4c94d5e2b513e37e04a7b
+    restart: unless-stopped
+    depends_on:
+      den:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${IDEXAL_WEB_PORT:-3005}:3005"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3005/api/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+    environment:
+      # Den web origin (denUrls source of truth for readiness and derived URLs).
+      DEN_BASE_URL: http://localhost:${IDEXAL_WEB_PORT:-3005}
+      # Container-internal API base for server-side calls: the /api/auth/* proxy
+      # (SSO ACS, SCIM, /setup account creation), readiness, SSO probe. Must be
+      # the in-network service URL; the host port is unreachable from here.
+      DEN_API_BASE: http://den:8788
+      # Browser-reachable API origin (what runtime-config hands to clients).
+      DEN_API_PUBLIC_URL: http://localhost:${IDEXAL_API_PORT:-8788}
+      DEN_AUTH_ORIGIN: http://localhost:${IDEXAL_WEB_PORT:-3005}
+      DEN_WEB_PUBLIC_ORIGIN: http://localhost:${IDEXAL_WEB_PORT:-3005}
+      DEN_WEB_IDEXAL_AUTH_CALLBACK_URL: http://localhost:${IDEXAL_WEB_PORT:-3005}
+      DEN_ORG_MODE: single_org
+      DEN_SINGLE_ORG_NAME: ${IDEXAL_ORG_NAME:-idexal Os Evaluation}
+      DEN_SINGLE_ORG_SLUG: default
+      DEN_SINGLE_ORG_ALLOW_PUBLIC_SIGNUP: ${IDEXAL_ALLOW_SIGNUP:-true}
+
+volumes:
+  idexal-os-eval-mysql:

@@ -1,0 +1,127 @@
+import type { BrowserEvaluation, EvaluateOptions } from "@idexal/cdp";
+import type { DenFetchResult, DenSession, NativeConnectorInput } from "@idexal/behaviors";
+import type { AttachedSurface, Surface } from "@idexal/cdp";
+import type { StartMockMcpOptions } from "@idexal/labs";
+import type { DaytonaExec, DesktopHandle } from "@idexal/hosts";
+import type { App } from "./desktop-app.ts";
+import type { AppWeb, SeedAppWebOptions } from "./app-web.ts";
+import type { Den, ServerOptions } from "./den.ts";
+import type { FaultProxy } from "./faults.ts";
+import type { MockBoot } from "./mock.ts";
+
+export interface SeedDesktopOptions {
+  den?: Den;
+  as?: string;
+  signIn?: false;
+  model?: string;
+  workspacePath?: string;
+  /** Arrange a previously activated private-Den installation; does not test activation. */
+  enterpriseActivated?: boolean;
+  profileDir?: string;
+  name?: string;
+  /** Extra environment for this isolated Electron process. */
+  env?: Record<string, string>;
+  /** Refuse the pooled lane's shared sandbox; this desktop gets one of its own. */
+  ownSandbox?: boolean;
+  /** With a Den: `false` signs in without creating a workspace (a member who has not made one yet). */
+  workspace?: false;
+}
+
+export interface SeedWebOptions {
+  den: Den;
+  signedInAs?: DenSession | "admin" | string;
+  startPath?: string;
+  headless?: boolean;
+  viewport?: { width: number; height: number; deviceScaleFactor?: number };
+}
+
+export interface OrgConnectionInput {
+  name: string;
+  url: string;
+  authType: string;
+  credentialMode: string;
+  access: { orgWide: boolean };
+}
+
+export type SeedDenLinkProfile = "baseline" | "vpn-flaky-emulated";
+export type SeedDenLinkClient = "public-preview" | "sandbox-loopback";
+export type SeedDenLinkRule = { pathPrefix?: string; times?: number; everyNth?: number } & (
+  | { kind: "latency"; delayMs: number; jitterMs?: number }
+  | { kind: "status"; statusCode: number; body?: unknown }
+  | { kind: "reset" }
+  | { kind: "stall" }
+);
+
+export interface SeedDenLinkOptions {
+  sandboxId?: string;
+  client?: SeedDenLinkClient;
+  port?: number;
+  adminPort?: number;
+  daytonaExec?: DaytonaExec;
+}
+
+export interface SeedDenLink extends AsyncDisposable {
+  ref: Den["ref"];
+  admin: {
+    phase(name: string, profile?: SeedDenLinkProfile): Promise<void>;
+    rules(rules: SeedDenLinkRule[]): Promise<void>;
+    bandwidth(bytesPerSec: number | null): Promise<void>;
+    offline(durationMs: number): Promise<void>;
+    clear(): Promise<void>;
+    requests(): Promise<{
+      requests: Array<{
+        method: string;
+        path: string;
+        status: number;
+        faulted: boolean;
+        fault?: string;
+        phase: string;
+        profile: SeedDenLinkProfile;
+        at: number;
+      }>;
+      refusedConnections: Record<string, number>;
+      phase: string;
+      profile: SeedDenLinkProfile;
+    }>;
+    stats(): Promise<{
+      requests: number;
+      faults: number;
+      refusedConnections: number;
+      phase: string;
+      profile: SeedDenLinkProfile;
+    }>;
+    health(): Promise<{ ok: boolean; phase: string; offline: boolean }>;
+  };
+}
+
+/** Framework-free arrangement contract implemented by the testkit world fixture. */
+export interface Seed {
+  den(options?: Omit<ServerOptions, "place">): Promise<Den>;
+  /** With a Den the desktop is signed in (or arranged signed-out) against it and carries a workspace unless `workspace: false`. */
+  desktop(options: SeedDesktopOptions & { den: Den }): Promise<App>;
+  desktop(options?: SeedDesktopOptions): Promise<App | DesktopHandle>;
+  appWeb(options: SeedAppWebOptions): Promise<AppWeb>;
+  web(options: SeedWebOptions): Promise<AttachedSurface>;
+  /**
+   * Ensure the workspace at `path` is selected, creating it unless the selected
+   * workspace already sits there (a first launch selects its own default folder,
+   * which must never satisfy a declared path); create:true forces creation.
+   */
+  workspace(app: Surface, path?: string, options?: { create?: boolean }): Promise<{ workspaceId: string; route: string }>;
+  session(app: Surface, options?: { title?: string }): Promise<{ sessionId: string; title: string }>;
+  sessions(app: Surface, titles: readonly string[]): Promise<{ sessionId: string; title: string }[]>;
+  signIn(app: Surface, member: DenSession, identity: string): Promise<void>;
+  api(session: DenSession, path: string, init?: RequestInit): Promise<DenFetchResult>;
+  orgConnection(admin: DenSession, input: OrgConnectionInput): Promise<{ id: string; name: string }>;
+  nativeConnector(admin: DenSession, input: NativeConnectorInput): Promise<{ id: string; name: string }>;
+  mock(options?: StartMockMcpOptions): MockBoot;
+  faultProxy(den: Den): Promise<FaultProxy>;
+  denLink(den: Den, options?: SeedDenLinkOptions): Promise<SeedDenLink>;
+  tmpPath(label: string): string;
+  composerText(app: Surface, text: string): Promise<void>;
+  /** Deliver a fixture-owned link at the renderer ingress; does not exercise OS protocol registration. */
+  deepLink(app: Surface, url: string): Promise<void>;
+  browserFixtureDiscovery(app: Surface, origin: string, action: "hold" | "release"): Promise<void>;
+  /** Migration-only raw write escape hatch. New specs must not use it. */
+  evalIn<T>(surface: Surface, expression: BrowserEvaluation<T>, options?: EvaluateOptions): Promise<Awaited<T>>;
+}

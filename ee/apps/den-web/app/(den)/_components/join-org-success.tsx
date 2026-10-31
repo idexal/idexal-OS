@@ -1,0 +1,322 @@
+"use client";
+
+import { detectPlatform, type DetectedPlatform } from "@idexal/ui/react";
+import { useEffect, useState } from "react";
+import {
+  getDesktopHandoffGrant,
+  getDesktopHandoffIdexalOsUrl,
+  rememberDesktopHandoffGrant,
+} from "../_lib/desktop-handoff";
+import { getErrorMessage, requestJson } from "../_lib/den-flow";
+import { getInstallConfigErrorMessage } from "../_lib/install-errors";
+import { detectedInstallPlatform, downloadCtaLabel, installDownloadHref } from "../_lib/install-download";
+import { isMobileUserAgent } from "../_lib/platform";
+import { useDesktopHandoffStatus } from "../_lib/use-desktop-handoff-status";
+import { OnboardingCard } from "./onboarding-card";
+import { OnboardingShell } from "./onboarding-shell";
+import { OrganizationBrandIdentity, type OrganizationBrand } from "./organization-brand-identity";
+
+const IDEXAL_DOWNLOAD_URL = "https://os.idexal.com/download";
+
+function ReturnToIdexalOsStatus({
+  idexalOsUrl,
+  grant,
+  organizationName,
+}: {
+  idexalOsUrl: string;
+  grant: string | null;
+  organizationName: string;
+}) {
+  const { status, timedOut } = useDesktopHandoffStatus(grant);
+  const [copied, setCopied] = useState(false);
+
+  async function copyIdexalOsUrl() {
+    await navigator.clipboard.writeText(idexalOsUrl);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1800);
+  }
+
+  if (status === "consumed") {
+    return (
+      <div className="rounded-2xl bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-700" data-testid="desktop-connected" aria-live="polite">
+        Connected — {organizationName} is ready in idexal Os.
+      </div>
+    );
+  }
+
+  if (timedOut || status === "unknown") {
+    return (
+      <div className="grid gap-3 rounded-2xl bg-slate-50 p-4 text-sm text-slate-600" data-testid="desktop-handoff-troubleshoot" aria-live="polite">
+        <p className="m-0">
+          Nothing opened?{" "}
+          <button type="button" className="font-medium text-slate-950 underline-offset-4 hover:underline" onClick={() => window.location.assign(idexalOsUrl)}>
+            Return to idexal Os again
+          </button>
+        </p>
+        <div className="grid gap-2">
+          <p className="m-0">Still stuck? Copy this sign-in link into idexal Os:</p>
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <input className="den-input min-w-0 flex-1 text-xs" value={idexalOsUrl} readOnly onFocus={(event) => event.currentTarget.select()} />
+            <button type="button" className="den-button-secondary sm:w-auto" onClick={() => void copyIdexalOsUrl()}>
+              {copied ? "Copied" : "Copy link"}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <p className="m-0 text-sm text-slate-500" aria-live="polite">
+      Returning to idexal Os…
+    </p>
+  );
+}
+
+type JoinOrgSuccessProps = {
+  organizationName: string;
+  brand: OrganizationBrand;
+  desktopAuthRequested: boolean;
+  desktopAuthScheme: string;
+  onContinueInBrowser: () => void;
+};
+
+export function JoinOrgSuccess({
+  organizationName,
+  brand,
+  desktopAuthRequested,
+  desktopAuthScheme,
+  onContinueInBrowser,
+}: JoinOrgSuccessProps) {
+  const [isMobile, setIsMobile] = useState<boolean | null>(null);
+  const [detected, setDetected] = useState<DetectedPlatform | null>(null);
+  const [platformReady, setPlatformReady] = useState(false);
+  const [installBusy, setInstallBusy] = useState(false);
+  const [emailBusy, setEmailBusy] = useState(false);
+  const [emailSent, setEmailSent] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [handoffBusy, setHandoffBusy] = useState(false);
+  const [desktopIdexalOsUrl, setDesktopIdexalOsUrl] = useState<string | null>(null);
+  const [desktopGrant, setDesktopGrant] = useState<string | null>(null);
+  const [downloadHref, setDownloadHref] = useState<string | null>(null);
+
+  useEffect(() => {
+    setIsMobile(isMobileUserAgent());
+    let cancelled = false;
+    void detectPlatform()
+      .then((platform) => {
+        if (cancelled) {
+          return;
+        }
+        setDetected(platform ?? { os: "macos", arch: "arm64", osVersion: null, source: "ua" });
+        setPlatformReady(true);
+      })
+      .catch(() => {
+        if (cancelled) {
+          return;
+        }
+        setDetected({ os: "macos", arch: "arm64", osVersion: null, source: "ua" });
+        setPlatformReady(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  function startInstallerDownload(href: string) {
+    const link = document.createElement("a");
+    link.href = href;
+    link.rel = "noopener noreferrer";
+    link.target = "_blank";
+    link.setAttribute("data-testid", "join-org-download-link");
+    document.body.append(link);
+    link.click();
+    link.remove();
+  }
+
+  async function handleGetApp() {
+    setInstallBusy(true);
+    setActionError(null);
+
+    try {
+      // Joining made this organization active, so the signed-in install routes
+      // serve its approved desktop version.
+      const { response, payload } = await requestJson("/v1/me/install-config", { method: "GET" }, 12000);
+      if (!response.ok) {
+        throw new Error(getInstallConfigErrorMessage(payload, response.status));
+      }
+
+      const platform = detectedInstallPlatform(detected) ?? "mac-arm64";
+      const href = installDownloadHref(platform);
+      setDownloadHref(href);
+      startInstallerDownload(href);
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "Could not prepare your download.");
+    } finally {
+      setInstallBusy(false);
+    }
+  }
+
+  async function handleReturnToIdexalOs() {
+    setHandoffBusy(true);
+    setActionError(null);
+
+    try {
+      const { response, payload } = await requestJson(
+        "/v1/auth/desktop-handoff",
+        { method: "POST", body: JSON.stringify({ desktopScheme: desktopAuthScheme }) },
+        12000,
+      );
+      if (!response.ok) {
+        setActionError(getErrorMessage(payload, `Could not return to idexal Os (${response.status}).`));
+        return;
+      }
+
+      const idexalOsUrl = getDesktopHandoffIdexalOsUrl(payload);
+      if (!idexalOsUrl) {
+        setActionError("idexal Os sign-in was prepared, but no app link was returned.");
+        return;
+      }
+
+      const grant = getDesktopHandoffGrant(payload, idexalOsUrl);
+      rememberDesktopHandoffGrant(grant);
+      setDesktopIdexalOsUrl(idexalOsUrl);
+      setDesktopGrant(grant);
+      window.location.assign(idexalOsUrl);
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "Could not return to idexal Os.");
+    } finally {
+      setHandoffBusy(false);
+    }
+  }
+
+  async function handleEmailDownload() {
+    setEmailBusy(true);
+    setActionError(null);
+
+    try {
+      const { response, payload } = await requestJson("/v1/me/send-download-link", { method: "POST" }, 12000);
+      if (!response.ok) {
+        setActionError(getErrorMessage(payload, `Could not send the download link (${response.status}).`));
+        return;
+      }
+      setEmailSent(true);
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "Could not send the download link.");
+    } finally {
+      setEmailBusy(false);
+    }
+  }
+
+  return (
+    <OnboardingShell state="joined" width="wide" background="surface">
+      <section data-testid="join-org-success">
+        <OnboardingCard organization={{ name: organizationName, brand }}>
+          <div className="grid gap-3">
+            <h1 className="m-0 grid max-w-full gap-1 text-[30px] font-semibold leading-[38px] tracking-[-0.03em] text-slate-950 sm:text-[38px] sm:leading-[46px]">
+              <span>You&apos;re in, welcome to</span>
+              {/* No horizontal gap: the possessive must hug the org identity
+                  ("Acme Robotics's idexal Os", not "Acme Robotics 's"). */}
+              <span className="flex min-w-0 flex-wrap items-center gap-y-1">
+                <OrganizationBrandIdentity organizationName={organizationName} brand={brand} />
+                <span className="whitespace-nowrap">&apos;s {brand.appName}</span>
+              </span>
+            </h1>
+            <p className="m-0 max-w-2xl text-[15px] leading-[23px] text-slate-600">
+              {desktopAuthRequested
+                ? "Your team setup is ready. Return to idexal Os to continue where you left off."
+                : "The desktop app is where idexal Os runs on your computer and puts your team's setup to work."}
+            </p>
+          </div>
+
+          {isMobile === null ? (
+            <p className="m-0 text-sm text-slate-500">Preparing your next step...</p>
+          ) : isMobile ? (
+            <div className="grid gap-3">
+              <div className="grid gap-2 rounded-2xl bg-slate-50 p-4" data-testid="join-org-mobile-note">
+                <p className="m-0 text-sm font-medium text-slate-950">idexal Os runs on your computer.</p>
+                <p className="m-0 text-sm leading-6 text-slate-600">
+                  Email the install link to yourself and continue when you&apos;re back at your desk.
+                </p>
+              </div>
+              <button
+                type="button"
+                className="den-button-primary min-h-12 w-full"
+                onClick={() => void handleEmailDownload()}
+                disabled={emailBusy || emailSent}
+                data-testid="join-org-email-download"
+              >
+                {emailBusy ? "Sending..." : emailSent ? "Sent" : "Email me the download link"}
+              </button>
+              {emailSent ? <div className="den-notice is-info">Sent — check your inbox when you&apos;re back at your desk.</div> : null}
+            </div>
+          ) : desktopAuthRequested ? (
+            desktopIdexalOsUrl ? (
+              <ReturnToIdexalOsStatus idexalOsUrl={desktopIdexalOsUrl} grant={desktopGrant} organizationName={organizationName} />
+            ) : (
+              <button
+                type="button"
+                className="den-button-primary min-h-12 w-full"
+                onClick={() => void handleReturnToIdexalOs()}
+                disabled={handoffBusy}
+                data-testid="join-org-return-idexalos"
+              >
+                {handoffBusy ? "Returning to idexal Os..." : "Return to idexal Os"}
+              </button>
+            )
+          ) : !platformReady ? (
+            <p className="m-0 text-sm text-slate-500">Preparing your next step...</p>
+          ) : (
+            <div className="grid gap-3">
+              <button
+                type="button"
+                className="den-button-primary min-h-12 w-full"
+                onClick={() => void handleGetApp()}
+                disabled={installBusy}
+                data-testid="join-org-get-app"
+                data-download-href={downloadHref ?? undefined}
+              >
+                {installBusy ? "Preparing your download..." : `${downloadCtaLabel(detected?.os ?? null)} →`}
+              </button>
+              <button
+                type="button"
+                className="min-h-12 w-full rounded-full px-3 text-sm font-medium text-slate-500 underline-offset-4 hover:text-slate-950 hover:underline"
+                onClick={() => void handleReturnToIdexalOs()}
+                disabled={handoffBusy}
+                data-testid="join-org-open-app"
+              >
+                {handoffBusy ? "Opening idexal Os..." : "Already have idexal Os? Open it."}
+              </button>
+            </div>
+          )}
+
+          {desktopAuthRequested && desktopIdexalOsUrl ? null : (
+            <div className="rounded-2xl bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-700" data-testid="join-org-connected">
+              Connected — idexal Os is set up for {organizationName}
+            </div>
+          )}
+
+          <button
+            type="button"
+            className="min-h-12 w-full rounded-full px-3 text-sm font-medium text-slate-500 underline-offset-4 hover:text-slate-950 hover:underline"
+            onClick={onContinueInBrowser}
+            data-testid="join-org-continue-browser"
+          >
+            Continue in the browser
+          </button>
+
+          {actionError ? (
+            <div className="grid gap-3">
+              <div className="den-notice is-error">{actionError}</div>
+              {desktopAuthRequested ? null : (
+                <a href={IDEXAL_DOWNLOAD_URL} className="den-button-secondary min-h-12 w-full">
+                  Open the public download page
+                </a>
+              )}
+            </div>
+          ) : null}
+        </OnboardingCard>
+      </section>
+    </OnboardingShell>
+  );
+}

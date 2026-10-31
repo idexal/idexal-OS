@@ -1,0 +1,160 @@
+---
+title: "Microsoft Entra SAML SSO"
+description: "Connect Microsoft Entra ID to idexal Os Cloud with SAML"
+---
+
+Use this guide when an organization wants members to sign in to idexal Os with
+Microsoft Entra ID.
+
+After SAML sign-in works, use
+[Microsoft Entra SCIM provisioning](/cloud/scim-microsoft-entra) to synchronize
+members and groups automatically.
+
+## Before you start
+
+You need:
+
+- An idexal Os organization on the Team or Enterprise plan.
+- Owner access in that idexal Os organization.
+- Admin access to a Microsoft Entra enterprise application.
+- The final idexal Os auth origin, for example `https://os.idexal.com`.
+
+idexal Os keeps a new SSO configuration disabled until you verify the domain,
+complete a real authentication test, and explicitly enable SSO. Keep password or
+existing recovery access available during setup.
+
+## 1. Create the Entra enterprise app
+
+In the Microsoft Azure portal, open **Microsoft Entra ID** and create a new
+enterprise application for idexal Os. Choose **SAML** as the single sign-on
+method.
+
+## 2. Configure Basic SAML Configuration
+
+In Entra, open **Single sign-on** and edit **Basic SAML Configuration**.
+
+Set:
+
+| Entra field | Value |
+| --- | --- |
+| Identifier (Entity ID) | The idexal Os auth origin, for example `https://os.idexal.com` |
+| Reply URL (Assertion Consumer Service URL) | The ACS URL idexal Os shows after saving SAML, for example `https://os.idexal.com/api/auth/sso/saml2/sp/acs/idexal-os-sso-<org-id>` |
+| Sign on URL | The org-specific idexal Os **Sign-in URL** shown after saving SAML, for example `https://os.idexal.com/sso/<org-slug>` |
+| Relay State | Leave blank |
+
+The Entity ID must be the idexal Os auth origin. Do not use the Entra tenant
+identifier, `https://sts.windows.net/<tenant-id>/`, as the Entity ID.
+
+idexal Os SAML connections are organization-scoped. If a user belongs to
+multiple idexal Os organizations, the Entra app, ACS URL, and Sign-in URL select
+which organization they are entering.
+
+## 3. Configure SAML signing
+
+Open **SAML Certificates** and edit the token signing certificate settings.
+
+Set:
+
+- **Signing Option**: `Sign SAML assertion`
+- **Signing Algorithm**: `SHA-256`
+
+idexal Os requires signed SAML assertions. If Entra signs only the response, the
+callback fails with `saml_error` and `Invalid SAML response`.
+
+After any certificate change, copy the active certificate again. Entra can
+create or activate a new signing certificate while you are editing SAML
+settings, and idexal Os must store the certificate that is currently active.
+
+## 4. Copy Entra values into idexal Os
+
+In idexal Os, open the organization dashboard, then **SSO**. Choose **SAML** and
+enter:
+
+| idexal Os field | Entra value |
+| --- | --- |
+| IdP Issuer URL | **Microsoft Entra Identifier**, for example `https://sts.windows.net/<tenant-id>/` |
+| Domain | The Entra-managed email domain, for example `example.onmicrosoft.com` |
+| SAML Entry Point | **Login URL**, for example `https://login.microsoftonline.com/<tenant-id>/saml2` |
+| Audience URL | Leave blank so idexal Os uses the auth origin, unless support gives you a different audience |
+| IdP Certificate | The active **Certificate (Base64)** from Entra |
+
+Save the SSO connection. idexal Os then shows setup values including
+**Sign-in URL**, **Redirect URL**, **ACS URL**, and **Metadata URL**. Copy the
+generated **ACS URL** back into Entra's **Reply URL** if it was not available
+before the first save. Copy the idexal Os **Sign-in URL** into Entra's
+**Sign on URL** so the Entra tile can launch the same organization-scoped flow.
+
+The saved configuration is still disabled at this point.
+
+## 5. Verify the email domain
+
+In idexal Os **Settings → SSO**, select **Request token** under domain
+verification. Create a DNS TXT record for the email domain:
+
+| DNS field | Value |
+| --- | --- |
+| Type | `TXT` |
+| Host / name | The **Host / name** value idexal Os displays |
+| Value | The token idexal Os displays |
+
+Use the host value when your DNS provider appends the domain automatically. Use
+the full DNS name when your provider expects the complete record name. After the
+TXT record resolves publicly, select **Verify domain** in idexal Os.
+
+The token is a one-time proof and expires after seven days. After verification
+succeeds, you may remove the TXT record.
+
+## 6. Assign test users
+
+In Entra, open the enterprise application's **Users and groups** page and assign
+the users who should be allowed to sign in.
+
+For external users, assign the guest identity shown by Entra, not only the
+original external email address.
+
+## 7. Test and enable SSO in idexal Os
+
+After the Entra assignment and domain verification are complete:
+
+1. In idexal Os **Settings → SSO**, select **Enable Config** or **Enable SSO**.
+2. In the **Test SSO before enabling it** dialog, select **SSO Login**.
+3. Complete Microsoft authentication in the separate window.
+4. Return to idexal Os and confirm **Authentication test successful**.
+5. Select **Enable SSO**.
+
+SSO is not offered to organization members until you explicitly enable it after
+the successful test. If you edit the SSO configuration after a successful test,
+test it again before enabling. Test links expire after five minutes.
+
+## Just-in-time provisioning and password signup
+
+After Entra SAML SSO is enabled for a verified domain, idexal Os's standard
+sign-in flow routes users with that email domain to the organization SSO flow.
+When a user completes SAML sign-in successfully, idexal Os can create their
+organization membership just in time with the default `Member` role.
+
+JIT provisioning happens only after successful SAML authentication. Creating an
+email/password account with the same email domain does not add the user to the
+organization or create a SCIM-managed identity. If that user later completes
+SSO, idexal Os can link the matching account and provision the organization
+membership through SSO.
+
+idexal Os does not convert SAML attributes such as `role`, `groups`, or `admin`
+into elevated organization roles. The owner assigns roles in
+idexal Os; ownership changes require ownership transfer. For group-based Admin,
+first configure [Entra SCIM provisioning](/cloud/scim-microsoft-entra), then
+explicitly approve the synchronized team using
+[Team Admin access](/cloud/members-and-rbac#team-admin-access).
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `AADSTS700016: Application with identifier 'https://os.idexal.com' was not found` | Entra's Entity ID does not match idexal Os's SAML issuer | Set **Identifier (Entity ID)** to the idexal Os auth origin |
+| `/?error=saml_error&error_description=Invalid%20SAML%20response` | Entra is signing with a different certificate than the one saved in idexal Os, or assertions are not signed | Confirm **Signing Option** is `Sign SAML assertion`, then paste Entra's active **Certificate (Base64)** into idexal Os and save |
+| `/?error=unsolicited_response&error_description=IdP-initiated+SSO+not+allowed` | The deployment is running an older idexal Os version that rejects IdP-initiated SAML | Upgrade idexal Os, or launch from the org-specific idexal Os **Sign-in URL** |
+| User reaches Microsoft but cannot continue | The user is not assigned to the enterprise application | Add the user under **Users and groups** |
+| Reply URL mismatch | Entra's Reply URL does not match the idexal Os ACS URL exactly | Copy the ACS URL from idexal Os and paste it into Entra |
+| idexal Os shows **Verify the SSO domain before testing this configuration** | The DNS TXT proof has not passed yet | Create the TXT record shown by idexal Os, wait for DNS propagation, then select **Verify domain** |
+| The test dialog shows **The SSO authentication window was closed before the test completed** | The popup was closed or redirected away before idexal Os received the test result | Start a new test and keep the authentication window open until it returns or closes itself |
+| idexal Os will not enable SSO after editing settings | The current configuration has not been tested successfully | Run **SSO Login** again, then select **Enable SSO** after the successful test |

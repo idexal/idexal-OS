@@ -1,0 +1,262 @@
+import { allocateFreePort, attachSurface, evaluateOnSurface } from "@idexal/cdp";
+import type { AttachedSurface } from "@idexal/cdp";
+import type { Seed } from "@idexal/env";
+import { localHost } from "@idexal/hosts";
+import type { ElectronSurfaceOptions } from "@idexal/hosts";
+
+/**
+ * Launch of a packaged desktop flavor on an isolated profile. The fresh world
+ * has no bootstrap, no activation, no sign-in: the cloud and enterprise
+ * flavors render a gate above the routes here, which is the one code path
+ * dogfooding never exercises. The activated world seeds the bootstrap an
+ * enterprise installation carries after activation, so an update on an
+ * existing customer's machine is covered too. `desktop()` cannot be used
+ * because its readiness probe only recognises signed-in surfaces, so these
+ * worlds attach directly.
+ */
+
+export type PackagedFlavor = "public" | "cloud" | "enterprise";
+
+export interface RendererException {
+  text: string;
+  description: string;
+}
+
+/**
+ * Unhandled promise rejections a packaged launch is known to produce today,
+ * matched exactly against `rejectionMessage()`. Tracked debt: every entry
+ * names a boot-time caller that should not reject, and the list shrinks back
+ * to empty once that caller is fixed; anything not listed fails the launch
+ * specs.
+ *
+ * Retired entries, kept so their shape is recognisable if they return:
+ * - "Error: Paper Shaders: WebGL is not supported in this browser" from the
+ *   decorative `Dithering` background on WebGL-less GPUs (Xvfb CI, some VDI),
+ *   until DitherBackdrop started skipping the shader without WebGL2.
+ * - "Error: Error invoking remote method 'idexalos:desktop': Error: idexal Os
+ *   must be activated from your Den portal before this command is available."
+ *   from the fire-and-forget window-chrome IPC (theme.ts, ui-state-store.ts),
+ *   until it caught its own rejection.
+ */
+export const KNOWN_LAUNCH_REJECTIONS: readonly string[] = [];
+
+const UNHANDLED_REJECTION_PREFIX = /^Uncaught \(in promise\)\s*/i;
+
+/**
+ * A synchronous uncaught exception is what unmounts the React tree and leaves a
+ * blank window. Unhandled promise rejections surface as "Uncaught (in promise)"
+ * and are classified separately by `isKnownRejection`.
+ */
+export function isRenderCrash(exception: RendererException): boolean {
+  return !UNHANDLED_REJECTION_PREFIX.test(exception.text);
+}
+
+/**
+ * The rejection message as Chromium reports it: the summary text after the
+ * "Uncaught (in promise)" prefix when present, otherwise the first line of the
+ * rejected value's description (an Error rejection keeps its message there).
+ */
+export function rejectionMessage(exception: RendererException): string {
+  const summary = exception.text.replace(UNHANDLED_REJECTION_PREFIX, "").trim();
+  return summary || exception.description.split("\n", 1)[0].trim();
+}
+
+export function isKnownRejection(exception: RendererException): boolean {
+  return !isRenderCrash(exception) && KNOWN_LAUNCH_REJECTIONS.includes(rejectionMessage(exception));
+}
+
+/** Full text of an exception for a failure message: the summary plus the stack-bearing description. */
+export function describeException(exception: RendererException): string {
+  return exception.description && exception.description !== exception.text
+    ? `${exception.text}\n${exception.description}`
+    : exception.text;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function readString(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function exceptionFrom(params: unknown): RendererException | null {
+  if (!isRecord(params) || !isRecord(params.exceptionDetails)) return null;
+  const details = params.exceptionDetails;
+  const exception = isRecord(details.exception) ? details.exception : {};
+  return {
+    text: readString(details.text),
+    description: readString(exception.description) || readString(exception.value),
+  };
+}
+
+/**
+ * The eval CDP client ignores protocol events, so boot-time exceptions need a
+ * second session on the same page target. Enabling the Runtime domain replays
+ * exceptions recorded before the session attached.
+ */
+export async function observeRendererExceptions(debuggerUrl: string | null | undefined) {
+  if (!debuggerUrl) throw new Error("Renderer exception witness needs a page debugger URL");
+  const socket = new WebSocket(debuggerUrl);
+  const exceptions: RendererException[] = [];
+  const bootFailures: string[] = [];
+  let disconnected = false;
+  socket.addEventListener("close", () => { disconnected = true; });
+  socket.addEventListener("error", () => { disconnected = true; });
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Renderer exception witness did not attach")), 15_000);
+    socket.addEventListener("open", () => socket.send(JSON.stringify({ id: 1, method: "Runtime.enable", params: {} })));
+    socket.addEventListener("error", () => {
+      clearTimeout(timeout);
+      reject(new Error("Renderer exception witness connection failed"));
+    });
+    socket.addEventListener("message", (event) => {
+      const message: unknown = JSON.parse(String(event.data));
+      if (!isRecord(message)) return;
+      if (message.id === 1) {
+        clearTimeout(timeout);
+        if (message.error) reject(new Error("Runtime.enable failed for the exception witness"));
+        else resolve();
+      }
+      if (message.method === "Runtime.consoleAPICalled" && isRecord(message.params)
+        && Array.isArray(message.params.args) && bootFailures.length < 5) {
+        const args = message.params.args.filter(isRecord);
+        if (typeof args[0]?.value === "string" && args[0].value.startsWith("[desktop-boot]")) {
+          let detail = args.map(arg => readString(arg.description) || readString(arg.value)).join(" ");
+          for (const [name, value] of Object.entries(process.env)) {
+            if (/token|secret|password|api_?key|authorization/i.test(name) && value && value.length > 3) detail = detail.replaceAll(value, "[redacted]");
+          }
+          bootFailures.push(detail.replace(/https?:\/\/\S+/g, "[url]").slice(0, 8000));
+        }
+      }
+      if (message.method !== "Runtime.exceptionThrown") return;
+      const exception = exceptionFrom(message.params);
+      if (exception) exceptions.push(exception);
+    });
+  });
+  return {
+    exceptions,
+    bootFailures,
+    assertConnected() {
+      if (disconnected || socket.readyState !== WebSocket.OPEN) {
+        throw new Error("Renderer exception witness disconnected during startup");
+      }
+    },
+    close() {
+      socket.close();
+    },
+  };
+}
+
+async function packagedLaunchWorld(name: string, bootstrap: ElectronSurfaceOptions["bootstrap"]) {
+  if (!process.env.IDEXAL_EVAL_ELECTRON_BINARY?.trim()) {
+    throw new Error("IDEXAL_EVAL_ELECTRON_BINARY must point at a packaged desktop binary");
+  }
+  const host = localHost();
+  const handle = await host.spawnElectron(name, {
+    profile: "fresh",
+    bootstrap,
+    prepareSharedResources: false,
+    env: { IDEXAL_DEV_MODE: "0", IDEXAL_ELECTRON_START_URL: "", ELECTRON_START_URL: "" },
+  });
+  let app: AttachedSurface | null = null;
+  let witness: Awaited<ReturnType<typeof observeRendererExceptions>> | null = null;
+  const dispose = async () => {
+    // A caught runtime bootstrap error is not a Runtime.exceptionThrown event.
+    // Preserve the recovery screen's collapsed technical details before the
+    // isolated profile is removed, without reading credentials or retrying boot.
+    if (app) {
+      const recovery = await evaluateOnSurface(app, () => {
+        const root = document.getElementById("root");
+        if (!/idexal Os couldn't start|idexal Os hit an unexpected error/.test(root?.innerText ?? "")) return null;
+        return { text: root?.textContent, details: [...document.querySelectorAll("details")].map(element => element.textContent) };
+      }, { timeoutMs: 5_000, reattachAttempts: 0 }).catch(() => null);
+      if (recovery) console.error("[packaged-startup-recovery]", JSON.stringify({ ...recovery, failures: witness?.bootFailures }));
+    }
+    witness?.close();
+    try {
+      await app?.stop();
+    } finally {
+      await host.disposeSurface(handle);
+    }
+  };
+  try {
+    app = await attachSurface(handle, { timeoutMs: 60_000 });
+    witness = await observeRendererExceptions(app.client.webSocketDebuggerUrl);
+  } catch (error) {
+    await dispose().catch(() => undefined);
+    throw error;
+  }
+  const attached = app;
+  const observed = witness;
+  return {
+    app: attached,
+    /** Flavor baked into the packaged artifact, as the renderer sees it. */
+    flavor: () => evaluateOnSurface(attached, (): PackagedFlavor | null => {
+      const electron: unknown = Reflect.get(window, "__IDEXAL_ELECTRON__");
+      if (typeof electron !== "object" || electron === null) return null;
+      const meta: unknown = Reflect.get(electron, "meta");
+      if (typeof meta !== "object" || meta === null) return null;
+      const distribution: unknown = Reflect.get(meta, "distribution");
+      if (typeof distribution !== "object" || distribution === null) return null;
+      const flavor: unknown = Reflect.get(distribution, "flavor");
+      return flavor === "public" || flavor === "cloud" || flavor === "enterprise" ? flavor : null;
+    }),
+    /** Text React actually mounted, as opposed to the body chrome. */
+    rootText: () => evaluateOnSurface(attached, () => document.getElementById("root")?.innerText ?? ""),
+    /** The boot overlay's collapsed Technical details, which innerText skips. */
+    bootError: () => evaluateOnSurface(attached, () => document.querySelector('[data-testid="boot-error-detail"]')?.textContent?.trim() || null),
+    /** One fresh final observation; never heal a lost observer into a green run. */
+    async health() {
+      observed.assertConnected();
+      if (!handle.pid) throw new Error("Packaged startup has no process liveness witness");
+      process.kill(handle.pid, 0);
+      const state = await evaluateOnSurface(attached, () => {
+        const root = document.getElementById("root");
+        return {
+          rootText: root?.innerText ?? "",
+          controls: Array.from(root?.querySelectorAll("input, button, [contenteditable]") ?? [], (control) => ({
+            tag: control.tagName.toLowerCase(),
+            text: control.textContent?.trim() ?? "",
+            testId: control.getAttribute("data-testid"),
+            editable: control instanceof HTMLElement && control.isContentEditable,
+            visible: control.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
+              && control.getBoundingClientRect().width > 0 && control.getBoundingClientRect().height > 0,
+            enabled: !control.matches(":disabled") && control.getAttribute("aria-disabled") !== "true"
+              && !control.closest("[inert]"),
+          })),
+        };
+      }, { timeoutMs: 5_000, reattachAttempts: 0 });
+      observed.assertConnected();
+      process.kill(handle.pid, 0);
+      return state;
+    },
+    exceptions: () => {
+      observed.assertConnected();
+      return [...observed.exceptions];
+    },
+    [Symbol.asyncDispose]: dispose,
+  };
+}
+
+/** A machine that has never run idexal Os: no bootstrap file at all. */
+export function packagedFirstLaunchWorld(_seed: Seed) {
+  return packagedLaunchWorld("packaged-first-launch", undefined);
+}
+
+/**
+ * An enterprise installation that already activated against its Den, as an
+ * existing customer's machine looks after an update. The Den lives on a
+ * closed local port so the launch is deterministic offline: the app has to
+ * get past the activation gate on the seeded bootstrap alone.
+ */
+export async function packagedActivatedLaunchWorld(_seed: Seed) {
+  const denBaseUrl = `http://127.0.0.1:${await allocateFreePort()}`;
+  const world = await packagedLaunchWorld("packaged-activated-launch", {
+    baseUrl: denBaseUrl,
+    apiBaseUrl: denBaseUrl,
+    requireSignin: true,
+    enterpriseActivation: { activatedAt: new Date().toISOString(), denBaseUrl },
+  });
+  return { ...world, denBaseUrl };
+}

@@ -1,0 +1,216 @@
+---
+title: "Okta SCIM provisioning"
+description: "Provision idexal Os members and teams from Okta"
+---
+
+Use Okta Lifecycle Management to create, update, deactivate, and reactivate
+idexal Os members. Okta groups can also become SCIM-managed idexal Os teams.
+
+## Before you start
+
+You need:
+
+- A working, domain-verified, tested, and enabled
+  [Okta SAML SSO](/cloud/sso-okta) connection.
+- The idexal Os organization owner.
+- An Okta administrator who can configure provisioning for the SAML app.
+- An Okta plan that supports the provisioning and group-push features you
+  intend to use.
+
+Do not broaden SCIM assignment scope until both SAML and a narrowly scoped SCIM
+test pass. Make sure at least one idexal Os owner can sign in through Okta and
+that the current SSO configuration has passed idexal Os's **Test SSO before
+enabling it** flow.
+
+## 1. Create the idexal Os SCIM connector
+
+In idexal Os, select the organization, then open **Settings → SCIM**. Confirm
+the page reports that SAML/SSO is active, then:
+
+1. Select **Create connector**.
+2. Copy the **SCIM base URL**.
+3. Copy the bearer token immediately. idexal Os displays the full token only
+   after creating or rotating the connector.
+4. Leave **Create teams from SCIM groups** off until user provisioning works.
+
+Treat the bearer token like a password. Do not put it in tickets, screenshots,
+logs, or documentation. Rotating it invalidates the previous token, so update
+Okta during the same maintenance window.
+
+<Note>
+Use the base URL idexal Os displays. In a split-host Helm deployment it may use
+the web auth origin even when a separate Den API origin also exists. Do not
+rewrite the hostname.
+</Note>
+
+## 2. Enable SCIM on the Okta application
+
+Use the same Okta application as SAML SSO:
+
+1. Open **Applications → Applications → idexal Os**.
+2. Open **General** and edit **App Settings**.
+3. Enable **SCIM** under **Provisioning**, then save.
+4. Open the new **Provisioning** tab.
+5. Select **Configure API Integration**.
+6. Enable **API Integration**.
+
+Enter:
+
+| Okta field | Value |
+| --- | --- |
+| SCIM connector base URL | idexal Os **SCIM base URL** |
+| Unique identifier field for users | `userName` |
+| Supported provisioning actions | Push new users and push profile updates. Add push groups after user provisioning works |
+| Authentication mode | HTTP Header |
+| Authorization | idexal Os SCIM bearer token |
+
+Select **Test API Credentials** or **Test Connector Configuration**, depending
+on your Okta interface. Save only after Okta reports **Connector configured
+successfully**. For the initial user-only setup, Okta should detect **Create
+Users** and **Update User Attributes**. It is expected for import and group
+features to remain undetected when you have not selected them.
+
+## 3. Configure provisioning to idexal Os
+
+Open **Provisioning → To App**, then enable:
+
+- **Create Users**
+- **Update User Attributes**
+- **Deactivate Users**
+
+Do not enable password synchronization. SCIM creates federated membership; it
+does not create an idexal Os password credential.
+
+Review the attribute mappings. At minimum, keep these identity values aligned:
+
+| Okta value | SCIM attribute |
+| --- | --- |
+| Stable work email or Okta username | `userName` |
+| Primary work email | `emails[type eq "work"].value` |
+| First name | `name.givenName` |
+| Last name | `name.familyName` |
+| Display name | `displayName` |
+
+The SAML NameID and SCIM `userName` must identify the same person. A mismatch
+can create a duplicate idexal Os member instead of linking SSO and SCIM.
+
+## 4. Provision one test user
+
+SCIM can adopt an existing idexal Os account only when that account already has
+an active membership in the connector's organization. Adoption preserves the
+existing user ID, organization membership, and role, and places the identity
+under SCIM management for subsequent updates and deactivation. New-user
+provisioning is unchanged.
+
+An email or domain match alone is not enough. Removed memberships, pending
+invitations, personal accounts without an active membership in this organization,
+and membership only in another organization cannot be adopted; creation returns
+`409` with `scimType: uniqueness`. A token without an organization cannot adopt
+an existing account either. Complete the normal organization joining process
+before provisioning an existing account; do not use SCIM to bypass it.
+
+For the cleanest first test, use a user who has never been assigned or
+provisioned to this Okta application:
+
+1. Open the Okta application's **Assignments** tab.
+2. Assign one test user and confirm their application username is the same
+   email used for SAML NameID and SCIM `userName`.
+3. Wait for Okta's automatic provisioning job to finish. Do not repeatedly
+   edit the assignment or trigger provisioning while the job is running.
+4. Open Okta **Reports → System Log** and confirm a single **Push new user to
+   external application** event succeeds.
+5. In idexal Os, open **Members** and verify the same member appears without a
+   second password-backed account.
+
+If the user was already assigned for the earlier SAML test, Okta may show a
+**Provision User** action after you enable provisioning. Select it once, then
+wait and inspect the System Log before taking another action. A second request
+can race the first successful create and return `409 User already exists`.
+
+Do not broaden assignments until the test user's create, update, deactivate,
+and reactivate lifecycle works.
+
+## 5. Verify the user lifecycle
+
+For the assigned test user, verify:
+
+1. Changing the profile name in Okta updates the idexal Os member.
+2. Unassigning or deactivating the user removes active organization access.
+3. The user cannot regain access through password sign-up while SCIM marks the
+   identity inactive.
+4. Reactivating and reassigning the user restores the same idexal Os identity.
+5. An unrelated idexal Os member remains unchanged throughout the test.
+
+idexal Os retains a disconnected member record for organization history. The
+global user is deleted only after their final active organization membership
+is removed.
+
+## 6. Push Okta groups as idexal Os teams
+
+After user provisioning works:
+
+1. In idexal Os **Settings → SCIM**, enable
+   **Create teams from SCIM groups**.
+2. In Okta, open the application's **Push Groups** tab.
+3. Select **Push Groups** and choose a small test group by name or rule.
+4. Confirm Okta creates the group and pushes its current membership.
+5. In idexal Os, open **Members → Teams** and verify a team labeled
+   **Managed by SCIM** appears with the expected members.
+6. Add and remove one member in Okta and verify the idexal Os team follows.
+
+Manage pushed groups in Okta, not in idexal Os. Manually created idexal Os teams
+remain independent.
+
+### Optional: grant organization Admin through an Okta group
+
+After verifying the pushed membership, the idexal Os organization owner can
+approve the team to grant organization `Admin`. Neither the Okta group name nor
+SAML group attributes grant elevated access by themselves. Follow
+[Team Admin access](/cloud/members-and-rbac#team-admin-access) for the checkbox,
+membership controls, and reapproval rules when team sync is disabled or re-enabled.
+
+Test with a member who has no direct Admin role or other Admin team grant:
+confirm `Admin via {team name}`, remove them from the Okta group, wait for a
+successful group push, and confirm that inherited access is gone. Inspect the
+Okta **System Log** and idexal Os SCIM health if the change has not arrived.
+
+## 7. Expand scope and enforce SSO
+
+After the lifecycle and group tests pass:
+
+1. Assign the intended Okta users and groups to the application.
+2. Review Okta provisioning events for failures.
+3. Review idexal Os's SCIM health and unresolved-failure count.
+4. Confirm at least one owner has working Okta SAML access through the enabled,
+   tested idexal Os SSO configuration.
+5. Keep password or other recovery access available until the rollout is stable.
+
+## When to run reconciliation
+
+Use **Settings → SCIM → Run reconciliation** to check idexal Os's local
+SCIM-managed identities for inconsistent organization membership or missing
+provider-account state. idexal Os records unresolved drift for retry or manual
+review.
+
+Reconciliation does not import users from Okta, force Okta to provision an
+assigned user, or clear an Okta application-assignment error. Use the Okta
+Assignments page and System Log for outbound provisioning. When idexal Os has no
+local drift to process, reconciliation may complete without a visible member
+change.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| **Create connector** is disabled | idexal Os does not see an enabled SSO provider | Complete and test Okta SAML first; if SAML returns `invalid_saml_configuration`, upgrade and save the connection again |
+| **Test API Credentials** fails | Incorrect base URL, stale token, whitespace, or a rewritten hostname | Copy both values again from idexal Os and use the advertised base URL unchanged |
+| Okta reports `409 User already exists` | The existing account lacks an active membership in this connector's organization, or the provider account already exists | Check membership in the selected organization and inspect the System Log. Removed or invited-only members cannot be adopted. If a successful create immediately precedes the conflict, stop triggering **Provision User**. Use a never-before-provisioned user for the clean lifecycle test |
+| Okta creates a duplicate member | SAML NameID and SCIM `userName` differ | Map both to the same stable work email |
+| Assignment succeeds but no member appears | To App provisioning is disabled or the user is outside assignment scope | Enable **Create Users** and confirm the person is assigned to the application |
+| **Run reconciliation** does not provision an assigned user | Reconciliation only checks idexal Os's local SCIM identity state | Trigger and inspect outbound provisioning in Okta instead |
+| Deactivation does not remove access | **Deactivate Users** is disabled or Okta has not sent the event | Enable it and inspect the Okta System Log and idexal Os SCIM health |
+| A pushed group does not create a team | idexal Os team synchronization is off | Enable **Create teams from SCIM groups**, then retry the Okta group push |
+| A group is pushed without members | Its members are not assigned or provisioned to the application | Assign and provision the users before validating group membership |
+
+For member and team behavior after provisioning, see
+[Members and RBAC](/cloud/members-and-rbac).

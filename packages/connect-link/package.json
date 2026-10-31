@@ -1,0 +1,40 @@
+{
+  "name": "@idexal/connect-link",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/index.d.ts",
+        "default": "./src/index.ts"
+      },
+      "development": "./src/index.ts",
+      "default": "./dist/index.js"
+    },
+    "./node": {
+      "types": {
+        "idexal-os-build": "./dist/types/src/node.d.ts",
+        "default": "./src/node.ts"
+      },
+      "development": "./src/node.ts",
+      "default": "./dist/node.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsup && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@idexal/types": "workspace:*",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsup": "^8.5.0",
+    "typescript": "^5.6.3"
+  }
+}

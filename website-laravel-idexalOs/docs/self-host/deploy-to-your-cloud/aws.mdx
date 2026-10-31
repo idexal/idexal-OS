@@ -1,0 +1,100 @@
+---
+title: "Deploy on AWS"
+description: "Run idexal Os on Amazon EKS or ECS Fargate with Amazon RDS for MySQL."
+---
+
+The recommended AWS path is Helm on Amazon EKS with Amazon RDS for MySQL. For the smallest first deployment, use EKS Auto Mode and Kubernetes `LoadBalancer` Services so AWS provisions Network Load Balancers for Den web and Den API. Move to an ALB or an existing ingress platform when you need shared layer-7 routing, WAF policy, or more advanced certificate handling.
+
+## What AWS manages
+
+- EKS control plane, compute, pod networking, and load-balancer integration
+- VPCs, subnets, routing, security groups, and IAM
+- RDS for MySQL, encryption, backups, and failover
+- Route 53 DNS and ACM certificates when you use those services
+
+The idexal Os chart manages Deployments, Services, ConfigMaps, Secret references, probes, and the database migration Job.
+
+## AWS checklist
+
+1. Create an EKS Auto Mode cluster with `eksctl` `0.195.0` or newer.
+2. Create an RDS MySQL 8-compatible database in private subnets.
+3. Allow database port `3306` only from the EKS workload or node security boundary.
+4. Store `DATABASE_URL`, `BETTER_AUTH_SECRET`, and `DEN_DB_ENCRYPTION_KEY` in a Kubernetes Secret.
+5. Start from the chart's `values.aws-load-balancer.yaml` example.
+6. Install the chart, verify migrations and readiness, then point DNS at the generated load balancers.
+7. Enable trusted HTTPS before creating the first administrator.
+
+For exact CLI commands, values, DNS/TLS choices, migration troubleshooting, verification, and cleanup, follow the [AWS EKS operator runbook](https://github.com/idexal/idexalOs/blob/dev/docs/aws-eks-helm.md).
+
+## ECS Fargate with Terraform
+
+These instructions and contract-v1 results apply to **direct Terraform users**.
+The managed-deployments installer is decoupled onto its own frozen pre-contract
+module. Its separate TLS-only update verifies RDS certificates with the public
+regional CA, with CA-first rollout ordering and retained API/web revisions;
+it does not adopt direct migration orchestration, write-only secret mode or AWS
+IAM changes. Existing AWS/random/archive pins remain; only the HTTP CA-fetch
+provider is added.
+
+### What it deploys
+
+If you run containers on ECS Fargate rather than Kubernetes, the Terraform module creates an ECS cluster (or uses yours), Den API and Den web as Fargate services behind an HTTPS Application Load Balancer, private RDS for MySQL, optional ElastiCache for Redis, and AWS Secrets Manager references. One standalone migration task must finish with exit 0 before API or web rollout. Application replicas do not run migrations. A small native Lambda invocation starts the task and observes completion; no local-exec provisioner is required.
+
+API defaults to 1 vCPU / 2 GiB and web to 0.5 vCPU / 1 GiB. Managed RDS deletion protection defaults on. The 0.18.57/0.18.58 API/web defaults are digest-pinned; other versions and enabled optional services require digest-pinned image overrides. Database TLS verifies the certificate chain using the public regional RDS CA bundle, loaded before Node starts. The application's current MySQL parser does not enable mysql2's separate hostname identity check; full hostname verification remains an application follow-up, not a claim of this module.
+
+### Tested scenarios
+
+| Scenario | Tools / release | Result | Date |
+| --- | --- | --- | --- |
+| Offline module defaults, secrets, TLS and existing infrastructure | Terraform 1.16.5; OpenTofu 1.11.14 | Passed: 37 tests per tool | 2026-10-15 |
+| Controller single-task, timeout/rejection, and failed migration completion gate | Local testkit; both tools | Passed: 2 tests | 2026-10-15 |
+| Legacy per-task migrator, two API replicas, fresh install and release-to-dev upgrade | 0.18.58 → dev | Failed: concurrent peers; eventual ECS replacement masked failures | 2026-10-14 |
+| Contract-v1 live release-to-dev upgrade, two API tasks, one successful migrator per image | 0.18.58 → dev ef455ca; Terraform 1.16.5 / AWS 6.69.1 | Passed | 2026-10-15 |
+| Same-version reapply; secret fingerprints and the pre-apply session unchanged | 0.18.58 | Passed: plan exit 0, no changes | 2026-10-15 |
+| Core secret values absent from actual state after release, reapply and upgrade | Write-only mode | Passed | 2026-10-15 |
+| Fresh browser and isolated native desktop sign-in on the preserved database | dev ef455ca | Passed | 2026-10-15 |
+| Destroy with protection explicitly disabled; independent absence and snapshot cleanup | Disposable contract-v1 stack | Passed | 2026-10-15 |
+
+### Support level
+
+<Warning>
+  idexal Os's Terraform modules are **beta**. If you hit an issue:
+
+  - **Customers with a support agreement:** contact your idexal Os team through your usual support channel.
+  - **Everyone else:** [open a GitHub issue](https://github.com/idexal/idexalOs/issues/new/choose).
+  - **Security issues:** report them privately ([SECURITY.md](https://github.com/idexal/idexalOs/blob/dev/SECURITY.md)).
+</Warning>
+
+The table records the tested core only, not production load, backup restoration,
+legacy handover, or every optional component. Complete your review before pinning a source commit.
+The [module](https://github.com/idexal/idexalOs/tree/dev/infra/terraform/modules/idexal-os-aws-ecs)
+and its deployment-contract improvements are available on `dev` in **beta**;
+the managed installer remains separate.
+See the [shared module contract](https://github.com/idexal/idexalOs/blob/dev/infra/terraform/MODULE_CONTRACT.md)
+for baseline checks and known limits.
+
+### Upgrade notes
+
+The first upgrade from a per-task migration module requires maintenance: freeze independent deployers and retries, scale the **old** API to zero, disable replacement/autoscaling and manual legacy launches, wait for all old tasks and DB sessions/in-flight DDL to terminate, and fence legacy DDL credentials where feasible. Only then apply the new module with the target replica count. Reducing to one task alone is not an exclusion barrier. Do not restore a legacy migration-capable task definition during rollback. This orders deployments; it does not add the application-level migration lock, dirty marker or schema compatibility protocol.
+
+Existing inputs remain, including the deprecated nested `database.deletion_protection` alias. Floating image tags are now rejected: pin the current digests before upgrading. Use one state/release coordinator per physical database. Migration failure or an unknown outcome blocks rollout and requires inspection, not automatic SQL retry. See the [module upgrade notes](https://github.com/idexal/idexalOs/tree/dev/infra/terraform/modules/idexal-os-aws-ecs#upgrade-notes) for the full fence and secret-conversion procedure.
+
+### State guidance
+
+Use Terraform or OpenTofu **>= 1.11, < 2.0** with encrypted, access-controlled remote state. An S3 root backend should set `encrypt = true` and `use_lockfile = true`; do not create a new DynamoDB locking table. The reusable module configures neither a provider nor a backend and ships no cross-registry lock file. Generate and retain the root lock with your chosen tool. This direct-user module uses the live-tested AWS `~> 6.69` provider line and random `~> 3.9`; the previous cross-major compatibility exception is no longer needed. The managed AWS installer instead uses a frozen pre-contract module with original AWS/random/archive pins and a separate strict-TLS/CA exception. It does not inherit the direct migration or secret lifecycle. Packaging, bootstrap permissions/re-approval, legacy maintenance fencing and version semantics for future contract adoption require separate work and owner review.
+
+For new installs, use `write_only_secrets = true` with persistent core values supplied through the ephemeral `secret_values_wo` input: RDS and Secrets Manager write-only fields keep those values out of new state snapshots. Write-only mode is the new default. Existing installations must explicitly set `write_only_secrets = false` before upgrading to retain their current keys/state, or securely preserve and supply the **exact existing** keys and DB password before converting. Missing ephemeral values fail validation before changes, rather than silently regenerating auth/encryption keys. Never regenerate an encryption key during an infrastructure upgrade. Optional integration secrets retain their state-backed compatibility path; restrict state history accordingly. Secret settings belong in `extra_secrets`, not plain `extra_environment`.
+
+### Cost notes
+
+Costs depend on region, replica count and egress: Fargate API/web, RDS, ALB, optional NAT/Redis, image pulls for the standalone migrator, and brief Lambda duration. A two-API-task lab with one NAT costs more than the one-task defaults. Stop disposable stacks promptly and disable deletion protection explicitly only for those tests.
+
+You provide a VPC, two hostnames (the web host and `api.` plus the web host), and an ACM certificate or a Route 53 zone the module can use to create one. HTTPS is required: Den API does not start with a plain-HTTP public URL. Email is optional for setup and sign-in, but member invites and password reset need SMTP or Resend.
+
+The module can also run idexal Os Web, so members chat in the browser with each workspace in a [Daytona](https://www.daytona.io) sandbox: set `idexal_os_web_enabled = true` and provide a Daytona API key and sandbox snapshot.
+
+It can also run the headless runner, so the Slack assistant, headless Automations and Workbot (a chat app at `chat.` plus your web host) work on your deployment with your own model provider: set `headless_runner`, `workbot` and `slack_assistant_enabled`.
+
+See the [module README](https://github.com/idexal/idexalOs/tree/dev/infra/terraform/modules/idexal-os-aws-ecs) for inputs, a complete example, and cost notes.
+
+Next: [Create the first administrator](/self-host/deploy-to-your-cloud/first-administrator).
