@@ -1,0 +1,206 @@
+---
+title: "Okta SAML SSO"
+description: "Connect Okta to idexal Os Cloud or a self-hosted idexal Os deployment with SAML"
+---
+
+Use this guide to let organization members sign in to idexal Os through an
+Okta application integration. It works for idexal Os Cloud and for a Helm
+deployment with a public HTTPS web origin.
+
+After SAML sign-in works, use [Okta SCIM provisioning](/cloud/scim-okta) to
+synchronize members and groups.
+
+## Before you start
+
+You need:
+
+- The idexal Os organization owner.
+- An Okta administrator who can create and assign application integrations.
+- Control of DNS for the email domain you will associate with the connection.
+- The final HTTPS idexal Os web origin, for example
+  `https://idexal-os.example.com`.
+
+idexal Os keeps a new SSO configuration disabled until you verify the domain,
+complete a real authentication test, and explicitly enable SSO. Keep password
+access available as a recovery path during setup.
+
+<Note>
+For a Helm deployment with separate web and API hosts, use the URLs idexal Os
+shows in **Settings → SSO**. Do not replace their host with the separate API
+origin. SAML uses the deployment's configured auth origin, which is normally
+the public web origin when `/api/auth` is proxied through the web host.
+</Note>
+
+## 1. Get the organization ID
+
+In idexal Os, select the organization and open **Settings → General**. Copy the
+organization ID. idexal Os creates the SAML provider ID as:
+
+```text
+idexal-os-sso-<organization-id>
+```
+
+The corresponding assertion consumer service URL is:
+
+```text
+https://<idexal-os-web-origin>/api/auth/sso/saml2/sp/acs/idexal-os-sso-<organization-id>
+```
+
+You can confirm the exact generated URL after saving the idexal Os connection.
+
+## 2. Create the Okta SAML application
+
+In the Okta Admin Console:
+
+1. Open **Applications → Applications**.
+2. Select **Create App Integration**.
+3. Choose **SAML 2.0**, then select **Next**.
+4. Set **App name** to `idexal Os` or another recognizable workspace name.
+5. Select **Next**.
+
+## 3. Configure SAML in Okta
+
+Under **General**, enter:
+
+| Okta field | Value |
+| --- | --- |
+| Single sign-on URL | The idexal Os ACS URL from step 1 |
+| Use this for Recipient URL and Destination URL | Enabled |
+| Audience URI (SP Entity ID) | The idexal Os web origin, for example `https://idexal-os.example.com` |
+| Default RelayState | Leave blank |
+| Name ID format | `EmailAddress` |
+| Application username | `Okta username` |
+
+Open **Show Advanced Settings** and confirm:
+
+- **Response**: `Signed`
+- **Assertion Signature**: `Signed`
+- **Signature Algorithm**: `RSA-SHA256`
+- **Digest Algorithm**: `SHA256`
+- **Assertion Encryption**: `Unencrypted`
+
+idexal Os requires a signed assertion. Keep the Okta username and NameID equal
+to the stable work email that SCIM will later send as `userName`.
+
+Select **Next**, mark the integration as an internal application when
+appropriate, then select **Finish**.
+
+## 4. Copy Okta values into idexal Os
+
+In the Okta application's **Sign On** tab, select
+**View SAML setup instructions**. Copy:
+
+- **Identity Provider Single Sign-On URL**
+- **Identity Provider Issuer**
+- **X.509 Certificate**, including the `BEGIN CERTIFICATE` and
+  `END CERTIFICATE` lines
+
+In idexal Os, open **Settings → SSO**, select **SAML**, and enter:
+
+| idexal Os field | Okta value |
+| --- | --- |
+| IdP Issuer URL | **Identity Provider Issuer** |
+| Domain | The members' email domain, for example `example.com` |
+| SAML Entry Point | **Identity Provider Single Sign-On URL** |
+| Audience URL | Leave blank to use the configured idexal Os auth origin |
+| IdP Certificate | **X.509 Certificate** |
+
+Save the connection. idexal Os then shows setup values including **Sign-in URL**,
+**Redirect URL**, **ACS URL**, and **Metadata URL**. Compare the generated
+**ACS URL** with Okta's **Single sign-on URL** character for character. Also
+copy the generated idexal Os **Sign-in URL** into Okta if you want the Okta tile
+to launch the same organization-scoped flow.
+
+The saved configuration is still disabled at this point.
+
+## 5. Verify the email domain
+
+Select **Request token** under **Domain verification**. Create a DNS TXT
+record for the email domain:
+
+| DNS field | Value |
+| --- | --- |
+| Type | `TXT` |
+| Name | `_better-auth-token-<provider-id>` |
+| Value | The token idexal Os displays |
+
+For example, provider `idexal-os-sso-org_123` for `example.com` produces:
+
+```text
+_better-auth-token-idexal-os-sso-org_123.example.com
+```
+
+In a DNS console that automatically appends the zone, enter only
+`_better-auth-token-<provider-id>` in the name field. The token is valid for
+seven days. After the TXT record resolves publicly, select **Verify domain**
+in idexal Os and confirm the connection shows **Domain verified: Yes**.
+
+## 6. Assign a test user in Okta
+
+In the Okta application:
+
+1. Open **Assignments**.
+2. Select **Assign → Assign to People**.
+3. Assign one idexal Os owner or another controlled test user.
+4. Confirm the application username is that user's stable work email.
+
+Do not assign broad groups until the test user can complete the full flow.
+
+## 7. Test and enable SSO in idexal Os
+
+After the Okta assignment and domain verification are complete:
+
+1. In idexal Os **Settings → SSO**, select **Enable Config** or **Enable SSO**.
+2. In the **Test SSO before enabling it** dialog, select **SSO Login**.
+3. Complete Okta authentication in the separate window.
+4. Return to idexal Os and confirm **Authentication test successful**.
+5. Select **Enable SSO**.
+
+During the test, confirm that:
+
+1. idexal Os redirects to the expected Okta tenant.
+2. Okta authenticates the assigned user.
+3. Okta posts the assertion to the generated idexal Os ACS URL.
+4. idexal Os returns the user to the intended organization.
+5. The member identity in idexal Os uses the same email that Okta sent as
+   NameID.
+
+SSO is not offered to organization members until you explicitly enable it after
+the successful test. If you edit the SSO configuration after a successful test,
+test it again before enabling. Test links expire after five minutes.
+
+Only after this succeeds should you configure SCIM.
+
+## Just-in-time provisioning and password signup
+
+After Okta SAML SSO is enabled for a verified domain, idexal Os's standard
+sign-in flow routes users with that email domain to the organization SSO flow.
+When a user completes SAML sign-in successfully, idexal Os can create their
+organization membership just in time with the default `Member` role.
+
+JIT provisioning happens only after successful SAML authentication. Creating an
+email/password account with the same email domain does not add the user to the
+organization or create a SCIM-managed identity. If that user later completes
+SSO, idexal Os can link the matching account and provision the organization
+membership through SSO.
+
+idexal Os does not convert SAML attributes such as `role`, `groups`, or `admin`
+into elevated organization roles. The owner assigns roles in
+idexal Os; ownership changes require ownership transfer. For group-based Admin,
+first configure [Okta SCIM provisioning](/cloud/scim-okta), then explicitly
+approve the synchronized team using
+[Team Admin access](/cloud/members-and-rbac#team-admin-access).
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `Provider domain has not been verified` | The TXT record is missing, attached to the zone apex, or has not propagated | Put the token at `_better-auth-token-<provider-id>.<domain>`, wait for public DNS, then select **Verify domain** |
+| `invalid_saml_configuration` | The idexal Os build did not persist the generated ACS callback URL in the SAML provider | Upgrade to a build containing the SAML callback configuration fix, then edit and save the connection again |
+| `invalid_audience` | Okta's Audience URI does not match idexal Os's configured auth origin | Use the idexal Os web/auth origin shown by the deployment; do not substitute a separate API host |
+| `invalid_destination` or `invalid_recipient` | Okta is posting to a different URL than idexal Os expects | Copy the generated idexal Os ACS URL into Okta and keep **Use this for Recipient URL and Destination URL** enabled |
+| `Invalid SAML response` | The assertion is unsigned, uses a deprecated algorithm, or the active Okta certificate differs from idexal Os | Sign the assertion with RSA-SHA256 and paste Okta's current active X.509 certificate into idexal Os |
+| Okta refuses access | The person is not assigned to the application | Assign the test user under **Assignments** |
+| idexal Os shows **Verify the SSO domain before testing this configuration** | The DNS TXT proof has not passed yet | Create the TXT record shown by idexal Os, wait for DNS propagation, then select **Verify domain** |
+| The test dialog shows **The SSO authentication window was closed before the test completed** | The popup was closed or redirected away before idexal Os received the test result | Start a new test and keep the authentication window open until it returns or closes itself |
+| idexal Os will not enable SSO after editing settings | The current configuration has not been tested successfully | Run **SSO Login** again, then select **Enable SSO** after the successful test |

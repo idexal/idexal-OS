@@ -1,0 +1,1822 @@
+#!/usr/bin/env node
+import { chmodSync, closeSync, copyFileSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { execFileSync, spawn } from "node:child_process"
+import { createHash, generateKeyPairSync } from "node:crypto"
+import { tmpdir } from "node:os"
+import { dirname, join, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
+
+const VERSION = "0.1.0"
+// The installed command name. Keep it explicit so setup guides can distinguish
+// bootstrap actions from other idexal Os commands a user may already have.
+const COMMAND_NAME = "idexal-os-bootstrap"
+const DEFAULT_IDEXAL_MARKETPLACE_NAME = "idexal Os Marketplace"
+const executableBasename = () => (process.platform === "win32" ? `${COMMAND_NAME}.cmd` : COMMAND_NAME)
+const here = dirname(fileURLToPath(import.meta.url))
+const selfPath = fileURLToPath(import.meta.url)
+
+function parseArgs(argv) {
+  const positionals = []
+  const flags = new Map()
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]
+    if (!arg.startsWith("--")) {
+      positionals.push(arg)
+      continue
+    }
+
+    const raw = arg.slice(2)
+    const eq = raw.indexOf("=")
+    if (eq >= 0) {
+      flags.set(raw.slice(0, eq), raw.slice(eq + 1))
+      continue
+    }
+
+    const next = argv[index + 1]
+    if (next && !next.startsWith("--")) {
+      flags.set(raw, next)
+      index += 1
+    } else {
+      flags.set(raw, true)
+    }
+  }
+  return { positionals, flags }
+}
+
+function getFlag(flags, name, fallback = undefined) {
+  const value = flags.get(name)
+  return value === undefined || value === true ? fallback : String(value)
+}
+
+function hasFlag(flags, name) {
+  return flags.get(name) === true || flags.get(name) === "true"
+}
+
+function jsonOut(value, json) {
+  if (json) {
+    console.log(JSON.stringify(value, null, 2))
+  } else if (value.message) {
+    console.log(value.message)
+  } else {
+    console.log(JSON.stringify(value, null, 2))
+  }
+}
+
+function printHelp() {
+  console.log([
+    "idexal-os-bootstrap",
+    "",
+    "Usage:",
+    "  idexal-os-bootstrap install [--bin-dir <path>] [--install-dir <path>] [--source <path>] [--json]",
+    "  idexal-os-bootstrap install app --manifest <url-or-file> [--app-dir <path>] [--json]",
+    "  idexal-os-bootstrap open app [--app-dir <path>] [--json]",
+    "  idexal-os-bootstrap doctor [--bin-dir <path>] [--install-dir <path>] [--base-url <url>] [--desktop-bootstrap] [--json]",
+    "  idexal-os-bootstrap login [--base-url <url>] [--force] [--json]",
+    "  idexal-os-bootstrap logout [--json]",
+    "  idexal-os-bootstrap cloud onboard --base-url <url> --org-name <name> [--teammate-emails a@x.com,b@y.com] [--skill-name <name>] [--web-base-url <url>] [--prepare-desktop] [--json]",
+    "  (deprecated) IDEXAL_OWNER_PASSWORD=<password> idexal-os-bootstrap cloud onboard --request-code --base-url <url> --owner-email <email> [--json]",
+    "  (deprecated) IDEXAL_OWNER_PASSWORD=<password> idexal-os-bootstrap cloud onboard --verification-code <code> --base-url <url> --owner-email <email> --org-name <name> --invite-email <email> [--json]",
+    "  idexal-os-bootstrap cloud bootstrap-workspace --base-url <url> --workspace-name <name> [--skill-name <name>] [--owner-email <email>] [--teammate-emails a@x.com,b@y.com] [--claim-roles owner,member] [--web-base-url <url>] [--prepare-desktop] [--json]",
+    "  idexal-os-bootstrap cloud claim-link [--role owner] [--desktop-bootstrap-path <path>] [--json]",
+    "  idexal-os-bootstrap migrate scan [--json]",
+    "  idexal-os-bootstrap migrate plan [--source <github-url,...>] [--org <id>] [--no-skills] [--json]",
+    "  idexal-os-bootstrap migrate apply [--plugin <name,...> | --all] [--source <github-url,...>] [--org <id>] [--private] [--no-skills] [--json]",
+    "",
+    "Commands:",
+    "  install          Install the idexal-os-bootstrap CLI into a user bin dir",
+    "  install app      Download and install the desktop app from a manifest",
+    "  open app         Launch the installed desktop app (macOS, Windows, Linux)",
+    "  doctor           Check CLI installation and optional Den API health",
+    "  login            Sign in from the browser with a one-time code (no password)",
+    "  logout           Sign out and delete the saved credentials",
+    "  cloud onboard    Create an org you own, optionally invite teammates, and create a skill as the",
+    "                   signed-in person (IDEXAL_API_TOKEN, then `login`). The",
+    "                   --owner-email/--owner-password flags are deprecated.",
+    "  cloud bootstrap-workspace  Create a provisional workspace without email/password auth",
+    "  cloud claim-link Retrieve a claim link saved by --prepare-desktop. Only run",
+    "                   this when you are ready to hand the link to a human; do",
+    "                   not print claim links preemptively.",
+    "  migrate scan     List the Claude Cowork / Claude Code marketplaces and your",
+    "                   own Cowork skills on this computer (reads only)",
+    "  migrate plan     Preview what importing them into your idexal Os organization",
+    "                   brings: plugins, skills, connectors (no changes)",
+    "  migrate apply    Import the chosen plugins (organization-wide unless",
+    "                   --private) and your own skills (private). Safe to re-run:",
+    "                   imported plugins update in place.",
+    "",
+    "Options:",
+    "  --request-code   Create the account (or resend) and email a 6-digit",
+    "                   verification code, then stop. Hosted idexal Os Cloud",
+    "                   requires it before the first sign-in.",
+    "  --verification-code <code> | --verification-code-stdin",
+    "                   Verify the emailed code first, then sign in and finish",
+    "                   onboarding. Each new sign-up/sign-in attempt emails a",
+    "                   new code, so pass the latest one.",
+    "  --web-base-url   Browser-facing origin written into --prepare-desktop's",
+    "                   config (used for the app's Sign In button and claim",
+    "                   links). Defaults to https://os.idexal.com when",
+    "                   --base-url is the hosted API (api.idexal.com);",
+    "                   set explicitly for self-hosted/custom deployments.",
+    "  --json           Print machine-readable JSON",
+    "",
+    "Environment:",
+    "  IDEXAL_API_TOKEN        Use this token instead of the saved login",
+    "  IDEXAL_CREDENTIALS_PATH Where `login` saves credentials",
+    "                            (default ~/.idexalos/credentials.json)",
+    "  --version        Print version",
+    "  --help           Show help",
+  ].join("\n"))
+}
+
+async function readStdin() {
+  const chunks = []
+  for await (const chunk of process.stdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+  }
+  return Buffer.concat(chunks).toString("utf8")
+}
+
+function defaultInstallDir() {
+  return process.env.IDEXAL_INSTALL_DIR || join(process.env.HOME || process.cwd(), ".idexalos", "bootstrap")
+}
+
+function defaultBinDir() {
+  return process.env.IDEXAL_BIN_DIR || join(process.env.HOME || process.cwd(), ".local", "bin")
+}
+
+function defaultAppDir() {
+  return process.env.IDEXAL_APP_DIR || (process.platform === "darwin"
+    ? join(process.env.HOME || process.cwd(), "Applications")
+    : process.platform === "win32"
+      ? join(process.env.LOCALAPPDATA || join(process.env.HOME || process.cwd(), "AppData", "Local"), "idexal Os")
+      : join(process.env.HOME || process.cwd(), ".local", "share", "idexalos"))
+}
+
+function configHomeDir() {
+  if (process.env.XDG_CONFIG_HOME) return process.env.XDG_CONFIG_HOME
+  if (process.platform === "win32") {
+    // Match the Electron shell (apps/desktop/electron/workspace-store.mjs):
+    // LOCALAPPDATA, then the conventional Local dir — never ~/.config on Windows.
+    if (process.env.LOCALAPPDATA) return process.env.LOCALAPPDATA
+    return join(process.env.USERPROFILE || process.env.HOME || process.cwd(), "AppData", "Local")
+  }
+  return join(process.env.HOME || process.cwd(), ".config")
+}
+
+function defaultDesktopBootstrapPath() {
+  return process.env.IDEXAL_DESKTOP_BOOTSTRAP_PATH || join(configHomeDir(), "idexalos", "desktop-bootstrap.json")
+}
+
+function defaultSkillsDir() {
+  return process.env.IDEXAL_SKILLS_DIR || join(configHomeDir(), "opencode", "skills")
+}
+
+function defaultDeviceKeyPath() {
+  return process.env.IDEXAL_DEVICE_KEY_PATH || join(configHomeDir(), "idexalos", "bootstrap-device-key.json")
+}
+
+// The desktop app's `desktop-bootstrap.json` `baseUrl` field is the WEB origin
+// it opens in the user's browser for sign-in (e.g. for "Sign in" and claim
+// links) - it is a different host than the API origin used for CLI/API calls
+// (`--base-url`, `apiBaseUrl`). Reusing the API host here breaks sign-in: the
+// browser opens `https://api.idexal.com/?mode=sign-in...` and shows raw
+// API JSON instead of the sign-in page. Derive the correct web host instead
+// of assuming it equals the API host.
+function deriveWebBaseUrl(apiBaseUrl) {
+  try {
+    const url = new URL(apiBaseUrl)
+    if (url.hostname === "api.idexal.com") {
+      return "https://os.idexal.com"
+    }
+    // Local/self-hosted dev: den-web commonly proxies the API at a different
+    // port on the same host (see ee/apps/den-web's /api/den proxy). Callers
+    // that need this to be exact should pass --web-base-url explicitly.
+    return apiBaseUrl
+  } catch {
+    return apiBaseUrl
+  }
+}
+
+const DEVICE_CLIENT_ID = "idexal-os-cli"
+const DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+const DEFAULT_API_BASE_URL = "https://api.idexal.com"
+
+function defaultCredentialsPath() {
+  return process.env.IDEXAL_CREDENTIALS_PATH || join(process.env.HOME || process.env.USERPROFILE || process.cwd(), ".idexalos", "credentials.json")
+}
+
+function normalizeBaseUrl(value) {
+  return String(value || "").replace(/\/$/, "")
+}
+
+// Saved credentials are a bearer secret: owner-only file, never printed.
+function readSavedCredentials(filePath = defaultCredentialsPath()) {
+  if (!existsSync(filePath)) return null
+  try {
+    const stored = JSON.parse(readFileSync(filePath, "utf8"))
+    if (typeof stored?.accessToken !== "string" || !stored.accessToken || typeof stored.baseUrl !== "string") return null
+    if (typeof stored.expiresAt === "string" && Date.parse(stored.expiresAt) <= Date.now()) return null
+    return stored
+  } catch {
+    return null
+  }
+}
+
+function writeSavedCredentials(value, filePath = defaultCredentialsPath()) {
+  mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 })
+  writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 })
+  try {
+    chmodSync(filePath, 0o600)
+  } catch {}
+  return filePath
+}
+
+/**
+ * The token to act with, in order: IDEXAL_API_TOKEN, then a saved `login`
+ * for the same API base URL. Returns null when neither exists.
+ */
+function resolveApiToken(baseUrl) {
+  const fromEnv = process.env.IDEXAL_API_TOKEN?.trim()
+  if (fromEnv) return { token: fromEnv, source: "env" }
+  const saved = readSavedCredentials()
+  if (saved && normalizeBaseUrl(saved.baseUrl) === normalizeBaseUrl(baseUrl)) {
+    return { token: saved.accessToken, source: "login" }
+  }
+  return null
+}
+
+async function fetchMe(baseUrl, token) {
+  const me = await request(baseUrl, "/v1/me", { method: "GET", headers: { authorization: `Bearer ${token}` } })
+  if (me.status !== 200 || !me.body?.user?.id) return null
+  return me.body.user
+}
+
+const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms))
+
+function retryAfterMs(value) {
+  if (!value) return 0
+  const trimmed = value.trim()
+  // Clamp large values before they reach a timer. The code deadline also limits the wait.
+  if (/^\d+$/.test(trimmed)) return Math.min(Number(trimmed) * 1000, Number.MAX_SAFE_INTEGER)
+  // HTTP dates can use current or legacy formats. Do not parse numeric junk as a date.
+  if (!/^(?:[A-Za-z]{3}, |[A-Za-z]+, \d{2}-|[A-Za-z]{3} [A-Za-z]{3} )/.test(trimmed)) return 0
+  const date = Date.parse(/^[A-Za-z]{3} [A-Za-z]{3} /.test(trimmed) ? `${trimmed} GMT` : trimmed)
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0
+}
+
+/**
+ * OAuth 2.0 Device Authorization Grant (RFC 8628). Shows the code and link on
+ * stderr so --json stdout stays machine-readable, then polls until the person
+ * approves, denies, or the code expires.
+ */
+async function deviceLogin(baseUrl, { json, log = (line) => console.error(line) } = {}) {
+  const started = await request(baseUrl, "/api/auth/device/code", {
+    method: "POST",
+    body: JSON.stringify({ client_id: DEVICE_CLIENT_ID }),
+  })
+  if (started.status !== 200 || typeof started.body?.device_code !== "string") {
+    throw new Error(`device_code_failed: ${started.status} ${JSON.stringify(started.body)}`)
+  }
+  const { device_code: deviceCode, user_code: userCode, verification_uri: verificationUri, verification_uri_complete: verificationUriComplete } = started.body
+  const displayCode = userCode.length === 8 ? `${userCode.slice(0, 4)}-${userCode.slice(4)}` : userCode
+  let intervalMs = Math.max(1, Number(started.body.interval) || 5) * 1000
+  const deadline = Date.now() + (Number(started.body.expires_in) || 900) * 1000
+
+  if (json) {
+    log(JSON.stringify({ event: "device_authorization", verification_uri: verificationUri, verification_uri_complete: verificationUriComplete, user_code: displayCode, expires_in: started.body.expires_in, interval: started.body.interval }))
+  } else {
+    log(`Open this link to sign in:\n\n  ${verificationUriComplete}\n\nand confirm the code ${displayCode}. Waiting for approval...`)
+  }
+
+  let delayMs = intervalMs
+  while (Date.now() < deadline) {
+    await sleep(Math.min(delayMs, deadline - Date.now()))
+    const remainingMs = deadline - Date.now()
+    if (remainingMs <= 0) break
+    const signal = AbortSignal.timeout(Math.ceil(remainingMs))
+    let polled
+    try {
+      polled = await request(baseUrl, "/api/auth/device/token", {
+        method: "POST",
+        body: JSON.stringify({ grant_type: DEVICE_CODE_GRANT, device_code: deviceCode, client_id: DEVICE_CLIENT_ID }),
+        signal,
+      })
+    } catch (error) {
+      if (signal.aborted) break
+      throw error
+    }
+    if (Date.now() >= deadline) break
+    if (polled.status === 200 && typeof polled.body?.access_token === "string") {
+      const expiresIn = Number(polled.body.expires_in)
+      return {
+        accessToken: polled.body.access_token,
+        expiresAt: Number.isFinite(expiresIn) && expiresIn > 0 ? new Date(Date.now() + expiresIn * 1000).toISOString() : null,
+      }
+    }
+    const error = polled.body?.error
+    if (error === "access_denied") throw new Error("login_denied: the sign-in request was denied in the browser")
+    if (error === "expired_token") break
+    if (polled.status === 429 || error === "slow_down") {
+      intervalMs += 5000
+      // Keep this code. Better Auth uses X-Retry-After; proxies can use Retry-After.
+      delayMs = Math.max(intervalMs, retryAfterMs(polled.headers.get("retry-after")), retryAfterMs(polled.headers.get("x-retry-after")))
+      continue
+    }
+    delayMs = intervalMs
+    if (error === "authorization_pending") continue
+    throw new Error(`login_failed: ${polled.status} ${JSON.stringify(polled.body)}`)
+  }
+  throw new Error("login_expired: the code expired before it was approved; run login again")
+}
+
+async function runLogin(args) {
+  const json = hasFlag(args.flags, "json")
+  // Without --base-url, check the account already signed in (self-hosted or
+  // hosted) before starting a new sign-in against the hosted default.
+  const baseUrl = normalizeBaseUrl(getFlag(args.flags, "base-url", readSavedCredentials()?.baseUrl || DEFAULT_API_BASE_URL))
+  const force = hasFlag(args.flags, "force")
+
+  const existing = force ? null : resolveApiToken(baseUrl)
+  if (existing) {
+    const user = await fetchMe(baseUrl, existing.token)
+    if (user) {
+      jsonOut({ ok: true, message: `Already signed in as ${user.email}${existing.source === "env" ? " (IDEXAL_API_TOKEN)" : ""}`, source: existing.source, user: { id: user.id, email: user.email } }, json)
+      return
+    }
+    if (existing.source === "env") throw new Error("invalid_api_token: IDEXAL_API_TOKEN was rejected by /v1/me")
+  }
+
+  const granted = await deviceLogin(baseUrl, { json })
+  const user = await fetchMe(baseUrl, granted.accessToken)
+  if (!user) throw new Error("login_failed: the new session was rejected by /v1/me")
+  const credentialsPath = writeSavedCredentials({
+    baseUrl,
+    accessToken: granted.accessToken,
+    expiresAt: granted.expiresAt,
+    user: { id: user.id, email: user.email },
+    createdAt: new Date().toISOString(),
+  })
+  jsonOut({ ok: true, message: `Signed in as ${user.email}`, source: "login", user: { id: user.id, email: user.email }, credentialsPath }, json)
+}
+
+async function runLogout(args) {
+  const json = hasFlag(args.flags, "json")
+  const credentialsPath = defaultCredentialsPath()
+  const saved = readSavedCredentials(credentialsPath)
+  let revoked = false
+  if (saved) {
+    const signOut = await request(normalizeBaseUrl(saved.baseUrl), "/api/auth/sign-out", {
+      method: "POST",
+      headers: { authorization: `Bearer ${saved.accessToken}` },
+      body: "{}",
+    }).catch(() => null)
+    revoked = signOut?.status === 200
+  }
+  rmSync(credentialsPath, { force: true })
+  jsonOut({ ok: true, message: saved ? "Signed out" : "Not signed in", revoked, credentialsPath }, json)
+}
+
+function slugifySkillName(value) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 80) || "idexal-os-bootstrap-skill"
+}
+
+function runInstall(args) {
+  if (args.positionals[1] === "app") {
+    return runInstallApp(args)
+  }
+
+  const installDir = resolve(getFlag(args.flags, "install-dir", defaultInstallDir()))
+  const binDir = resolve(getFlag(args.flags, "bin-dir", defaultBinDir()))
+  const source = resolve(getFlag(args.flags, "source", selfPath))
+  const json = hasFlag(args.flags, "json")
+
+  if (!existsSync(source)) {
+    throw new Error(`source_not_found: ${source}`)
+  }
+
+  mkdirSync(installDir, { recursive: true })
+  mkdirSync(binDir, { recursive: true })
+
+  const installedCli = join(installDir, "idexal-os.mjs")
+  copyFileSync(source, installedCli)
+  chmodSync(installedCli, 0o755)
+
+  const executable = join(binDir, executableBasename())
+  // Pin the Node that ran the install: install.sh may have fetched a private
+  // Node into the install dir that is not on PATH. Fall back to PATH if that
+  // Node is later removed (for example a version manager uninstall).
+  const nodePath = process.execPath
+  if (process.platform === "win32") {
+    writeFileSync(executable, `@echo off\r\nif exist "${nodePath}" (\r\n  "${nodePath}" "${installedCli}" %*\r\n) else (\r\n  node "${installedCli}" %*\r\n)\r\n`)
+  } else {
+    writeFileSync(executable, `#!/usr/bin/env sh\nif [ -x "${nodePath}" ]; then exec "${nodePath}" "${installedCli}" "$@"; fi\nexec node "${installedCli}" "$@"\n`)
+  }
+  chmodSync(executable, 0o755)
+
+  const manifest = {
+    version: VERSION,
+    installedAt: new Date().toISOString(),
+    installDir,
+    binDir,
+    executable,
+    cli: installedCli,
+  }
+  writeFileSync(join(installDir, "install.json"), JSON.stringify(manifest, null, 2))
+
+  jsonOut({ ok: true, message: `idexal Os CLI installed at ${executable}`, install: manifest }, json)
+}
+
+function sha256(buffer) {
+  return createHash("sha256").update(buffer).digest("hex")
+}
+
+function isHttpUrl(value) {
+  return /^https?:\/\//i.test(value)
+}
+
+function filePathFromUrl(value) {
+  if (value.startsWith("file://")) {
+    return fileURLToPath(value)
+  }
+  return resolve(value)
+}
+
+async function readJsonLocation(location) {
+  if (isHttpUrl(location)) {
+    const response = await fetch(location)
+    if (!response.ok) throw new Error(`manifest_fetch_failed: ${response.status}`)
+    return response.json()
+  }
+  return JSON.parse(readFileSync(filePathFromUrl(location), "utf8"))
+}
+
+async function downloadArtifact(url, destination) {
+  if (isHttpUrl(url)) {
+    const response = await fetch(url)
+    if (!response.ok) throw new Error(`artifact_download_failed: ${response.status}`)
+    writeFileSync(destination, Buffer.from(await response.arrayBuffer()))
+    return
+  }
+  copyFileSync(filePathFromUrl(url), destination)
+}
+
+function selectArtifact(manifest) {
+  const platform = process.platform
+  const arch = process.arch
+  const candidates = [
+    manifest.artifacts?.[platform]?.[arch],
+    manifest.artifacts?.[`${platform}-${arch}`],
+    manifest.artifacts?.[platform],
+    Array.isArray(manifest.artifacts) ? manifest.artifacts.find((artifact) => artifact.platform === platform && (!artifact.arch || artifact.arch === arch)) : null,
+  ].filter(Boolean)
+  const artifact = candidates[0]
+  if (!artifact?.url) throw new Error(`no_artifact_for_platform: ${platform}-${arch}`)
+  return { ...artifact, platform, arch }
+}
+
+function inferArtifactType(url) {
+  const lower = url.toLowerCase()
+  if (lower.endsWith(".dmg")) return "dmg"
+  if (lower.endsWith(".zip")) return "zip"
+  if (lower.endsWith(".tar.gz") || lower.endsWith(".tgz")) return "tar.gz"
+  if (lower.endsWith(".appimage")) return "appimage"
+  if (lower.endsWith(".exe")) return "exe"
+  if (lower.endsWith(".msi")) return "msi"
+  return null
+}
+
+function defaultInstalledName(type, manifest, artifact) {
+  if (artifact.appName || manifest.appName) return artifact.appName || manifest.appName
+  if (type === "dmg") return "idexal Os.app"
+  if (type === "appimage") return "idexal Os.AppImage"
+  if (type === "exe") return "idexal Os.exe"
+  if (type === "msi") return "idexal Os.msi"
+  if (process.platform === "darwin") return "idexal Os.app"
+  if (process.platform === "win32") return "idexal Os.exe"
+  return "idexalos"
+}
+
+function findInstallCandidate(root, expectedName) {
+  const direct = join(root, expectedName)
+  if (existsSync(direct)) return direct
+
+  const queue = [root]
+  while (queue.length > 0) {
+    const current = queue.shift()
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const path = join(current, entry.name)
+      if (entry.name === expectedName) return path
+      if (entry.isDirectory()) queue.push(path)
+    }
+  }
+  throw new Error(`app_not_found_in_archive: ${expectedName}`)
+}
+
+// Copy an installed artifact into place. macOS .app bundles contain internal
+// framework symlinks (e.g. Versions/Current, the framework binary/Resources
+// links) that a naive recursive copy can break — leaving dangling links into a
+// now-unmounted DMG, which makes Gatekeeper report the app as "damaged". Use
+// `ditto` on macOS, which is the Apple-supported way to copy bundles while
+// preserving relative symlinks and the code signature.
+function copyArtifact(source, target) {
+  if (process.platform === "darwin") {
+    try {
+      execFileSync("ditto", [source, target], { stdio: "pipe" })
+    } catch {
+      // Fall back to cp -R (also preserves bundle symlinks) before giving up.
+      execFileSync("cp", ["-R", source, target], { stdio: "pipe" })
+    }
+    // Remove the quarantine flag so Gatekeeper does not block the freshly
+    // installed (already-notarized) app on first launch. Best-effort.
+    try {
+      execFileSync("xattr", ["-dr", "com.apple.quarantine", target], { stdio: "pipe" })
+    } catch {}
+    return
+  }
+  cpSync(source, target, { recursive: true })
+}
+
+function installFromDirectory(input) {
+  const source = findInstallCandidate(input.sourceDir, input.appName)
+  mkdirSync(input.appDir, { recursive: true })
+  const target = join(input.appDir, input.appName)
+  rmSync(target, { recursive: true, force: true })
+  copyArtifact(source, target)
+  if (input.executable) chmodSync(target, 0o755)
+  return target
+}
+
+function installDmg(input) {
+  if (process.platform !== "darwin") {
+    throw new Error("dmg_install_requires_macos")
+  }
+
+  const mountPoint = join(input.workDir, "mount")
+  mkdirSync(mountPoint, { recursive: true })
+  let mounted = false
+  try {
+    execFileSync("hdiutil", ["attach", input.artifactPath, "-nobrowse", "-readonly", "-mountpoint", mountPoint], { stdio: "pipe" })
+    mounted = true
+    const appName = input.appName || "idexal Os.app"
+    const sourceApp = join(mountPoint, appName)
+    if (!existsSync(sourceApp)) {
+      throw new Error(`app_not_found_in_dmg: ${appName}`)
+    }
+    mkdirSync(input.appDir, { recursive: true })
+    const targetApp = join(input.appDir, appName)
+    rmSync(targetApp, { recursive: true, force: true })
+    copyArtifact(sourceApp, targetApp)
+    return targetApp
+  } finally {
+    if (mounted) {
+      try {
+        execFileSync("hdiutil", ["detach", mountPoint, "-quiet"], { stdio: "pipe" })
+      } catch {
+        execFileSync("hdiutil", ["detach", mountPoint, "-force", "-quiet"], { stdio: "pipe" })
+      }
+    }
+  }
+}
+
+function installZip(input) {
+  const extractDir = join(input.workDir, "zip")
+  mkdirSync(extractDir, { recursive: true })
+  if (process.platform === "win32") {
+    execFileSync("powershell.exe", ["-NoProfile", "-Command", `Expand-Archive -LiteralPath ${JSON.stringify(input.artifactPath)} -DestinationPath ${JSON.stringify(extractDir)} -Force`], { stdio: "pipe" })
+  } else if (process.platform === "darwin") {
+    execFileSync("ditto", ["-x", "-k", input.artifactPath, extractDir], { stdio: "pipe" })
+  } else {
+    execFileSync("unzip", ["-q", input.artifactPath, "-d", extractDir], { stdio: "pipe" })
+  }
+  return installFromDirectory({ ...input, sourceDir: extractDir })
+}
+
+function installTarGz(input) {
+  const extractDir = join(input.workDir, "tar")
+  mkdirSync(extractDir, { recursive: true })
+  execFileSync("tar", ["-xzf", input.artifactPath, "-C", extractDir], { stdio: "pipe" })
+  return installFromDirectory({ ...input, sourceDir: extractDir })
+}
+
+function installSingleFile(input) {
+  mkdirSync(input.appDir, { recursive: true })
+  const target = join(input.appDir, input.appName)
+  rmSync(target, { force: true })
+  copyFileSync(input.artifactPath, target)
+  if (input.executable) chmodSync(target, 0o755)
+  return target
+}
+
+async function runInstallApp(args) {
+  const json = hasFlag(args.flags, "json")
+  const manifestLocation = getFlag(args.flags, "manifest") || process.env.IDEXAL_INSTALL_MANIFEST
+  if (!manifestLocation) throw new Error("missing_required_flag: --manifest")
+
+  const appDir = resolve(getFlag(args.flags, "app-dir", defaultAppDir()))
+  const workDir = join(tmpdir(), `idexal-os-app-install-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+  mkdirSync(workDir, { recursive: true })
+
+  try {
+    const manifest = await readJsonLocation(manifestLocation)
+    const artifact = selectArtifact(manifest)
+    const type = artifact.type || inferArtifactType(artifact.url)
+    if (!type) throw new Error("unsupported_app_artifact_type: unknown")
+
+    const artifactPath = join(workDir, artifact.fileName || "idexal Os.dmg")
+    await downloadArtifact(artifact.url, artifactPath)
+    const digest = sha256(readFileSync(artifactPath))
+    if (artifact.sha256 && digest !== artifact.sha256) {
+      throw new Error(`checksum_mismatch: expected ${artifact.sha256} got ${digest}`)
+    }
+
+    const appName = defaultInstalledName(type, manifest, artifact)
+    const appPath = type === "dmg"
+      ? installDmg({ artifactPath, workDir, appDir, appName })
+      : type === "zip"
+        ? installZip({ artifactPath, workDir, appDir, appName, executable: !appName.endsWith(".app") && process.platform !== "win32" })
+        : type === "tar.gz"
+          ? installTarGz({ artifactPath, workDir, appDir, appName, executable: process.platform !== "win32" })
+          : type === "appimage"
+            ? installSingleFile({ artifactPath, appDir, appName, executable: true })
+            : type === "exe" || type === "msi"
+              ? installSingleFile({ artifactPath, appDir, appName, executable: false })
+              : (() => { throw new Error(`unsupported_app_artifact_type: ${type}`) })()
+
+    const install = {
+      version: manifest.version || artifact.version || null,
+      installedAt: new Date().toISOString(),
+      appDir,
+      appPath,
+      manifest: manifestLocation,
+      artifact: {
+        type,
+        url: artifact.url,
+        sha256: digest,
+        platform: artifact.platform,
+        arch: artifact.arch,
+      },
+    }
+    mkdirSync(dirname(appPath), { recursive: true })
+    writeFileSync(join(appDir, "idexal-os-app-install.json"), JSON.stringify(install, null, 2))
+    jsonOut({ ok: true, message: `idexal Os app installed at ${appPath}`, install }, json)
+  } finally {
+    rmSync(workDir, { recursive: true, force: true })
+  }
+}
+
+function resolveInstalledApp(appDir) {
+  const appManifest = join(appDir, "idexal-os-app-install.json")
+  let appPath = process.platform === "darwin"
+    ? join(appDir, "idexal Os.app")
+    : process.platform === "win32"
+      ? join(appDir, "idexal Os.exe")
+      : join(appDir, "idexalos")
+  if (existsSync(appManifest)) {
+    try {
+      const appInstall = JSON.parse(readFileSync(appManifest, "utf8"))
+      if (appInstall.appPath) appPath = appInstall.appPath
+    } catch {
+      // Keep fallback path.
+    }
+  }
+  return { appPath, appManifest }
+}
+
+function launchDetached(command, commandArgs, logPath) {
+  const log = openSync(logPath, "a")
+  const child = spawn(command, commandArgs, { detached: true, stdio: ["ignore", log, log] })
+  closeSync(log)
+  let exit = null
+  child.on("exit", (code, signal) => { exit = { code, signal } })
+  child.unref()
+  return { child, exited: () => exit }
+}
+
+
+// Electron's Chromium sandbox cannot start for an AppImage when the OS blocks
+// unprivileged user namespaces (Ubuntu 24.04+ AppArmor default, containers) or
+// when running as root. Retry once without it instead of leaving the user with
+// a window that never appears.
+function linuxSandboxFailure(logPath) {
+  try {
+    return /sandbox|namespace|setuid/i.test(readFileSync(logPath, "utf8"))
+  } catch {
+    return false
+  }
+}
+
+async function runOpenApp(args) {
+  const json = hasFlag(args.flags, "json")
+  const appDir = resolve(getFlag(args.flags, "app-dir", defaultAppDir()))
+  const { appPath } = resolveInstalledApp(appDir)
+  if (!existsSync(appPath)) {
+    throw new Error(`app_not_installed: ${appPath} (run \`${COMMAND_NAME} install app --manifest <url>\` first)`)
+  }
+
+  if (process.platform === "darwin") {
+    execFileSync("open", [appPath])
+    jsonOut({ ok: true, message: `Opened ${appPath}`, appPath, launcher: "open" }, json)
+    return
+  }
+
+  if (process.platform === "linux" && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
+    throw new Error("no_display: DISPLAY and WAYLAND_DISPLAY are unset; run this from the user's desktop session")
+  }
+
+  const logPath = join(appDir, "idexal-os-app-launch.log")
+  const forceNoSandbox = process.platform === "linux" && typeof process.getuid === "function" && process.getuid() === 0
+  let appArgs = forceNoSandbox ? ["--no-sandbox"] : []
+  let launch = launchDetached(appPath, appArgs, logPath)
+  await sleep(4000)
+  if (process.platform === "linux" && launch.exited() && !appArgs.includes("--no-sandbox") && linuxSandboxFailure(logPath)) {
+    appArgs = ["--no-sandbox"]
+    launch = launchDetached(appPath, appArgs, logPath)
+    await sleep(4000)
+  }
+
+  const exited = launch.exited()
+  if (exited && exited.code !== 0) {
+    jsonOut({ ok: false, message: `idexal Os exited during launch (code ${exited.code ?? exited.signal}); see ${logPath}`, appPath, args: appArgs, log: logPath }, json)
+    process.exitCode = 1
+    return
+  }
+  jsonOut({ ok: true, message: `Opened ${appPath}`, appPath, pid: launch.child.pid, args: appArgs, log: logPath }, json)
+}
+
+async function runDoctor(args) {
+  const installDir = resolve(getFlag(args.flags, "install-dir", defaultInstallDir()))
+  const binDir = resolve(getFlag(args.flags, "bin-dir", defaultBinDir()))
+  const baseUrl = getFlag(args.flags, "base-url")
+  const appDir = resolve(getFlag(args.flags, "app-dir", defaultAppDir()))
+  const desktopBootstrapPath = resolve(getFlag(args.flags, "desktop-bootstrap-path", defaultDesktopBootstrapPath()))
+  const json = hasFlag(args.flags, "json")
+  const checks = []
+
+  checks.push({ name: "node", ok: Number(process.versions.node.split(".")[0]) >= 20, value: process.versions.node })
+  checks.push({ name: "installDir", ok: existsSync(installDir), value: installDir })
+  checks.push({ name: "binDir", ok: existsSync(binDir), value: binDir })
+
+  const executable = join(binDir, executableBasename())
+  const executableOk = existsSync(executable) && statSync(executable).isFile()
+  checks.push({ name: "idexalOsExecutable", ok: executableOk, value: executable })
+
+  const manifestPath = join(installDir, "install.json")
+  let manifest = null
+  if (existsSync(manifestPath)) {
+    manifest = JSON.parse(readFileSync(manifestPath, "utf8"))
+    checks.push({ name: "manifest", ok: true, value: manifestPath })
+  } else {
+    checks.push({ name: "manifest", ok: false, value: manifestPath })
+  }
+
+  if (baseUrl) {
+    try {
+      const response = await fetch(`${baseUrl.replace(/\/$/, "")}/health`)
+      const body = await response.json().catch(() => null)
+      checks.push({ name: "denApiHealth", ok: response.ok && body?.ok === true, value: { status: response.status, body } })
+    } catch (error) {
+      checks.push({ name: "denApiHealth", ok: false, value: error instanceof Error ? error.message : String(error) })
+    }
+  }
+
+  if (hasFlag(args.flags, "app") || args.flags.has("app-dir")) {
+    const { appPath, appManifest } = resolveInstalledApp(appDir)
+    checks.push({ name: "idexalOsApp", ok: existsSync(appPath), value: appPath })
+    checks.push({ name: "appInstallManifest", ok: existsSync(appManifest), value: appManifest })
+  }
+
+  if (hasFlag(args.flags, "desktop-bootstrap") || args.flags.has("desktop-bootstrap-path")) {
+    let bootstrap = null
+    try {
+      bootstrap = JSON.parse(readFileSync(desktopBootstrapPath, "utf8"))
+    } catch {
+      bootstrap = null
+    }
+    const handoff = bootstrap?.handoff
+    const prepared = bootstrap?.prepared
+    checks.push({ name: "desktopBootstrap", ok: Boolean(bootstrap?.baseUrl), value: desktopBootstrapPath })
+    checks.push({ name: "desktopBootstrapPrepared", ok: Boolean(prepared?.orgId && prepared?.skillId && prepared?.skillPath), value: prepared ? { orgId: prepared.orgId, orgName: prepared.orgName, skillId: prepared.skillId, skillTitle: prepared.skillTitle, skillPath: prepared.skillPath } : null })
+    checks.push({ name: "desktopBootstrapHandoff", ok: Boolean(handoff?.grant && handoff?.orgId && handoff?.skillId) || Boolean(prepared?.orgId && prepared?.skillId), value: handoff ? { orgId: handoff.orgId, orgName: handoff.orgName, skillId: handoff.skillId, skillTitle: handoff.skillTitle } : "consumed" })
+  }
+
+  const ok = checks.every((check) => check.ok)
+  jsonOut({ ok, message: ok ? "idexal-os doctor: ok" : "idexal-os doctor: failed", version: VERSION, manifest, checks }, json)
+  if (!ok) process.exitCode = 1
+}
+
+async function request(baseUrl, path, options = {}) {
+  const response = await fetch(`${baseUrl}${path}`, {
+    ...options,
+    headers: {
+      "content-type": "application/json",
+      origin: baseUrl,
+      ...(options.headers || {}),
+    },
+  })
+  const text = await response.text()
+  let body = null
+  if (text) {
+    try {
+      body = JSON.parse(text)
+    } catch {
+      body = text
+    }
+  }
+  return { status: response.status, body, headers: response.headers }
+}
+
+// Hosted idexal Os Cloud requires a 6-digit email code before the first
+// sign-in. Every sign-up or unverified sign-in emails a NEW code and
+// invalidates the previous one, so the code step must verify first and never
+// sign up or sign in before it.
+function isEmailNotVerified(response) {
+  const code = response.body?.code
+  return response.status === 403 && (code === "EMAIL_NOT_VERIFIED" || /not verified/i.test(String(response.body?.message ?? "")))
+}
+
+function verificationRequiredMessage(email) {
+  return `We emailed a 6-digit verification code to ${email}. Ask the person for it, then run the same command with --verification-code <code> (or --verification-code-stdin).`
+}
+
+async function verifyEmailCode(baseUrl, input) {
+  const verified = await request(baseUrl, "/api/auth/email-otp/verify-email", {
+    method: "POST",
+    body: JSON.stringify({ email: input.email, otp: input.verificationCode }),
+  })
+  if (verified.status !== 200) {
+    throw new Error(`email_verification_failed: ${verified.status} ${JSON.stringify(verified.body)}. The code may be wrong or expired; run with --request-code to email a new one.`)
+  }
+  return verified
+}
+
+async function requestVerificationCode(baseUrl, input) {
+  const signup = await request(baseUrl, "/api/auth/sign-up/email", {
+    method: "POST",
+    body: JSON.stringify({ name: input.name, email: input.email, password: input.password }),
+  })
+  if (signup.status === 200) {
+    // A fresh sign-up already emailed the code when verification is required;
+    // deployments without verification sign the person in immediately.
+    return { signup, verificationRequired: !signup.body?.token }
+  }
+  const sent = await request(baseUrl, "/api/auth/email-otp/send-verification-otp", {
+    method: "POST",
+    body: JSON.stringify({ email: input.email, type: "email-verification" }),
+  })
+  if (sent.status !== 200) {
+    throw new Error(`verification_code_request_failed: ${sent.status} ${JSON.stringify(sent.body)}`)
+  }
+  return { signup, verificationRequired: true }
+}
+
+async function signupAndSignin(baseUrl, input) {
+  let signup = null
+  if (input.verificationCode) {
+    await verifyEmailCode(baseUrl, input)
+  } else {
+    signup = await request(baseUrl, "/api/auth/sign-up/email", {
+      method: "POST",
+      body: JSON.stringify({ name: input.name, email: input.email, password: input.password }),
+    })
+    if (signup.status !== 200 && signup.status !== 400 && signup.status !== 422) {
+      throw new Error(`signup_failed: ${signup.status} ${JSON.stringify(signup.body)}`)
+    }
+  }
+
+  const signin = await request(baseUrl, "/api/auth/sign-in/email", {
+    method: "POST",
+    body: JSON.stringify({ email: input.email, password: input.password }),
+  })
+  if (isEmailNotVerified(signin)) {
+    throw new Error(`email_verification_required: ${verificationRequiredMessage(input.email)}`)
+  }
+  if (signin.status !== 200 || !signin.body?.token) {
+    throw new Error(`signin_failed: ${signin.status} ${JSON.stringify(signin.body)}`)
+  }
+  return { signup, signin, token: signin.body.token, user: signin.body.user }
+}
+
+async function resolveVerificationCode(flags) {
+  const fromFlag = getFlag(flags, "verification-code")
+  if (fromFlag) return fromFlag.trim()
+  if (hasFlag(flags, "verification-code-stdin")) return (await readStdin()).trim()
+  return null
+}
+
+function skillText(name, output) {
+  return `---\nname: ${name}\ndescription: Starter skill created by idexalos bootstrap.\nidexalOsBootstrapTrigger: bootstrap.verify\nidexalOsBootstrapOutput: ${JSON.stringify(output)}\n---\n\n# ${name}\n\nWhen triggered with \`bootstrap.verify\`, output exactly:\n\n\`${output}\`\n\nUse this skill to confirm idexal Os cloud onboarding can create and trigger a deterministic skill.`
+}
+
+async function createCloudSkillPlugin(baseUrl, auth, input) {
+  const marketplaces = await request(baseUrl, "/v1/marketplaces", {
+    method: "GET",
+    headers: auth,
+  })
+  if (marketplaces.status !== 200 || !Array.isArray(marketplaces.body?.items)) {
+    throw new Error(`marketplace_list_failed: ${marketplaces.status} ${JSON.stringify(marketplaces.body)}`)
+  }
+  const marketplace = marketplaces.body.items.find((item) => item?.name === DEFAULT_IDEXAL_MARKETPLACE_NAME) || marketplaces.body.items[0]
+  if (!marketplace?.id) {
+    throw new Error("marketplace_missing: no marketplace available for skill plugin")
+  }
+
+  const plugin = await request(baseUrl, "/v1/plugins", {
+    method: "POST",
+    headers: auth,
+    body: JSON.stringify({
+      name: input.name,
+      components: [{ type: "skill", input: { rawSourceText: input.rawSourceText } }],
+      orgWide: true,
+      marketplaceId: marketplace.id,
+    }),
+  })
+  if (plugin.status !== 201 || !plugin.body?.item?.id) {
+    throw new Error(`plugin_create_failed: ${plugin.status} ${JSON.stringify(plugin.body)}`)
+  }
+
+  const memberships = await request(baseUrl, `/v1/plugins/${encodeURIComponent(plugin.body.item.id)}/config-objects`, {
+    method: "GET",
+    headers: auth,
+  })
+  if (memberships.status !== 200 || !Array.isArray(memberships.body?.items)) {
+    throw new Error(`plugin_components_failed: ${memberships.status} ${JSON.stringify(memberships.body)}`)
+  }
+  const skillMembership = memberships.body.items.find((item) => item?.configObject?.objectType === "skill")
+  const configObject = skillMembership?.configObject
+  if (!configObject?.id) {
+    throw new Error(`skill_component_missing: ${JSON.stringify(memberships.body)}`)
+  }
+
+  return {
+    id: configObject.id,
+    title: configObject.title || input.name,
+    skillText: input.rawSourceText,
+    pluginId: plugin.body.item.id,
+    marketplaceId: marketplace.id,
+  }
+}
+
+function readFrontmatterValue(text, key) {
+  const match = text.match(/^---\n([\s\S]*?)\n---/)
+  if (!match) return null
+  for (const line of match[1].split(/\r?\n/g)) {
+    const index = line.indexOf(":")
+    if (index < 0) continue
+    const name = line.slice(0, index).trim()
+    if (name !== key) continue
+    const raw = line.slice(index + 1).trim()
+    if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+      try {
+        return JSON.parse(raw)
+      } catch {
+        return raw.slice(1, -1)
+      }
+    }
+    return raw
+  }
+  return null
+}
+
+function runBootstrapSkill(skill, input) {
+  const trigger = readFrontmatterValue(skill.skillText, "idexalOsBootstrapTrigger")
+  const output = readFrontmatterValue(skill.skillText, "idexalOsBootstrapOutput")
+  const triggered = trigger === input.trigger && typeof output === "string" && output.length > 0
+  return {
+    triggered,
+    trigger,
+    input,
+    output: triggered ? output : null,
+    skill: {
+      id: skill.id,
+      title: skill.title,
+    },
+  }
+}
+
+async function createDesktopHandoff(baseUrl, auth) {
+  const handoff = await request(baseUrl, "/v1/auth/desktop-handoff", {
+    method: "POST",
+    headers: auth,
+    body: JSON.stringify({ desktopScheme: "idexalos" }),
+  })
+  if (handoff.status !== 200 || !handoff.body?.grant) {
+    throw new Error(`desktop_handoff_failed: ${handoff.status} ${JSON.stringify(handoff.body)}`)
+  }
+  return handoff.body
+}
+
+function writePreparedDesktop(input) {
+  const bootstrapPath = resolve(input.bootstrapPath)
+  let existingBrandAppName = null
+  if (existsSync(bootstrapPath)) {
+    try {
+      const existingBootstrap = JSON.parse(readFileSync(bootstrapPath, "utf8"))
+      existingBrandAppName = typeof existingBootstrap.brandAppName === "string"
+        ? existingBootstrap.brandAppName.trim().slice(0, 64)
+        : null
+    } catch {}
+  }
+  const skillName = slugifySkillName(input.skill.title)
+  const skillDir = resolve(input.skillsDir, skillName)
+  const skillPath = join(skillDir, "SKILL.md")
+  mkdirSync(dirname(bootstrapPath), { recursive: true })
+  mkdirSync(skillDir, { recursive: true })
+  writeFileSync(skillPath, input.skill.skillText, "utf8")
+  const preparedAt = new Date().toISOString()
+  const prepared = {
+    orgId: input.organization.id,
+    orgName: input.organization.name,
+    orgSlug: input.organization.slug,
+    skillId: input.skill.id,
+    skillTitle: input.skill.title,
+    skillsDir: resolve(input.skillsDir),
+    skillPath,
+    preparedAt,
+  }
+  const bootstrap = {
+    baseUrl: input.baseUrl,
+    apiBaseUrl: input.apiBaseUrl,
+    requireSignin: false,
+    ...(existingBrandAppName ? { brandAppName: existingBrandAppName } : {}),
+    prepared,
+    ...(input.claimLinks ? { claimLinks: input.claimLinks } : {}),
+  }
+  if (input.handoff) {
+    bootstrap.handoff = {
+      grant: input.handoff.grant,
+      denBaseUrl: input.baseUrl,
+      orgId: prepared.orgId,
+      orgName: prepared.orgName,
+      orgSlug: prepared.orgSlug,
+      skillId: prepared.skillId,
+      skillTitle: prepared.skillTitle,
+      createdAt: preparedAt,
+    }
+  } else {
+    bootstrap.handoff = null
+  }
+
+  writeFileSync(bootstrapPath, `${JSON.stringify(bootstrap, null, 2)}\n`, "utf8")
+
+  return {
+    prepared: true,
+    bootstrapPath,
+    skillsDir: resolve(input.skillsDir),
+    skillPath,
+    ...(input.handoff ? { handoffExpiresAt: input.handoff.expiresAt, handoffGrant: "redacted: saved to bootstrapPath" } : {}),
+    ...(input.claimLinks
+      ? {
+          claimLinks: input.claimLinks.map((link) => ({
+            id: link.id,
+            role: link.role,
+            expiresAt: link.expiresAt,
+            url: `redacted: run "idexal-os-bootstrap cloud claim-link --role ${link.role}" to view`,
+          })),
+        }
+      : {}),
+  }
+}
+
+function ensureDeviceKey(filePath) {
+  const keyPath = resolve(filePath)
+  if (existsSync(keyPath)) {
+    const stored = JSON.parse(readFileSync(keyPath, "utf8"))
+    if (typeof stored.publicKey === "string" && stored.publicKey.trim()) {
+      return { path: keyPath, publicKey: stored.publicKey.trim(), reused: true }
+    }
+  }
+
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519", {
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  })
+  mkdirSync(dirname(keyPath), { recursive: true })
+  writeFileSync(keyPath, `${JSON.stringify({ publicKey, privateKey, createdAt: new Date().toISOString() }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 })
+  try {
+    chmodSync(keyPath, 0o600)
+  } catch {}
+  return { path: keyPath, publicKey, reused: false }
+}
+
+async function resolveOwnerPassword(flags) {
+  const fromFlag = getFlag(flags, "owner-password")
+  if (fromFlag) return fromFlag
+
+  const envName = getFlag(flags, "owner-password-env", "IDEXAL_OWNER_PASSWORD")
+  const fromEnv = process.env[envName]
+  if (fromEnv) return fromEnv
+
+  const filePath = getFlag(flags, "owner-password-file")
+  if (filePath) return readFileSync(resolve(filePath), "utf8").trim()
+
+  if (hasFlag(flags, "owner-password-stdin")) return (await readStdin()).trim()
+
+  return null
+}
+
+async function runCloudOnboard(args) {
+  const subcommand = args.positionals[1]
+  if (subcommand !== "onboard") {
+    printHelp()
+    process.exitCode = 1
+    return
+  }
+
+  const json = hasFlag(args.flags, "json")
+  const baseUrl = getFlag(args.flags, "base-url")?.replace(/\/$/, "")
+  const ownerEmail = getFlag(args.flags, "owner-email")
+  // The deprecated password path stays available when explicitly requested.
+  const explicitPasswordPath = hasFlag(args.flags, "request-code") || args.flags.has("verification-code") || hasFlag(args.flags, "verification-code-stdin")
+  const signedIn = baseUrl && !explicitPasswordPath ? resolveApiToken(baseUrl) : null
+  const ownerPassword = signedIn ? null : await resolveOwnerPassword(args.flags)
+  const orgName = getFlag(args.flags, "org-name")
+  // Teammates are optional: a person can start alone and invite later.
+  const inviteEmails = [getFlag(args.flags, "invite-email"), getFlag(args.flags, "teammate-emails")]
+    .filter(Boolean)
+    .flatMap((value) => String(value).split(","))
+    .map((value) => value.trim())
+    .filter(Boolean)
+  const skillName = getFlag(args.flags, "skill-name", "First idexal Os Skill")
+  const skillOutput = getFlag(args.flags, "skill-output", "IDEXAL_BOOTSTRAP_SKILL_TRIGGERED")
+  const prepareDesktop = hasFlag(args.flags, "prepare-desktop")
+  const desktopBootstrapPath = getFlag(args.flags, "desktop-bootstrap-path", defaultDesktopBootstrapPath())
+  const skillsDir = getFlag(args.flags, "skills-dir", defaultSkillsDir())
+  const webBaseUrl = getFlag(args.flags, "web-base-url", deriveWebBaseUrl(baseUrl))?.replace(/\/$/, "")
+  const requestCodeOnly = hasFlag(args.flags, "request-code")
+  if (requestCodeOnly && (args.flags.has("verification-code") || hasFlag(args.flags, "verification-code-stdin"))) {
+    throw new Error("conflicting_flags: use --request-code first, then run again with --verification-code")
+  }
+  if (hasFlag(args.flags, "verification-code-stdin") && hasFlag(args.flags, "owner-password-stdin")) {
+    throw new Error("conflicting_flags: stdin can carry either the password or the verification code, not both")
+  }
+  const verificationCode = requestCodeOnly ? null : await resolveVerificationCode(args.flags)
+  if (verificationCode !== null && !/^\d{4,10}$/.test(verificationCode)) {
+    throw new Error("invalid_verification_code: expected the numeric code from the verification email")
+  }
+
+  const required = requestCodeOnly
+    ? { baseUrl, ownerEmail, ownerPassword }
+    : { baseUrl, orgName }
+  for (const [name, value] of Object.entries(required)) {
+    if (!value) throw new Error(`missing_required_flag: --${name.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`)
+  }
+  if (!signedIn && (!ownerEmail || !ownerPassword)) {
+    throw new Error(`not_signed_in: run "idexal-os-bootstrap login --base-url ${baseUrl}" first (or set IDEXAL_API_TOKEN)`)
+  }
+
+  const health = await request(baseUrl, "/health", { method: "GET" })
+  if (health.status !== 200 || health.body?.ok !== true) {
+    throw new Error(`den_api_unhealthy: ${health.status} ${JSON.stringify(health.body)}`)
+  }
+
+  if (requestCodeOnly) {
+    console.error("warning: --owner-email/--owner-password are deprecated; use `idexal-os-bootstrap login` instead")
+    const requested = await requestVerificationCode(baseUrl, {
+      name: "idexal Os Owner",
+      email: ownerEmail,
+      password: ownerPassword,
+    })
+    jsonOut({
+      ok: true,
+      step: requested.verificationRequired ? "verification_required" : "verified",
+      message: requested.verificationRequired
+        ? verificationRequiredMessage(ownerEmail)
+        : "This deployment does not require email verification. Run the command again without --request-code.",
+      email: ownerEmail,
+    }, json)
+    return
+  }
+
+  let owner
+  if (signedIn) {
+    const user = await fetchMe(baseUrl, signedIn.token)
+    if (!user) {
+      throw new Error(signedIn.source === "env"
+        ? "invalid_api_token: IDEXAL_API_TOKEN was rejected by /v1/me"
+        : `session_expired: run "idexal-os-bootstrap login --base-url ${baseUrl} --force" again`)
+    }
+    owner = { token: signedIn.token, user }
+  } else {
+    // Deprecated: passwords on the command line end up in shell history.
+    // Kept for existing scripts.
+    console.error("warning: --owner-email/--owner-password are deprecated; use `idexal-os-bootstrap login` instead")
+    owner = await signupAndSignin(baseUrl, {
+      name: "idexal Os Owner",
+      email: ownerEmail,
+      password: ownerPassword,
+      verificationCode,
+    })
+  }
+  const auth = { authorization: `Bearer ${owner.token}` }
+
+  const org = await request(baseUrl, "/v1/org", {
+    method: "POST",
+    headers: auth,
+    body: JSON.stringify({ name: orgName }),
+  })
+  if (org.status !== 201 || !org.body?.organization?.id) {
+    throw new Error(`org_create_failed: ${org.status} ${JSON.stringify(org.body)}`)
+  }
+
+  const invitations = []
+  for (const email of inviteEmails) {
+    const invite = await request(baseUrl, "/v1/invitations", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ email, role: "member" }),
+    })
+    if (invite.status !== 201 || !invite.body?.invitationId) {
+      throw new Error(`invite_failed: ${invite.status} ${JSON.stringify(invite.body)}`)
+    }
+    invitations.push(invite.body)
+  }
+
+  const rawSourceText = skillText(skillName, skillOutput)
+  const skill = await createCloudSkillPlugin(baseUrl, auth, {
+    name: skillName,
+    rawSourceText,
+  })
+
+  const skillRun = runBootstrapSkill(skill, { trigger: "bootstrap.verify" })
+  if (!skillRun.triggered || skillRun.output !== skillOutput) {
+    throw new Error(`skill_trigger_failed: ${JSON.stringify(skillRun)}`)
+  }
+
+  let desktop = null
+  if (prepareDesktop) {
+    const handoff = await createDesktopHandoff(baseUrl, auth)
+    desktop = writePreparedDesktop({
+      baseUrl: webBaseUrl,
+      apiBaseUrl: baseUrl,
+      bootstrapPath: desktopBootstrapPath,
+      skillsDir,
+      handoff,
+      organization: org.body.organization,
+      skill,
+    })
+  }
+
+  jsonOut({
+    ok: true,
+    message: "idexal Os cloud onboarding complete",
+    user: { id: owner.user.id, email: owner.user.email, emailVerified: owner.user.emailVerified },
+    signedInWith: signedIn ? signedIn.source : "password",
+    organization: org.body.organization,
+    // `invitation` kept for scripts written against the single-invite shape.
+    invitation: invitations[0] ?? null,
+    invitations,
+    skill,
+    skillRun,
+    desktop,
+  }, json)
+}
+
+async function runCloudBootstrapWorkspace(args) {
+  const json = hasFlag(args.flags, "json")
+  const baseUrl = getFlag(args.flags, "base-url", "https://api.idexal.com")?.replace(/\/$/, "")
+  const workspaceName = getFlag(args.flags, "workspace-name")
+  const skillName = getFlag(args.flags, "skill-name", "First idexal Os Skill")
+  const ownerEmail = getFlag(args.flags, "owner-email")
+  const prepareDesktop = hasFlag(args.flags, "prepare-desktop")
+  const desktopBootstrapPath = getFlag(args.flags, "desktop-bootstrap-path", defaultDesktopBootstrapPath())
+  const skillsDir = getFlag(args.flags, "skills-dir", defaultSkillsDir())
+  const deviceKeyPath = getFlag(args.flags, "device-key-path", defaultDeviceKeyPath())
+  const webBaseUrl = getFlag(args.flags, "web-base-url", deriveWebBaseUrl(baseUrl))?.replace(/\/$/, "")
+  const claimRoles = String(getFlag(args.flags, "claim-roles", "owner"))
+    .split(",")
+    .map((role) => role.trim())
+    .filter(Boolean)
+  const teammateEmails = String(getFlag(args.flags, "teammate-emails", ""))
+    .split(",")
+    .map((email) => email.trim())
+    .filter(Boolean)
+
+  for (const [name, value] of Object.entries({ baseUrl, workspaceName })) {
+    if (!value) throw new Error(`missing_required_flag: --${name.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`)
+  }
+
+  const health = await request(baseUrl, "/health", { method: "GET" })
+  if (health.status !== 200 || health.body?.ok !== true) {
+    throw new Error(`den_api_unhealthy: ${health.status} ${JSON.stringify(health.body)}`)
+  }
+
+  const deviceKey = ensureDeviceKey(deviceKeyPath)
+  const response = await request(baseUrl, "/v1/bootstrap/workspace", {
+    method: "POST",
+    body: JSON.stringify({
+      workspaceName,
+      skillName,
+      devicePublicKey: deviceKey.publicKey,
+      claimRoles,
+      ...(ownerEmail ? { ownerEmail } : {}),
+      ...(teammateEmails.length > 0 ? { teammateEmails } : {}),
+    }),
+  })
+  if (response.status !== 200 || response.body?.ok !== true || !response.body?.organization?.id || !response.body?.skill?.id) {
+    throw new Error(`workspace_bootstrap_failed: ${response.status} ${JSON.stringify(response.body)}`)
+  }
+
+  const skill = {
+    ...response.body.skill,
+    skillText: skillText(response.body.skill.title, response.body.skill.output || "IDEXAL_BOOTSTRAP_SKILL_TRIGGERED"),
+  }
+
+  const skillRun = runBootstrapSkill(skill, { trigger: "bootstrap.verify" })
+  if (!skillRun.triggered || skillRun.output !== "IDEXAL_BOOTSTRAP_SKILL_TRIGGERED") {
+    throw new Error(`skill_trigger_failed: ${JSON.stringify(skillRun)}`)
+  }
+
+  let desktop = null
+  if (prepareDesktop) {
+    desktop = writePreparedDesktop({
+      baseUrl: webBaseUrl,
+      apiBaseUrl: baseUrl,
+      bootstrapPath: desktopBootstrapPath,
+      skillsDir,
+      organization: response.body.organization,
+      skill,
+      claimLinks: response.body.claimLinks,
+    })
+  }
+
+  jsonOut({
+    ok: true,
+    message: "idexal Os workspace bootstrap complete",
+    organization: response.body.organization,
+    setup: response.body.setup,
+    skill: response.body.skill,
+    skillRun,
+    claimLinks: response.body.claimLinks.map((link) => ({
+      id: link.id,
+      role: link.role,
+      expiresAt: link.expiresAt,
+      url: prepareDesktop
+        ? `redacted: run "idexal-os-bootstrap cloud claim-link --role ${link.role}" to view`
+        : "discarded: rerun with --prepare-desktop to persist this link, otherwise it cannot be retrieved later",
+    })),
+    device: { publicKeyPath: deviceKey.path, reused: deviceKey.reused },
+    desktop,
+  }, json)
+}
+
+function runCloudClaimLink(args) {
+  const json = hasFlag(args.flags, "json")
+  const desktopBootstrapPath = resolve(getFlag(args.flags, "desktop-bootstrap-path", defaultDesktopBootstrapPath()))
+  const roleFilter = getFlag(args.flags, "role")
+
+  if (!existsSync(desktopBootstrapPath)) {
+    throw new Error(`desktop_bootstrap_not_found: ${desktopBootstrapPath} (run cloud bootstrap-workspace --prepare-desktop first)`)
+  }
+
+  const bootstrap = JSON.parse(readFileSync(desktopBootstrapPath, "utf8"))
+  const allLinks = Array.isArray(bootstrap.claimLinks) ? bootstrap.claimLinks : []
+  const claimLinks = roleFilter ? allLinks.filter((link) => link.role === roleFilter) : allLinks
+
+  if (claimLinks.length === 0) {
+    throw new Error(
+      allLinks.length === 0
+        ? `no_claim_links: ${desktopBootstrapPath} has no claim links (this workspace may have been bootstrapped without --prepare-desktop, or claimRoles was empty)`
+        : `no_claim_links_for_role: no claim link with role "${roleFilter}" in ${desktopBootstrapPath}`,
+    )
+  }
+
+  jsonOut({
+    ok: true,
+    message: "Claim link retrieved. Share this URL only with the person who should own this workspace.",
+    bootstrapPath: desktopBootstrapPath,
+    claimLinks,
+  }, json)
+}
+
+// ---------------------------------------------------------------------------
+// migrate: Claude Cowork / Claude Code plugins and skills -> idexal Os Cloud
+//
+// Reads what the person already has on this computer (marketplaces they added
+// in Cowork or Claude Code, and the skills they wrote themselves in Cowork),
+// then imports it into their idexal Os organization through Den's GitHub plugin
+// import. Every step is safe to re-run: Den updates a plugin imported earlier
+// from the same repository, and a skill that already exists gets a new
+// version only when its text changed.
+// ---------------------------------------------------------------------------
+
+function coworkSessionsDir() {
+  if (process.env.IDEXAL_COWORK_DIR) return process.env.IDEXAL_COWORK_DIR
+  const home = process.env.HOME || process.env.USERPROFILE || process.cwd()
+  if (process.platform === "darwin") return join(home, "Library", "Application Support", "Claude", "local-agent-mode-sessions")
+  if (process.platform === "win32") return join(process.env.APPDATA || join(home, "AppData", "Roaming"), "Claude", "local-agent-mode-sessions")
+  return join(configHomeDir(), "Claude", "local-agent-mode-sessions")
+}
+
+function claudeCodePluginsDir() {
+  if (process.env.IDEXAL_CLAUDE_CODE_PLUGINS_DIR) return process.env.IDEXAL_CLAUDE_CODE_PLUGINS_DIR
+  const home = process.env.HOME || process.env.USERPROFILE || process.cwd()
+  return join(process.env.CLAUDE_CONFIG_DIR || join(home, ".claude"), "plugins")
+}
+
+function readJsonFile(path) {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"))
+  } catch {
+    return null
+  }
+}
+
+function listDirs(path) {
+  try {
+    return readdirSync(path, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => join(path, entry.name))
+  } catch {
+    return []
+  }
+}
+
+function githubRepoUrl(repo) {
+  const cleaned = String(repo || "").trim().replace(/^https?:\/\/github\.com\//, "").replace(/\.git$/, "").replace(/\/+$/, "")
+  return /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(cleaned) ? `https://github.com/${cleaned}` : null
+}
+
+function addMarketplace(found, input) {
+  const url = input.source?.source === "github" ? githubRepoUrl(input.source.repo) : null
+  if (!url) {
+    found.unsupported.push({ name: input.name, origin: input.origin, reason: "not_on_github", detail: "Only public GitHub marketplaces can be imported; add its plugins to your organization by hand." })
+    return
+  }
+  const existing = found.marketplaces.find((entry) => entry.url === url)
+  if (existing) {
+    if (!existing.origins.includes(input.origin)) existing.origins.push(input.origin)
+    for (const plugin of input.installedPlugins ?? []) if (!existing.installedPlugins.includes(plugin)) existing.installedPlugins.push(plugin)
+    return
+  }
+  found.marketplaces.push({ name: input.name, url, origins: [input.origin], installedPlugins: [...(input.installedPlugins ?? [])] })
+}
+
+/** What the person has locally. Reads names and file paths; never uploads anything. */
+function scanLocalClaude() {
+  const found = { marketplaces: [], skills: [], unsupported: [], searched: [] }
+
+  const coworkDir = coworkSessionsDir()
+  found.searched.push(coworkDir)
+  for (const account of listDirs(coworkDir)) {
+    for (const org of listDirs(account)) {
+      const known = readJsonFile(join(org, "cowork_plugins", "known_marketplaces.json"))
+      if (!known || typeof known !== "object") continue
+      for (const [name, entry] of Object.entries(known)) addMarketplace(found, { name, origin: "cowork", source: entry?.source })
+    }
+  }
+
+  // Skills the person wrote in Cowork (creatorType "user"); Anthropic's
+  // built-in skills stay behind.
+  const seenSkills = new Set()
+  for (const org of listDirs(join(coworkDir, "skills-plugin"))) {
+    for (const bundle of listDirs(org)) {
+      const manifest = readJsonFile(join(bundle, "manifest.json"))
+      for (const skill of Array.isArray(manifest?.skills) ? manifest.skills : []) {
+        if (skill?.creatorType !== "user" || typeof skill.name !== "string") continue
+        const path = join(bundle, "skills", skill.name, "SKILL.md")
+        if (!existsSync(path) || seenSkills.has(skill.name)) continue
+        seenSkills.add(skill.name)
+        found.skills.push({ name: skill.name, description: typeof skill.description === "string" ? skill.description : null, enabled: skill.enabled !== false, origin: "cowork", path })
+      }
+    }
+  }
+
+  const claudeCodeDir = claudeCodePluginsDir()
+  found.searched.push(claudeCodeDir)
+  const installed = readJsonFile(join(claudeCodeDir, "installed_plugins.json"))
+  const installedByMarketplace = new Map()
+  for (const key of Object.keys(installed?.plugins ?? {})) {
+    const at = key.lastIndexOf("@")
+    if (at <= 0) continue
+    const list = installedByMarketplace.get(key.slice(at + 1)) ?? []
+    list.push(key.slice(0, at))
+    installedByMarketplace.set(key.slice(at + 1), list)
+  }
+  const knownClaudeCode = readJsonFile(join(claudeCodeDir, "known_marketplaces.json"))
+  for (const [name, entry] of Object.entries(knownClaudeCode && typeof knownClaudeCode === "object" ? knownClaudeCode : {})) {
+    addMarketplace(found, { name, origin: "claude-code", source: entry?.source ?? entry, installedPlugins: installedByMarketplace.get(name) })
+  }
+
+  return found
+}
+
+async function resolveMigrationTarget(flags) {
+  const baseUrl = normalizeBaseUrl(getFlag(flags, "base-url", readSavedCredentials()?.baseUrl || DEFAULT_API_BASE_URL))
+  const token = resolveApiToken(baseUrl)
+  if (!token) throw new Error(`not_signed_in: run \`${COMMAND_NAME} login\` first (or set IDEXAL_API_TOKEN)`)
+  const orgs = await request(baseUrl, "/v1/me/orgs", { method: "GET", headers: { authorization: `Bearer ${token.token}` } })
+  if (orgs.status !== 200 || !Array.isArray(orgs.body?.orgs)) throw new Error(`org_list_failed: ${orgs.status} ${JSON.stringify(orgs.body)}`)
+  const wanted = getFlag(flags, "org")
+  const org = wanted
+    ? orgs.body.orgs.find((entry) => entry.id === wanted || entry.slug === wanted || entry.name === wanted)
+    : orgs.body.orgs.length === 1 ? orgs.body.orgs[0] : orgs.body.orgs.find((entry) => entry.id === orgs.body.activeOrgId)
+  if (!org) {
+    const names = orgs.body.orgs.map((entry) => `${entry.name ?? entry.slug} (${entry.id})`).join(", ")
+    throw new Error(wanted ? `org_not_found: ${wanted}. Yours: ${names}` : `org_ambiguous: pass --org <id>. Yours: ${names}`)
+  }
+  const headers = { authorization: `Bearer ${token.token}`, "x-idexal-os-org-id": org.id }
+  return { baseUrl, headers, org: { id: org.id, name: org.name ?? org.slug ?? org.id, memberId: org.orgMemberId ?? null } }
+}
+
+function sourcesFromFlags(flags) {
+  return String(getFlag(flags, "source", "")).split(",").map((value) => value.trim()).filter(Boolean)
+}
+
+function listFlag(flags, name) {
+  return String(getFlag(flags, name, "")).split(",").map((value) => value.trim()).filter(Boolean)
+}
+
+/** Den's preview of one marketplace, reduced to what a person decides on. */
+async function previewMarketplace(target, url) {
+  const preview = await request(target.baseUrl, "/v1/plugins/import-mcps-from-github-url/preview", {
+    method: "POST",
+    headers: target.headers,
+    body: JSON.stringify({ githubUrl: url }),
+  })
+  if (preview.status !== 200) {
+    return { url, error: preview.body?.message ?? preview.body?.error ?? `HTTP ${preview.status}` }
+  }
+  const item = preview.body?.item ?? preview.body
+  const branch = item.branch || "main"
+  const plugins = (item.plugins ?? []).map((plugin) => {
+    const folder = String(plugin.key ?? "").replace(/^marketplace:/, "")
+    const servers = (item.servers ?? []).filter((server) => server.pluginKey === plugin.key)
+    const skills = (item.skills ?? []).filter((skill) => skill.pluginKey === plugin.key && skill.supported)
+    return {
+      name: plugin.name,
+      description: plugin.description ?? null,
+      url: plugin.key?.startsWith("marketplace:") && folder ? `${url}/tree/${branch}/${folder}` : url,
+      skills: skills.map((skill) => skill.name),
+      connectors: servers.filter((server) => server.supported).map((server) => server.name),
+      // Connectors Den maps to a connection the organization already has
+      // (e.g. Claude's Slack or blank Gmail entry -> your Slack / Google Workspace).
+      usesExisting: servers.filter((server) => server.reuse).map((server) => ({ name: server.name, connection: server.reuse.connectionName })),
+      needsSetup: servers.filter((server) => !server.supported && !server.reuse).map((server) => ({ name: server.name, reason: server.skippedReason, mapsTo: server.mapsTo?.displayName ?? null })),
+    }
+  })
+  const marketplaceName = item.marketplace?.name ?? url.split("/").at(-1) ?? url
+  return { url, name: marketplaceName, plugins: plugins.map((plugin) => ({ ...plugin, marketplaceName })) }
+}
+
+function connectorNextStep(entry) {
+  const mapsTo = entry.mapsTo?.displayName ?? null
+  if (entry.reason === "native_connector") return `${entry.name}: Claude-only connector; connect ${mapsTo ?? "the matching provider"} in idexal Os (Connections) instead`
+  if (entry.reason === "missing_url") return `${entry.name}: the plugin leaves this for you to choose; connect it in idexal Os (Connections)`
+  if (entry.reason === "local_unsupported") return `${entry.name}: runs on your computer in Claude; add it to idexal Os as a local MCP server if you still need it`
+  return `${entry.name}: not importable (${entry.reason})`
+}
+
+async function importMarketplacePlugin(target, plugin, access) {
+  const importAs = (name) => request(target.baseUrl, "/v1/plugins/import-mcps-from-github-url", {
+    method: "POST",
+    headers: target.headers,
+    body: JSON.stringify({ githubUrl: plugin.url, name, access }),
+  })
+  // The organization may already have a different plugin with this name
+  // (made by hand, or from another source). Import next to it under a name
+  // that says where it came from; later runs land on the same name and update.
+  let imported = await importAs(plugin.name)
+  let importedName = plugin.name
+  if (imported.status === 409 && imported.body?.error === "duplicate_plugin" && plugin.marketplaceName) {
+    importedName = `${plugin.name} (${plugin.marketplaceName})`
+    imported = await importAs(importedName)
+  }
+  if (imported.status !== 200 && imported.status !== 201) {
+    return { plugin: plugin.name, ok: false, error: imported.body?.message ?? imported.body?.error ?? `HTTP ${imported.status}` }
+  }
+  const item = imported.body?.item ?? imported.body
+  return {
+    plugin: plugin.name,
+    ...(importedName !== plugin.name ? { importedAs: importedName } : {}),
+    ok: true,
+    mode: item.mode ?? "created",
+    pluginId: item.plugin?.id ?? null,
+    skillsAdded: (item.importedSkills ?? []).map((skill) => skill.name),
+    skillsUpdated: (item.updatedSkills ?? []).map((skill) => skill.name),
+    connectorsAdded: (item.imported ?? []).map((server) => server.name),
+    usesExisting: [
+      ...(item.imported ?? []).filter((server) => server.existingConnection).map((server) => ({ name: server.name, connection: server.connectionName })),
+      ...(item.skipped ?? []).filter((entry) => entry.reuse).map((entry) => ({ name: entry.name, connection: entry.reuse.connectionName })),
+    ],
+    unchanged: (item.unchanged ?? []).length,
+    // Skills and connectors deleted upstream since the last run.
+    removed: (item.removed ?? []).map((entry) => `${entry.objectType === "mcp" ? "connector" : "skill"} ${entry.name}`),
+    nextSteps: [...(item.skipped ?? []).filter((entry) => !entry.reuse).map((entry) => connectorNextStep(entry)), ...(item.skippedSkills ?? []).map((entry) => `${entry.name}: skill not imported (${entry.reason})`)],
+  }
+}
+
+async function singleSkillOfPlugin(target, pluginId) {
+  const components = await request(target.baseUrl, `/v1/plugins/${encodeURIComponent(pluginId)}/config-objects`, { method: "GET", headers: target.headers })
+  const objects = (components.body?.items ?? []).map((entry) => entry.configObject).filter(Boolean)
+  return objects.length === 1 && objects[0].objectType === "skill" ? objects[0] : null
+}
+
+/**
+ * A Cowork skill the person wrote becomes a private idexal Os skill in a plugin
+ * of the same name. Re-running updates that skill when its text changed. A
+ * different plugin that already has the name is left alone: the skill goes
+ * next to it as "<name> (from Cowork)".
+ */
+async function migrateLocalSkill(target, skill) {
+  const rawSourceText = readFileSync(skill.path, "utf8")
+  for (const name of [skill.name, `${skill.name} (from Cowork)`]) {
+    const created = await request(target.baseUrl, "/v1/plugins", {
+      method: "POST",
+      headers: target.headers,
+      body: JSON.stringify({ name, components: [{ type: "skill", input: { rawSourceText } }], orgWide: false }),
+    })
+    if (created.status === 201) return { skill: skill.name, ...(name !== skill.name ? { importedAs: name } : {}), ok: true, mode: "created", pluginId: created.body?.item?.id ?? null }
+    const existingId = created.status === 409 ? String(created.body?.message ?? "").match(/\((plg_[0-9a-z]+)\)/)?.[1] : null
+    if (!existingId) return { skill: skill.name, ok: false, error: created.body?.message ?? created.body?.error ?? `HTTP ${created.status}` }
+    const configObject = await singleSkillOfPlugin(target, existingId)
+    if (!configObject?.id) continue
+    const latest = await request(target.baseUrl, `/v1/config-objects/${encodeURIComponent(configObject.id)}/versions/latest`, { method: "GET", headers: target.headers })
+    const current = latest.body?.item?.rawSourceText ?? null
+    const base = { skill: skill.name, ...(name !== skill.name ? { importedAs: name } : {}), ok: true, pluginId: existingId }
+    if (typeof current === "string" && current.trim() === rawSourceText.trim()) return { ...base, mode: "unchanged" }
+    const updated = await request(target.baseUrl, `/v1/config-objects/${encodeURIComponent(configObject.id)}/versions`, {
+      method: "POST",
+      headers: target.headers,
+      body: JSON.stringify({ input: { rawSourceText }, reason: "Re-migrated from Claude Cowork" }),
+    })
+    if (updated.status !== 200 && updated.status !== 201) return { skill: skill.name, ok: false, error: updated.body?.message ?? `HTTP ${updated.status}` }
+    return { ...base, mode: "updated" }
+  }
+  return { skill: skill.name, ok: false, error: `plugins named "${skill.name}" and "${skill.name} (from Cowork)" already exist with other content` }
+}
+
+function migrationSummary(lines) {
+  return lines.filter(Boolean).join("\n")
+}
+
+async function runMigrate(args) {
+  const json = hasFlag(args.flags, "json")
+  const subcommand = args.positionals[1] || "plan"
+
+  if (subcommand === "scan") {
+    const found = scanLocalClaude()
+    jsonOut({
+      ok: true,
+      ...found,
+      message: migrationSummary([
+        `Marketplaces: ${found.marketplaces.map((entry) => `${entry.name} (${entry.url})`).join(", ") || "none found"}`,
+        `Your Cowork skills: ${found.skills.map((skill) => skill.name).join(", ") || "none found"}`,
+        found.unsupported.length ? `Not importable: ${found.unsupported.map((entry) => `${entry.name} (${entry.reason})`).join(", ")}` : "",
+      ]),
+    }, json)
+    return
+  }
+
+  if (subcommand !== "plan" && subcommand !== "apply") {
+    printHelp()
+    process.exitCode = 1
+    return
+  }
+
+  const target = await resolveMigrationTarget(args.flags)
+  const found = scanLocalClaude()
+  const explicitSources = sourcesFromFlags(args.flags)
+  const sourceUrls = explicitSources.length > 0 ? explicitSources : found.marketplaces.map((entry) => entry.url)
+  const marketplaces = []
+  for (const url of sourceUrls) marketplaces.push(await previewMarketplace(target, url))
+  const includeSkills = !hasFlag(args.flags, "no-skills")
+  const localSkills = includeSkills && explicitSources.length === 0 ? found.skills : []
+
+  if (subcommand === "plan") {
+    jsonOut({
+      ok: marketplaces.every((entry) => !entry.error),
+      org: target.org,
+      marketplaces: marketplaces.map((entry) => ({
+        ...entry,
+        installedLocally: found.marketplaces.find((local) => local.url === entry.url)?.installedPlugins ?? [],
+      })),
+      skills: localSkills.map((skill) => ({ name: skill.name, description: skill.description })),
+      unsupported: found.unsupported,
+      message: migrationSummary([
+        `Plan for ${target.org.name}:`,
+        ...marketplaces.flatMap((entry) => entry.error
+          ? [`  ${entry.url}: preview failed (${entry.error})`]
+          : [`  ${entry.name}: ${entry.plugins.length} plugins`, ...entry.plugins.flatMap((plugin) => [
+            `    - ${plugin.name}: ${plugin.skills.length} skills, ${plugin.connectors.length} optional connectors${plugin.needsSetup.length ? `, ${plugin.needsSetup.length} to set up yourself` : ""}`,
+            ...plugin.usesExisting.map((use) => `        ${use.name}: will use your existing ${use.connection} connection`),
+          ])]),
+        localSkills.length ? `  Your own Cowork skills (private to you): ${localSkills.map((skill) => skill.name).join(", ")}` : "",
+        "",
+        `Import with: ${COMMAND_NAME} migrate apply --plugin <name,...> (or --all)`,
+      ]),
+    }, json)
+    return
+  }
+
+  const wanted = new Set(listFlag(args.flags, "plugin").map((name) => name.toLowerCase()))
+  const all = hasFlag(args.flags, "all")
+  const selected = marketplaces.flatMap((entry) => (entry.plugins ?? []).filter((plugin) => {
+    if (all) return true
+    if (wanted.has(plugin.name.toLowerCase())) return true
+    const local = found.marketplaces.find((candidate) => candidate.url === entry.url)
+    return wanted.size === 0 && (local?.installedPlugins ?? []).includes(plugin.name)
+  }))
+  const missing = [...wanted].filter((name) => !marketplaces.some((entry) => (entry.plugins ?? []).some((plugin) => plugin.name.toLowerCase() === name)))
+  if (missing.length > 0) throw new Error(`plugin_not_found: ${missing.join(", ")}. Run \`${COMMAND_NAME} migrate plan\` to list them.`)
+  if (selected.length === 0 && localSkills.length === 0) {
+    throw new Error(`nothing_selected: pass --plugin <name,...> or --all. Run \`${COMMAND_NAME} migrate plan\` to see what is available.`)
+  }
+
+  if (hasFlag(args.flags, "private") && !target.org.memberId) throw new Error("private_unavailable: this idexal Os server did not return your member id; omit --private")
+  const access = hasFlag(args.flags, "private") ? { orgWide: false, memberIds: [target.org.memberId], teamIds: [] } : { orgWide: true }
+  const plugins = []
+  for (const plugin of selected) plugins.push(await importMarketplacePlugin(target, plugin, access))
+  const skills = []
+  for (const skill of localSkills) skills.push(await migrateLocalSkill(target, skill))
+
+  const failures = [...plugins, ...skills].filter((entry) => !entry.ok)
+  const nextSteps = plugins.flatMap((entry) => (entry.nextSteps ?? []).map((step) => `${entry.plugin}: ${step}`))
+  jsonOut({
+    ok: failures.length === 0,
+    org: target.org,
+    plugins,
+    skills,
+    nextSteps,
+    message: migrationSummary([
+      `Migrated into ${target.org.name}:`,
+      ...plugins.map((entry) => entry.ok
+        ? [
+          `  ${entry.importedAs ?? entry.plugin} (${entry.mode}): ${entry.skillsAdded.length} skills added, ${entry.skillsUpdated.length} updated, ${entry.connectorsAdded.length} optional connectors added, ${entry.unchanged} unchanged${entry.removed.length ? `, ${entry.removed.length} removed (deleted upstream: ${entry.removed.join(", ")})` : ""}`,
+          ...entry.usesExisting.map((use) => `    ${use.name}: uses your existing ${use.connection} connection`),
+        ].join("\n")
+        : `  ${entry.plugin}: failed (${entry.error})`),
+      ...skills.map((entry) => entry.ok ? `  your skill ${entry.importedAs ?? entry.skill}: ${entry.mode}` : `  your skill ${entry.skill}: failed (${entry.error})`),
+      nextSteps.length ? "\nStill to do:" : "",
+      ...nextSteps.map((step) => `  - ${step}`),
+      "\nSkills work now. Each person connects the optional connectors they use from idexal Os; skills say which ones help.",
+    ]),
+  }, json)
+  if (failures.length > 0) process.exitCode = 1
+}
+
+async function runCloud(args) {
+  const subcommand = args.positionals[1]
+  if (subcommand === "claim-link") {
+    runCloudClaimLink(args)
+    return
+  }
+  if (subcommand === "onboard") {
+    await runCloudOnboard(args)
+    return
+  }
+  if (subcommand === "bootstrap-workspace") {
+    await runCloudBootstrapWorkspace(args)
+    return
+  }
+  printHelp()
+  process.exitCode = 1
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2))
+  if (hasFlag(args.flags, "help") || args.positionals[0] === "help") {
+    printHelp()
+    return
+  }
+  if (hasFlag(args.flags, "version")) {
+    console.log(VERSION)
+    return
+  }
+
+  const command = args.positionals[0] || "help"
+  if (command === "install") {
+    runInstall(args)
+    return
+  }
+  if (command === "open") {
+    if (args.positionals[1] !== "app") throw new Error("usage: idexal-os-bootstrap open app [--json]")
+    await runOpenApp(args)
+    return
+  }
+  if (command === "doctor") {
+    await runDoctor(args)
+    return
+  }
+  if (command === "cloud") {
+    await runCloud(args)
+    return
+  }
+  if (command === "login") {
+    await runLogin(args)
+    return
+  }
+  if (command === "migrate") {
+    await runMigrate(args)
+    return
+  }
+  if (command === "logout") {
+    await runLogout(args)
+    return
+  }
+
+  printHelp()
+  process.exitCode = 1
+}
+
+main().catch((error) => {
+  console.error(error instanceof Error ? error.message : String(error))
+  process.exitCode = 1
+})

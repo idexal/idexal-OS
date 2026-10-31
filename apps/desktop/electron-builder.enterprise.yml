@@ -1,0 +1,18 @@
+extends: ./electron-builder.base.yml
+appId: com.idexal.os
+productName: idexal Os Enterprise
+extraMetadata:
+  idexalOsDistribution: enterprise
+protocols:
+  - name: idexal Os Enterprise
+    schemes:
+      - idexalos
+publish:
+  - provider: github
+    owner: idexal
+    repo: idexalOs
+    releaseType: release
+    channel: enterprise
+linux:
+  executableName: idexal-os-enterprise
+artifactName: idexal-os-enterprise-${os}-${arch}-${version}.${ext}

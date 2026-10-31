@@ -1,0 +1,56 @@
+---
+title: "Connect OpenCode"
+sidebarTitle: "OpenCode"
+description: "Add idexal Os MCP to OpenCode: add a remote MCP entry for https://api.idexal.com/mcp/agent to your OpenCode config, then run opencode mcp auth idexal-os."
+---
+
+Give OpenCode your organization's idexal Os skills, plugins, and connections. OpenCode is the verified client.
+
+<Tip>
+On OpenCode 2, the [idexal Os plugin](/model-context-protocol/opencode-plugin) also brings your AI Gateway models, with one sign-in.
+</Tip>
+
+<Steps>
+<Step title="Add the server to opencode.json">
+
+```json
+{
+  "mcp": {
+    "idexalos": {
+      "type": "remote",
+      "enabled": true,
+      "url": "https://api.idexal.com/mcp/agent",
+      "oauth": {}
+    }
+  }
+}
+```
+
+</Step>
+<Step title="Sign in">
+
+```sh
+opencode mcp auth idexalos
+```
+
+Sign in to idexal Os in the browser and pick your organization.
+
+</Step>
+<Step title="Try it">
+Ask: "Which idexal Os organization am I connected to?"
+</Step>
+</Steps>
+
+<AccordionGroup>
+  <Accordion title="Switch organizations">
+
+```sh
+opencode mcp logout idexalos
+opencode mcp auth idexalos
+```
+
+  </Accordion>
+  <Accordion title="OpenCode on a remote machine or SSH host">
+    Follow [Connect idexal Os MCP from a remote machine](/cloud/run-in-the-cloud/connect-idexal-os-mcp-remote-machine).
+  </Accordion>
+</AccordionGroup>

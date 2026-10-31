@@ -1,0 +1,1 @@
+ALTER TABLE `scim_provider` ADD `user_id` varchar(64);

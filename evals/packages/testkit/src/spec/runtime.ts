@@ -1,0 +1,1377 @@
+import type { BrowserEvaluation, EvaluateOptions } from "@idexal/cdp";
+import { browserScript } from "@idexal/cdp";
+import { typeWithCadence, typingPlan } from "@idexal/behaviors";
+import {
+  control,
+  createNativeConnector,
+  createOrgConnection,
+  denFetch,
+  evalIn,
+  listSessions,
+  readComposerState,
+  readBrowserState,
+  readBrowserTabMetrics,
+  readConnectorCatalog,
+  renameSessionAndWait,
+  signInDesktopAs,
+  waitUntilInteractive,
+} from "@idexal/behaviors";
+import {
+  callFunctionOnSurface,
+  CdpPageError,
+  addInitScript,
+  callFunction, connect, debuggerUrlFor, listTargets,
+  clickTarget,
+  dumpScreenState,
+  evaluateOnSurface,
+  hoverAt,
+  locate,
+  readDom,
+  assertAbsent,
+  navigate,
+  pressKey,
+  reload,
+  setViewport,
+  typeText,
+  waitForLocated,
+} from "@idexal/cdp";
+import type { Located, Surface, Target, Viewport } from "@idexal/cdp";
+import {
+  app as startApp,
+  appWeb as startAppWeb,
+  faultProxy as startFaultProxy,
+  mcpMock,
+  server,
+  requestBrowserTask,
+  readBrowserFixtureState,
+  setBrowserFixtureDiscovery,
+  requireWorldResource,
+  validateWorldResources,
+} from "@idexal/env";
+import type { App, Den, EvalEngine, Place, WorldResources } from "@idexal/env";
+import { chrome, desktop } from "@idexal/hosts";
+import type { DesktopHandle } from "@idexal/hosts";
+import { findCheckpointCapability, redactText, screenshot, takeCheckpoint, validate } from "@idexal/test-evidence";
+import type { CheckpointCapability, ScreenshotArtifact } from "@idexal/test-evidence";
+import type {
+  StepRecord,
+  StepRecordInput,
+  TestEvidenceRecorder,
+  TestOutcome,
+  TraceChannel,
+  TraceEntry,
+  TraceEntryInput,
+} from "@idexal/test-evidence";
+import { eventually } from "@idexal/env";
+import { denLink as startDenLink } from "../link.ts";
+import { readConnectState } from "../state.ts";
+import type {
+  Agent,
+  ClickOptions,
+  CredentialInputState,
+  Probe,
+  ProbeEvalOptions,
+  Seed,
+  SeedAppWebOptions,
+  SeedDesktopOptions,
+  SeedWebOptions,
+  SeeOptions,
+  SpecAdapters,
+  Step,
+  StepOptions,
+  TypeOptions,
+  User,
+} from "./types.ts";
+
+interface EvidenceSink {
+  recordTrace(entry: TraceEntryInput): TraceEntry;
+  recordStep(step: StepRecordInput): StepRecord;
+  setOutcome(outcome: TestOutcome, failure?: string): void;
+  setEngine(engine: EvalEngine): void;
+  setActiveStep?(name: string | undefined): void;
+}
+
+export class BufferedEvidenceSink implements EvidenceSink {
+  readonly trace: TraceEntry[] = [];
+  readonly steps: StepRecord[] = [];
+  outcome: TestOutcome = "unknown";
+  failure?: string;
+  engine?: EvalEngine;
+
+  setEngine(engine: EvalEngine): void {
+    this.engine = engine;
+  }
+
+  recordTrace(entry: TraceEntryInput): TraceEntry {
+    const recorded: TraceEntry = {
+      ...entry,
+      seq: this.trace.length + 1,
+      at: entry.at ?? new Date().toISOString(),
+    };
+    this.trace.push(recorded);
+    return recorded;
+  }
+
+  recordStep(step: StepRecordInput): StepRecord {
+    const recorded: StepRecord = { ...step, seq: this.steps.length + 1 };
+    this.steps.push(recorded);
+    return recorded;
+  }
+
+  setOutcome(outcome: TestOutcome, failure?: string): void {
+    this.outcome = outcome;
+    this.failure = failure;
+  }
+}
+
+export function replayEvidence(buffer: BufferedEvidenceSink, evidence: TestEvidenceRecorder): void {
+  if (buffer.engine) evidence.setEngine(buffer.engine);
+  for (const entry of buffer.trace) {
+    const { seq, ...input } = entry;
+    void seq;
+    evidence.recordTrace(input);
+  }
+  for (const step of buffer.steps) {
+    const { seq, ...input } = step;
+    void seq;
+    evidence.recordStep(input);
+  }
+  if (buffer.outcome !== "unknown") evidence.setOutcome(buffer.outcome, buffer.failure);
+}
+
+export class SeedBeforeActError extends Error {
+  constructor(verb: string) {
+    super(`seed.${verb}() before the first act — move it into the world function`);
+    this.name = "SeedBeforeActError";
+  }
+}
+
+class StepNotReachedError extends Error {
+  constructor(name: string) {
+    super(`Step ${JSON.stringify(name)} was not reached because an earlier step failed.`);
+    this.name = "StepNotReachedError";
+  }
+}
+
+function messageText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function redacted(value: string): string {
+  return redactText(value).slice(0, 240);
+}
+
+function isSurface(value: unknown): value is Surface {
+  if (typeof value !== "object" || value === null) return false;
+  return "handle" in value && "client" in value;
+}
+
+function isAsyncDisposable(value: unknown): value is AsyncDisposable {
+  if (typeof value !== "object" || value === null) return false;
+  return typeof Reflect.get(value, Symbol.asyncDispose) === "function";
+}
+
+export function primarySurface(value: unknown): Surface | null {
+  if (isSurface(value)) return value;
+  if (typeof value !== "object" || value === null) return null;
+  const app = Reflect.get(value, "app");
+  if (isSurface(app)) return app;
+  const web = Reflect.get(value, "web");
+  if (isSurface(web)) return web;
+  const surfaces = Object.values(value).filter(isSurface);
+  return surfaces.length === 1 ? surfaces[0] : null;
+}
+
+function surfaceName(surface: Surface | null): string | undefined {
+  return surface?.handle.name;
+}
+
+function targetDetail(target: Target): string {
+  if (typeof target === "string") return target;
+  if (target.testId) return `testId=${target.testId}`;
+  if (target.label) return `label=${matcherDetail(target.label)}`;
+  if (target.text) return `text=${matcherDetail(target.text)}`;
+  if (target.placeholder) return `placeholder=${target.placeholder}`;
+  return target.role ?? "target";
+}
+
+function matcherDetail(value: string | RegExp): string {
+  return typeof value === "string" ? value : `/${value.source}/${value.flags}`;
+}
+
+function optionTextDetail(value: string | RegExp): string {
+  return typeof value === "string" ? JSON.stringify(redacted(value)) : matcherDetail(value);
+}
+
+function seeDetail(target: Target, options: SeeOptions): string {
+  const details = [targetDetail(target)];
+  if (options.editable !== undefined) details.push(options.editable ? "editable" : "editable=false");
+  if (options.value !== undefined) details.push(`value=${JSON.stringify(redacted(options.value))}`);
+  if (options.text !== undefined) details.push(`text=${optionTextDetail(options.text)}`);
+  if (options.timeoutMs !== undefined) details.push(`timeoutMs=${options.timeoutMs}`);
+  return `see(${details.join(", ")})`;
+}
+
+function textMatches(actual: string, expected: string | RegExp): boolean {
+  if (typeof expected === "string") return actual.trim() === expected.trim();
+  return new RegExp(expected.source, expected.flags).test(actual);
+}
+
+function typedTextDetail(target: Target, text: string, options: TypeOptions): string {
+  const targetName = targetDetail(target);
+  const sensitive = options.sensitive || /password|token|secret/i.test(targetName);
+  return `type(${targetName}, ${sensitive ? "<redacted>" : JSON.stringify(redacted(text))}${options.replace ? ", replace" : ""})`;
+}
+
+const CONTROL_READY_TIMEOUT_MS = 60_000;
+const CONTROL_POLL_INTERVAL_MS = 250;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function waitForControlAction(surface: Surface, action: string, timeoutMs = CONTROL_READY_TIMEOUT_MS): Promise<void> {
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
+  let lastError: unknown = null;
+  await waitForControlRail(surface, action, Math.max(1, deadline - Date.now()));
+  while (Date.now() < deadline) {
+    try {
+      const actions = await evalIn(surface, () => (window.__idexalOsControl?.listActions?.() ?? null), {
+        timeoutMs: Math.min(2_000, Math.max(1, deadline - Date.now())),
+      });
+      if (Array.isArray(actions) && actions.some((entry) => isRecord(entry) && entry.id === action && entry.disabled !== true)) return;
+      lastError = new Error(`action ${action} is not enabled`);
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(CONTROL_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now()))));
+  }
+  throw new Error(`control rail not ready for ${action} within ${timeoutMs}ms${lastError ? `: ${messageText(lastError)}` : ""}`);
+}
+
+async function waitForControlRail(surface: Surface, action: string, timeoutMs = CONTROL_READY_TIMEOUT_MS): Promise<void> {
+  try {
+    await waitUntilInteractive(surface, { timeoutMs });
+  } catch (error) {
+    throw new Error(`control rail not ready for ${action} within ${timeoutMs}ms: ${messageText(error)}`);
+  }
+}
+
+async function createSessionWhenReady(surface: Surface): Promise<string> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await waitForControlAction(surface, "session.create_task");
+    try {
+      const result = await control(surface, "session.create_task");
+      if (typeof result === "string" && result.trim()) return result.trim();
+      if (attempt === 1) throw new Error("session.create_task returned no session ID after one retry.");
+    } catch (error) {
+      const emptyResult = /did not return a session ID|returned no session ID|invalid session ID/i.test(messageText(error));
+      // The action can turn disabled again between the readiness check and the
+      // call (the previous task is still being selected); nothing ran, so retry.
+      const disabledMeanwhile = /Action is disabled/i.test(messageText(error));
+      if (attempt === 1 || !(emptyResult || disabledMeanwhile)) throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, CONTROL_POLL_INTERVAL_MS));
+  }
+  throw new Error("session.create_task returned no session ID after one retry.");
+}
+
+export function copyWorldResources(resources: WorldResources | undefined): WorldResources | undefined {
+  if (resources === undefined) return undefined;
+  validateWorldResources(resources);
+  const copy = {
+    surfaces: Object.freeze([...resources.surfaces]),
+    services: Object.freeze([...resources.services]),
+    ...(resources.nativeReason === undefined ? {} : { nativeReason: resources.nativeReason }),
+  };
+  validateWorldResources(copy);
+  return Object.freeze(copy);
+}
+
+export class SpecRuntime {
+  stage: "world" | "body" = "world";
+  acted = false;
+  primary: Surface | null = null;
+  sink: EvidenceSink;
+  readonly stack: AsyncDisposableStack;
+  readonly place: Place;
+  readonly adapters: SpecAdapters;
+  readonly #resources: WorldResources | undefined;
+
+  get resources(): WorldResources | undefined { return this.#resources; }
+  #stepDepth = 0;
+  #stepBlocked = false;
+  readonly #stepNames: string[] = [];
+  #capability: CheckpointCapability | undefined;
+  #warnedNoCapture = false;
+  #actedSinceCheckpoint = true;
+  /** The surface the person last acted on or looked at; a failed step's frame comes from it. */
+  #lastSurface: Surface | null = null;
+  #failureFramed = false;
+  /** What the running step verified with `user.see` since the last screenshot, to outline on the next one. */
+  #seen: { surface: Surface; target: Target }[] = [];
+
+  /** Name of the innermost `step()` currently running; screenshots taken inside it are captioned with it. */
+  currentStepName(): string | undefined {
+    return this.#stepNames.at(-1);
+  }
+
+  constructor(place: Place, stack: AsyncDisposableStack, sink: EvidenceSink, adapters: SpecAdapters = {}, resources?: WorldResources) {
+    this.place = place;
+    this.stack = stack;
+    this.sink = sink;
+    this.adapters = adapters;
+    this.#resources = copyWorldResources(resources);
+  }
+
+  useSink(sink: EvidenceSink): void {
+    this.sink = sink;
+  }
+
+  requireDen(den: Den): void {
+    requireWorldResource(this.resources, "den");
+    if (Object.keys(den.mocks).length > 0) requireWorldResource(this.resources, "mock");
+  }
+
+  async own<T extends AsyncDisposable>(resource: T, expectedKind?: "chrome" | "electron"): Promise<T> {
+    try {
+      if (expectedKind && (!isSurface(resource) || !isRecord(resource.handle) || resource.handle.kind !== expectedKind)) {
+        throw new Error(`World resource handle mismatch: expected ${expectedKind}.`);
+      }
+      return this.stack.use(resource);
+    } catch (error) {
+      // A timed-out world may finish launching after its stack was disposed.
+      try { await resource[Symbol.asyncDispose](); }
+      catch (cleanupError) { throw new AggregateError([error, cleanupError], "Resource registration and cleanup failed"); }
+      throw error;
+    }
+  }
+
+  setPrimary(value: unknown): void {
+    this.primary = primarySurface(value);
+    this.#capability = findCheckpointCapability(value);
+  }
+
+  /**
+   * Checkpoints are an addition to the evidence, never the proof. They run only
+   * when requested (`--checkpoints`) on a world that can capture the surface;
+   * anything else prints one warning and the test continues unchanged.
+   */
+  async checkpoint(surface: Surface | null, caption: string | undefined, quiet = false): Promise<ScreenshotArtifact | undefined> {
+    if (process.env.IDEXAL_EVIDENCE_CHECKPOINTS !== "1") return undefined;
+    const capability = this.#capability;
+    if (!surface || !capability || capability.surface !== surface || !capability.available()) {
+      if (!quiet && !this.#warnedNoCapture) {
+        this.#warnedNoCapture = true;
+        console.warn(`[idexalos/testkit] Checkpoints skipped: this world cannot capture ${surface ? `surface "${surface.handle.name}"` : "without a primary surface"} (placement ${this.place.kind}). The test runs normally.`);
+      }
+      return undefined;
+    }
+    // Unit tests shorten the hold; real runs use the measured default.
+    const holdMs = Number(process.env.IDEXAL_EVIDENCE_CHECKPOINT_HOLD_MS) || undefined;
+    const result = await this.call("user", "checkpoint", `checkpoint(${caption ?? ""})`, surface, () =>
+      takeCheckpoint(surface, capability, { caption: caption ?? this.currentStepName(), holdMs }));
+    this.#actedSinceCheckpoint = false;
+    return result;
+  }
+
+  /** Tagged tests keep the world as launched, before the body acts, so it can be reopened as a clean start. */
+  async checkpointStartState(): Promise<void> {
+    await this.checkpoint(this.primary, "Start state", true);
+  }
+
+  /** Tagged tests keep their end state, unless nothing changed since the last checkpoint. */
+  async checkpointEndState(): Promise<void> {
+    if (!this.#actedSinceCheckpoint) return;
+    await this.checkpoint(this.primary, "End state", true);
+  }
+
+  emit(entry: TraceEntryInput): TraceEntry {
+    const recorded = this.sink.recordTrace(entry);
+    this.adapters.observe?.trace?.(recorded);
+    return recorded;
+  }
+
+  setOutcome(outcome: TestOutcome, failure?: string): void {
+    const safeFailure = failure === undefined ? undefined : redacted(failure);
+    this.sink.setOutcome(outcome, safeFailure);
+    this.adapters.observe?.outcome?.(outcome, safeFailure);
+  }
+
+  checkOrder(channel: TraceChannel, verb: string): void {
+    if (this.stack.disposed) throw new Error("World is disposed; refused before launch.");
+    if (channel === "user" || channel === "agent") { this.acted = true; this.#actedSinceCheckpoint = true; }
+    if ((channel === "seed" || channel === "seed:raw") && this.stage === "body" && !this.acted) {
+      throw new SeedBeforeActError(verb);
+    }
+  }
+
+  async call<T>(channel: TraceChannel, verb: string, detail: string, surface: Surface | null, fn: () => Promise<T>): Promise<T> {
+    const startedAt = Date.now();
+    const safeDetail = redacted(detail);
+    if (surface && (channel === "user" || channel === "agent")) this.#lastSurface = surface;
+    try {
+      this.checkOrder(channel, verb);
+      const result = await fn();
+      this.emit({
+        stage: this.stage,
+        channel,
+        verb,
+        detail: safeDetail,
+        surface: surfaceName(surface),
+        ok: true,
+        ms: Date.now() - startedAt,
+      });
+      return result;
+    } catch (error) {
+      this.emit({
+        stage: this.stage,
+        channel,
+        verb,
+        detail: safeDetail,
+        surface: surfaceName(surface),
+        ok: false,
+        ms: Date.now() - startedAt,
+        error: redacted(messageText(error)),
+      });
+      throw error;
+    }
+  }
+
+  sync<T>(channel: TraceChannel, verb: string, detail: string, fn: () => T): T {
+    const startedAt = Date.now();
+    try {
+      this.checkOrder(channel, verb);
+      const result = fn();
+      this.emit({ stage: this.stage, channel, verb, detail: redacted(detail), ok: true, ms: Date.now() - startedAt });
+      return result;
+    } catch (error) {
+      this.emit({
+        stage: this.stage,
+        channel,
+        verb,
+        detail: redacted(detail),
+        ok: false,
+        ms: Date.now() - startedAt,
+        error: redacted(messageText(error)),
+      });
+      throw error;
+    }
+  }
+
+  failWorld(error: unknown): void {
+    this.emit({
+      stage: "world",
+      channel: "seed",
+      verb: "build",
+      detail: "world build",
+      ok: false,
+      error: redacted(messageText(error)),
+    });
+    this.setOutcome("failed", messageText(error));
+  }
+
+  step: Step = async <T>(name: string, fn: () => Promise<T> | T, options: StepOptions = {}): Promise<T> => {
+    if (this.#stepBlocked) {
+      const step = this.sink.recordStep({ name, depth: this.#stepDepth, ok: "not-reached" });
+      this.adapters.observe?.step?.(step);
+      this.emit({ stage: "body", channel: "step", verb: "step", detail: name, ok: false, error: "not-reached" });
+      throw new StepNotReachedError(name);
+    }
+    const depth = this.#stepDepth;
+    this.#stepDepth += 1;
+    this.#stepNames.push(name);
+    this.#seen = [];
+    this.sink.setActiveStep?.(name);
+    const startedAt = Date.now();
+    try {
+      const result = await fn();
+      if (options.checkpoint) await this.checkpoint(this.primary, name);
+      const ms = Date.now() - startedAt;
+      const step = this.sink.recordStep({ name, depth, ok: true, ms });
+      this.adapters.observe?.step?.(step);
+      this.emit({ stage: "body", channel: "step", verb: "step", detail: name, ok: true, ms });
+      return result;
+    } catch (error) {
+      const ms = Date.now() - startedAt;
+      const failure = redacted(messageText(error));
+      const step = this.sink.recordStep({ name, depth, ok: false, ms, error: failure });
+      this.adapters.observe?.step?.(step);
+      this.emit({ stage: "body", channel: "step", verb: "step", detail: name, ok: false, ms, error: failure });
+      this.#stepBlocked = true;
+      this.setOutcome("failed", failure);
+      await this.#failureFrame(name);
+      throw error;
+    } finally {
+      this.#stepDepth -= 1;
+      this.#stepNames.pop();
+      this.sink.setActiveStep?.(this.currentStepName());
+    }
+  };
+
+  noteSeen(surface: Surface, target: Target): void {
+    this.#seen = [...this.#seen.filter((entry) => entry.surface !== surface || targetDetail(entry.target) !== targetDetail(target)), { surface, target }];
+  }
+
+  /** Where the elements this step verified are now, most recent first; each is outlined on the screenshot once. */
+  async locateSeen(surface: Surface): Promise<{ label: string; rect: Located["rect"] }[]> {
+    const mine = this.#seen.filter((entry) => entry.surface === surface).slice(-4).reverse();
+    this.#seen = this.#seen.filter((entry) => entry.surface !== surface);
+    const found = await Promise.all(mine.map(async ({ target }) => {
+      try {
+        const located = await locate(surface, target);
+        return located.visible ? [{ label: redacted(focusLabel(target, located)), rect: located.rect }] : [];
+      } catch {
+        return [];
+      }
+    }));
+    return found.flat();
+  }
+
+  /**
+   * The screen at the moment a step failed, so a red run shows what went
+   * wrong and not only what came before. Best effort: never changes the
+   * outcome, never waits more than 5 s, and only once per test.
+   */
+  async #failureFrame(name: string): Promise<void> {
+    const surface = this.#lastSurface ?? this.primary;
+    if (this.#failureFramed || !surface || this.stage !== "body") return;
+    this.#failureFramed = true;
+    const capture = screenshot(surface, { caption: `failed: ${name}`, failure: true }).then(() => undefined, () => undefined);
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([capture, new Promise<void>((resolve) => { timer = setTimeout(resolve, 5_000); })]);
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** A reviewer-readable name for an outlined element: the words the test looked for. */
+function focusLabel(target: Target, located: Located): string {
+  if (typeof target === "string") return target;
+  const words = target.label ?? target.text ?? target.placeholder;
+  if (typeof words === "string") return words;
+  const name = (located.name || located.text).replace(/\s+/g, " ").trim();
+  return name ? (name.length > 60 ? `${name.slice(0, 59)}…` : name) : targetDetail(target);
+}
+
+function requireSurface(surface: Surface | null): Surface {
+  if (!surface) throw new Error("This world has no primary surface; bind one with user.on(surface), agent.on(surface), or probe.on(surface).");
+  return surface;
+}
+
+/** A request the page made itself failed (a stalled local server ends as "signal timed out"); say which one. */
+function namePageFailure(label: string): (error: unknown) => never {
+  return (error) => {
+    if (error instanceof CdpPageError) throw new Error(`${label} failed in the page: ${error.message}`, { cause: error });
+    throw error;
+  };
+}
+
+function sessionFromWebOptions(options: SeedWebOptions) {
+  const identity = options.signedInAs;
+  if (typeof identity === "object" && identity !== null) return identity;
+  if (identity === undefined || identity === "admin") return options.den.admin;
+  const member = options.den.members[identity];
+  if (!member) throw new Error(`Unknown Den member ${JSON.stringify(identity)}.`);
+  return member;
+}
+
+export class SeedChannel implements Seed {
+  readonly #runtime: SpecRuntime;
+
+  constructor(runtime: SpecRuntime) {
+    this.#runtime = runtime;
+  }
+
+  den(options: Omit<import("@idexal/env").ServerOptions, "place"> = {}): Promise<Den> {
+    requireWorldResource(this.#runtime.resources, "den");
+    if (options.mocks && Object.keys(options.mocks).length > 0) requireWorldResource(this.#runtime.resources, "mock");
+    return this.#runtime.call("seed", "den", `den(${this.#runtime.place.kind})`, null, async () => {
+      const den = await server({ ...options, place: this.#runtime.place });
+      return this.#runtime.own(den);
+    });
+  }
+
+  desktop(options: SeedDesktopOptions & { den: Den }): Promise<App>;
+  desktop(options?: SeedDesktopOptions): Promise<App | DesktopHandle>;
+  desktop(options: SeedDesktopOptions = {}): Promise<App | DesktopHandle> {
+    requireWorldResource(this.#runtime.resources, "desktop");
+    if (options.den) this.#runtime.requireDen(options.den);
+    const requestedSurface = process.env.IDEXAL_EVAL_APP_SURFACE?.trim();
+    if (requestedSurface && requestedSurface !== "electron") {
+      throw new Error(`seed.desktop() conflicts with app surface ${requestedSurface}; select an explicit desktop world.`);
+    }
+    return this.#runtime.call("seed", "desktop", `desktop(${options.den ? `as ${options.signIn === false ? "signed-out" : options.as ?? "admin"}` : this.#runtime.place.kind})`, null, async () => {
+      if (options.den) {
+        if (options.signIn === false) {
+          return this.#runtime.own(await startApp({
+            den: options.den,
+            place: this.#runtime.place,
+            signIn: false,
+            model: options.model,
+            env: options.env,
+            workspacePath: options.workspacePath,
+            profileDir: options.profileDir,
+            enterpriseActivated: options.enterpriseActivated,
+          }), "electron");
+        }
+        return this.#runtime.own(await startApp({
+          den: options.den,
+          place: this.#runtime.place,
+          as: options.as ?? "admin",
+          model: options.model,
+          env: options.env,
+          workspace: options.workspace,
+          workspacePath: options.workspacePath,
+          profileDir: options.profileDir,
+          enterpriseActivated: options.enterpriseActivated,
+        }), "electron");
+      }
+      if (options.as) throw new Error("seed.desktop({ as }) requires a Den.");
+      const app = await this.#runtime.own(await desktop({
+        name: options.name,
+        host: this.#runtime.place.host(),
+        profileDir: options.profileDir,
+        ownSandbox: options.ownSandbox,
+        env: options.model
+          ? { ...options.env, IDEXAL_EVAL_MODEL: options.model }
+          : options.env,
+      }), "electron");
+      if (options.workspacePath) await this.workspace(app, options.workspacePath);
+      return app;
+    });
+  }
+
+  appWeb(options: SeedAppWebOptions) {
+    requireWorldResource(this.#runtime.resources, "appWeb");
+    if (options.mocks && Object.keys(options.mocks).length > 0) requireWorldResource(this.#runtime.resources, "mock");
+    const requestedSurface = process.env.IDEXAL_EVAL_APP_SURFACE?.trim();
+    if (requestedSurface && requestedSurface !== "web") {
+      throw new Error(`seed.appWeb() requires IDEXAL_EVAL_APP_SURFACE=web when a surface is explicitly requested; received ${JSON.stringify(requestedSurface)}.`);
+    }
+    return this.#runtime.call("seed", "appWeb", `appWeb(${this.#runtime.place.kind})`, null, async () => {
+      if (options.engine) this.#runtime.sink.setEngine(options.engine);
+      const web = await startAppWeb({ ...options, place: this.#runtime.place });
+      return this.#runtime.own(web, "chrome");
+    });
+  }
+
+  web(options: SeedWebOptions) {
+    requireWorldResource(this.#runtime.resources, "web");
+    this.#runtime.requireDen(options.den);
+    return this.#runtime.call("seed", "web", `web(${options.signedInAs ? "signed in" : "signed out"})`, null, async () => {
+      const web = await this.#runtime.own(await chrome({
+        name: "spec-web",
+        host: this.#runtime.place.host(),
+        startUrl: options.signedInAs === undefined ? options.den.ref.webUrl : "about:blank",
+        headless: options.headless,
+      }), "chrome");
+      if (options.viewport) await setViewport(web, {
+        ...options.viewport,
+        deviceScaleFactor: options.viewport.deviceScaleFactor ?? 1,
+      });
+      if (options.signedInAs !== undefined) {
+        const session = sessionFromWebOptions(options);
+        const denOrigin = new URL(options.den.ref.webUrl).origin;
+        // Seed before hydration: a running anonymous page can otherwise clear the token.
+        await using initialSession = await addInitScript(web.client, browserScript((origin, token) => {
+          if (location.origin === origin) localStorage.setItem("idexalos:web:auth-token", token);
+        }, [denOrigin, session.token]));
+        await navigate(web.client, new URL(options.startPath ?? "/", options.den.ref.webUrl).toString());
+        await eventually(() => evaluateOnSurface(web, browserScript((origin) =>
+          location.origin === origin && document.readyState !== "loading", [denOrigin])),
+        { within: 30_000, intervalMs: 250, label: "Seeded Den origin document" });
+        return web;
+      }
+      const startPath = options.startPath ?? "/";
+      await navigate(web.client, new URL(startPath, options.den.ref.webUrl).toString());
+      return web;
+    });
+  }
+
+  workspace(app: Surface, path = `/tmp/idexal-os-spec-${Date.now()}`, options: { create?: boolean } = {}) {
+    return this.#runtime.call("seed", "workspace", `workspace(${path})`, app, async () => {
+      const result = await import("@idexal/behaviors").then(({ createAndSelectWorkspace }) => createAndSelectWorkspace(app, { path, ...options }));
+      await eventually(() => callFunctionOnSurface(app, (workspaceId) => {
+        const workspace = window.__idexalos?.slice?.("route")?.workspaces?.find(item => item.id === workspaceId);
+        return workspace ? { exists: true, loading: workspace.loading } : { exists: false };
+      }, [result.workspaceId]), {
+        within: 60000, intervalMs: 250, label: `workspace ${result.workspaceId} initial session load`,
+        until: value => isRecord(value) && value.exists === true && value.loading === false,
+      });
+      return result;
+    });
+  }
+
+  session(app: Surface, options: { title?: string } = {}) {
+    const title = options.title ?? "New task";
+    return this.#runtime.call("seed", "session", `session(${JSON.stringify(title)})`, app, async () => {
+      const sessionId = await createSessionWhenReady(app);
+      // Same contract as sessions(): the title is part of the arrangement, so
+      // hand back only once the app lists it (the sidebar renders that list).
+      if (options.title) await renameSessionAndWait((action, args) => control(app, action, args), sessionId, title);
+      return { sessionId, title };
+    });
+  }
+
+  sessions(app: Surface, titles: readonly string[]) {
+    return this.#runtime.call("seed", "sessions", `sessions(${titles.length})`, app, async () => {
+      const seeded: { sessionId: string; title: string }[] = [];
+      for (const title of titles) {
+        const sessionId = await createSessionWhenReady(app);
+        await renameSessionAndWait((action, args) => control(app, action, args), sessionId, title);
+        seeded.push({ sessionId, title });
+      }
+      const observed = await listSessions(app);
+      const missing = titles.filter((title) => !observed.some((session) => session.title === title));
+      if (missing.length > 0) {
+        throw new Error(`Seeded session titles were not present after creation. Missing: ${JSON.stringify(missing)}. Observed: ${JSON.stringify(observed)}.`);
+      }
+      return seeded;
+    });
+  }
+
+  signIn(app: Surface, member: import("@idexal/behaviors").DenSession, identity: string) {
+    return this.#runtime.call("seed", "signIn", `signIn(${identity})`, app, () => signInDesktopAs(app, member, member));
+  }
+
+  api(session: import("@idexal/behaviors").DenSession, path: string, init: RequestInit = {}) {
+    const method = init.method?.toUpperCase() ?? "GET";
+    return this.#runtime.call("seed", "api", `[seed] api ${method} ${path}`, null, () => {
+      const headers = new Headers(init.headers);
+      headers.set("authorization", `Bearer ${session.token}`);
+      return denFetch(session, path, { ...init, headers });
+    });
+  }
+
+  orgConnection(admin: import("@idexal/behaviors").DenSession, input: import("./types.ts").OrgConnectionInput) {
+    return this.#runtime.call("seed", "orgConnection", `orgConnection(${JSON.stringify(input.name)})`, null, () => createOrgConnection(admin, input));
+  }
+
+  nativeConnector(admin: import("@idexal/behaviors").DenSession, input: import("@idexal/behaviors").NativeConnectorInput) {
+    return this.#runtime.call("seed", "nativeConnector", `nativeConnector(${JSON.stringify(input.name)})`, null, () => createNativeConnector(admin, input));
+  }
+
+  mock(options: Parameters<typeof mcpMock>[0] = {}) {
+    requireWorldResource(this.#runtime.resources, "mock");
+    return this.#runtime.sync("seed", "mock", "mock(mcp)", () => mcpMock(options));
+  }
+
+  faultProxy(den: Den) {
+    this.#runtime.requireDen(den);
+    return this.#runtime.call("seed", "faultProxy", `faultProxy(${this.#runtime.place.kind})`, null, async () => {
+      const proxy = await startFaultProxy(den.ref, {
+        place: this.#runtime.place,
+        sandbox: den.placement?.kind === "daytona" ? den.placement.sandboxId : undefined,
+      });
+      return this.#runtime.own(proxy);
+    });
+  }
+
+  denLink(den: Den, options: import("@idexal/env").SeedDenLinkOptions = {}) {
+    this.#runtime.requireDen(den);
+    return this.#runtime.call("seed", "denLink", `denLink(${options.client ?? "public-preview"})`, null, async () => {
+      const link = await startDenLink(den.ref, options);
+      return this.#runtime.own(link);
+    });
+  }
+
+  tmpPath(label: string): string {
+    this.#runtime.checkOrder("seed", "tmpPath");
+    return this.#runtime.adapters.seed?.tmpPath?.(label)
+      ?? `/tmp/idexal-os-${label.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${Date.now()}`;
+  }
+
+  composerText(app: Surface, text: string) {
+    return this.#runtime.call("seed", "composerText", `composerText(${text.length} chars)`, app, async () => {
+      await waitForControlAction(app, "composer.set_text");
+      await control(app, "composer.set_text", { text });
+    });
+  }
+
+  deepLink(app: Surface, url: string) {
+    return this.#runtime.call("seed", "deepLink", "deepLink(renderer ingress)", app, async () => {
+      if (new URL(url).protocol !== "idexalos:") throw new Error("Expected an idexal Os deep link.");
+      await callFunctionOnSurface(app, (url) => {
+        window.dispatchEvent(new CustomEvent("idexalos:deep-link", { detail: { urls: [url] } }));
+      }, [url]);
+    });
+  }
+
+  browserFixtureDiscovery(app: Surface, origin: string, action: "hold" | "release") {
+    return this.#runtime.call("seed", "browserFixtureDiscovery", `browserFixtureDiscovery(${action})`, app,
+      () => setBrowserFixtureDiscovery(app, origin, action));
+  }
+
+  evalIn<T>(surface: Surface, expression: BrowserEvaluation<T>, options: EvaluateOptions = {}): Promise<Awaited<T>> {
+    return this.#runtime.call("seed:raw", "evalIn", "[seed:raw] evalIn(<callback>)", surface,
+      () => evalIn(surface, expression, options));
+  }
+}
+
+export class UserChannel implements User {
+  readonly #runtime: SpecRuntime;
+  readonly #surface: Surface | null;
+
+  constructor(runtime: SpecRuntime, surface: Surface | null) {
+    this.#runtime = runtime;
+    this.#surface = surface;
+  }
+
+  on(surface: Surface): User {
+    return new UserChannel(this.#runtime, surface);
+  }
+
+  click(target: Target, options: ClickOptions = {}): Promise<void> {
+    return this.#click(target, 1, "click", options);
+  }
+
+  rightClick(target: Target, options: ClickOptions = {}): Promise<void> {
+    const surface = requireSurface(this.#surface);
+    const hitTestDetail = options.hitTest === false ? ", hitTest=false" : "";
+    return this.#runtime.call("user", "rightClick", `rightClick(${targetDetail(target)}${hitTestDetail})`, surface, async () => {
+      if (this.#runtime.adapters.user?.click) return this.#runtime.adapters.user.click(surface, target, 1);
+      await clickTarget(surface, target, { mustHitTest: options.hitTest !== false, button: "right" });
+    });
+  }
+
+  dblclick(target: Target): Promise<void> {
+    return this.#click(target, 2, "dblclick");
+  }
+
+  #click(target: Target, clickCount: number, verb: "click" | "dblclick", options: ClickOptions = {}): Promise<void> {
+    const surface = requireSurface(this.#surface);
+    const hitTestDetail = options.hitTest === false ? ", hitTest=false" : "";
+    return this.#runtime.call("user", verb, `${verb}(${targetDetail(target)}${hitTestDetail})`, surface, async () => {
+      if (this.#runtime.adapters.user?.click) return this.#runtime.adapters.user.click(surface, target, clickCount);
+      const clicked = await clickTarget(surface, target, { mustHitTest: options.hitTest !== false, clickCount });
+      this.#runtime.emit({ stage: this.#runtime.stage, channel: "user", verb: "target", detail: targetDetail(target), surface: surfaceName(surface), ok: true, target: clicked.rect });
+    });
+  }
+
+  type(target: Target, text: string, options: TypeOptions = {}): Promise<void> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("user", "type", typedTextDetail(target, text, options), surface, async () => {
+      if (options.typing) typingPlan(text, options.typing);
+      if (this.#runtime.adapters.user?.click) await this.#runtime.adapters.user.click(surface, target, 1);
+      else await clickTarget(surface, target);
+      if (options.sensitive) {
+        // A password input, or a multi-line secret field (pasted key files) masked with text-security.
+        const maskedFocus = () => callFunctionOnSurface(surface, () => {
+          const active = document.activeElement;
+          if (active instanceof HTMLInputElement) return active.type === 'password' ? 'masked' : `input:${active.type}`;
+          if (!(active instanceof HTMLTextAreaElement)) return active ? active.tagName.toLowerCase() : 'nothing';
+          const style = getComputedStyle(active);
+          const security = style.getPropertyValue('-webkit-text-security') || style.getPropertyValue('text-security');
+          return security && security !== 'none' ? 'masked' : `textarea:${security || 'unmasked'}`;
+        }, []);
+        let masked = await maskedFocus();
+        if (masked !== 'masked' && masked !== null && typeof masked === 'string' && !masked.startsWith('input:') && !masked.startsWith('textarea:')) {
+          // Focus moved (the page re-rendered under the click); click the target once more.
+          if (this.#runtime.adapters.user?.click) await this.#runtime.adapters.user.click(surface, target, 1);
+          else await clickTarget(surface, target);
+          masked = await maskedFocus();
+        }
+        if (masked !== 'masked') throw new Error(`Sensitive typing requires a masked password input (focused: ${String(masked)})`);
+      }
+      const mac = surface.handle.hostKind !== "daytona" && process.platform === "darwin";
+      await pressKey(surface, options.replace ? (mac ? "Meta+A" : "Control+A") : (mac ? "Meta+ArrowDown" : "Control+End"));
+      if (options.typing) {
+        await typeWithCadence(text, options.typing, (character) => typeText(surface, character));
+      } else if (options.intervalMs) {
+        for (const character of text) {
+          await typeText(surface, character);
+          await new Promise((resolve) => setTimeout(resolve, options.intervalMs));
+        }
+      } else {
+        await typeText(surface, text);
+      }
+      if (options.verify) {
+        // Do not serialize the expected value or the located field into errors.
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline) {
+          const found = await locate(surface, target);
+          if (found.value === text) return;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        throw new Error("Typed field did not retain the expected value");
+      }
+    });
+  }
+
+  press(key: string): Promise<void> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("user", "press", `press(${key})`, surface, () => pressKey(surface, key));
+  }
+
+  hover(target: Target): Promise<void> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("user", "hover", `hover(${targetDetail(target)})`, surface, async () => {
+      const found = await waitForLocated(surface, target, { mustHitTest: true });
+      await hoverAt(surface, found.center);
+    });
+  }
+
+  see(target: Target, options: SeeOptions = {}): Promise<void> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("user", "see", seeDetail(target, options), surface, async () => {
+      const timeoutMs = options.timeoutMs ?? 30_000;
+      const deadline = Date.now() + timeoutMs;
+      let found: Located | null = null;
+      while (Date.now() < deadline) {
+        try {
+          found = await locate(surface, target);
+          if (found.visible
+            && (options.editable === undefined || found.editable === options.editable)
+            && (options.value === undefined || found.value === options.value)
+            && (options.text === undefined || textMatches(found.text, options.text))) {
+            this.#runtime.noteSeen(surface, target);
+            return;
+          }
+        } catch {
+          found = null;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      throw new Error(`Timed out after ${timeoutMs}ms seeing ${targetDetail(target)}${found ? `; last state ${JSON.stringify(found)}` : ""}. On screen: ${await dumpScreenState(surface)}.`);
+    });
+  }
+
+  wheelAt(input: { x: number; y: number; deltaY: number; deltaX?: number }): Promise<void> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("user", "wheelAt", `scroll(${input.deltaX ?? 0}, ${input.deltaY}) at (${input.x}, ${input.y})`, surface, async () => {
+      const { x, y, deltaY, deltaX = 0 } = input;
+      if (![x, y, deltaX, deltaY].every(Number.isFinite)) throw new Error("Wheel coordinates and deltas must be finite");
+      await surface.client.send("Input.dispatchMouseEvent", { type: "mouseWheel", x, y, deltaX, deltaY });
+    });
+  }
+
+  notSee(target: Target, options: { timeoutMs?: number } = {}): Promise<void> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("user", "notSee", `notSee(${targetDetail(target)})`, surface, async () => {
+      await assertAbsent(surface, target, options.timeoutMs ?? 3_000);
+    });
+  }
+
+  reload(): Promise<void> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("user", "reload", "reload", surface, () => reload(surface));
+  }
+
+  resizeViewport(viewport: Viewport): Promise<void> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("user", "resizeViewport", `resizeViewport(${viewport.width}×${viewport.height}, scale=${viewport.deviceScaleFactor})`, surface,
+      () => setViewport(surface, viewport));
+  }
+
+  navigate(url: string): Promise<void> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("user", "navigate", `navigate(${new URL(url).pathname})`, surface, async () => {
+      if (surface.handle.kind !== "chrome") throw new Error("user.navigate() is available only on web surfaces.");
+      await navigate(surface.client, url);
+    });
+  }
+
+  screenshot() {
+    const surface = requireSurface(this.#surface);
+    const caption = this.#runtime.currentStepName();
+    return this.#runtime.call("user", "screenshot", "screenshot", surface, () =>
+      screenshot(surface, { caption, locateFocus: () => this.#runtime.locateSeen(surface) }));
+  }
+
+  checkpoint(caption?: string) {
+    return this.#runtime.checkpoint(this.#surface, caption);
+  }
+
+  looks(expectations: string[]): Promise<void> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("vision", "looks", `looks(${expectations.length} expectations)`, surface, async () => {
+      const artifact = await screenshot(surface);
+      const result = await validate(artifact, expectations);
+      const { expectVisualEvidence } = await import("@idexal/test-evidence/vitest");
+      expectVisualEvidence(result);
+    });
+  }
+}
+
+export class AgentChannel implements Agent {
+  readonly #runtime: SpecRuntime;
+  readonly #surface: Surface | null;
+
+  constructor(runtime: SpecRuntime, surface: Surface | null) {
+    this.#runtime = runtime;
+    this.#surface = surface;
+  }
+
+  on(surface: Surface): Agent {
+    return new AgentChannel(this.#runtime, surface);
+  }
+
+  browserTask(input: import("@idexal/behaviors").BrowserTaskInput) {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("agent", "browserTask", `browserTask(${input.operation}, session=${input.sessionId}, tab=${input.args?.tabId ?? "owned"})`, surface,
+      () => requestBrowserTask(surface, input));
+  }
+
+  run(action: string, args?: unknown): Promise<unknown> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("agent", "run", `run(${action})`, surface, async () => {
+      if (action.startsWith("composer.")) await waitForControlAction(surface, action);
+      else await waitForControlRail(surface, action);
+      return control(surface, action, args);
+    });
+  }
+
+  browserRequest(input: { url: string; method?: string; body?: string }): Promise<{ reached: boolean; error?: string }> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("agent", "browserRequest", `browserRequest(${input.method ?? "GET"} ${input.url})`, surface, async () => {
+      const handle = await callFunctionOnSurface(surface, async () => {
+        const browser = window.__IDEXAL_ELECTRON__.browser;
+        const state = await browser.getState();
+        const tab = state.tabs.find(tab => tab.id === state.activeTabId);
+        if (!tab?.ownerSessionId || !tab.url?.startsWith('http')) throw new Error('Select an owned website tab first');
+        return browser.openUrl(tab.url, 'builtin', { sessionId: tab.ownerSessionId });
+      }, [], { awaitPromise: true });
+      if (!isRecord(handle) || typeof handle.target_id !== "string") throw new Error("Browser did not return a target");
+      const target = (await listTargets(surface.handle.cdpUrl)).find((entry) => entry.id === handle.target_id);
+      if (!target) throw new Error("Browser target missing");
+      const client = await connect(debuggerUrlFor(surface.handle.cdpUrl, target));
+      try {
+        const result = await callFunction(client, async (encoded) => {
+          const input = JSON.parse(encoded);
+          try {
+            await fetch(input.url, { method: input.method ?? "GET", body: input.body, mode: "no-cors", cache: "no-store", signal: AbortSignal.timeout(20000) });
+            return { reached: true };
+          } catch (error) { return { reached: false, error: String(error) }; }
+        }, [JSON.stringify(input)], { awaitPromise: true, timeoutMs: 25000 });
+        if (!isRecord(result) || typeof result.reached !== "boolean") throw new Error("Invalid browser request result");
+        return { reached: result.reached, ...(typeof result.error === "string" ? { error: result.error } : {}) };
+      } finally { client.close(); }
+    });
+  }
+
+  desktopApi(path: string, input: { method: string; body?: unknown }): Promise<{ status: number; body: unknown }> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("agent", "desktopApi", `desktopApi(${input.method} ${path})`, surface, async () => {
+      if (!path.startsWith("/") || path.startsWith("//") || /[\\\s]/.test(path)) throw new Error("A root-relative server path is required.");
+      const value = await callFunctionOnSurface(surface, async (path, encodedInput) => {
+        const input = JSON.parse(encodedInput);
+        // Desktop: the bridge reports the embedded server. App in a browser:
+        // the app keeps the same address and token in localStorage.
+        const info = await window.__IDEXAL_ELECTRON__?.invokeDesktop?.("idexalOsServerInfo");
+        let baseUrl = info?.running && info.baseUrl ? String(info.baseUrl) : "";
+        let token = baseUrl ? String(info?.ownerToken ?? info?.clientToken ?? "") : "";
+        if (!baseUrl) {
+          const override = (localStorage.getItem("idexal-os.server.urlOverride") ?? "").trim();
+          const port = (localStorage.getItem("idexal-os.server.port") ?? "").trim();
+          baseUrl = override || (port ? "http://127.0.0.1:" + port : "");
+          token = (localStorage.getItem("idexal-os.server.token") ?? "").trim();
+        }
+        if (!baseUrl) return { status: 0, body: { error: "local_server_unavailable" } };
+        const response = await fetch(baseUrl.replace(/\/+$/, "") + path, {
+          method: input.method,
+          headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+          body: input.body === undefined ? undefined : JSON.stringify(input.body),
+          redirect: "error", signal: AbortSignal.timeout(30_000),
+        });
+        const text = await response.text();
+        let body = text;
+        try { body = JSON.parse(text); } catch {}
+        return { status: response.status, body };
+      }, [path, JSON.stringify(input)], { awaitPromise: true, timeoutMs: 35_000 }).catch(namePageFailure(`agent.desktopApi(${input.method} ${path})`));
+      if (!isRecord(value) || typeof value.status !== "number") throw new Error("Invalid desktop API result");
+      return { status: value.status, body: value.body };
+    });
+  }
+
+  async send(text: string): Promise<unknown> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("agent", "send", `send(${text.length} chars)`, surface, async () => {
+      await waitForControlAction(surface, "composer.set_text");
+      await control(surface, "composer.set_text", { text });
+      await waitForControlAction(surface, "composer.send");
+      return control(surface, "composer.send");
+    });
+  }
+
+  createSession(title?: string): Promise<string> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("agent", "createSession", `createSession(${title ? JSON.stringify(title) : ""})`, surface, async () => {
+      const result = await createSessionWhenReady(surface);
+      if (title) await control(surface, "session.rename", { sessionId: result, title });
+      return result;
+    });
+  }
+
+  list() {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("agent", "list", "listSessions", surface, () => listSessions(surface));
+  }
+
+  actions(): Promise<unknown> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("agent", "actions", "listActions", surface, async () => {
+      await waitForControlRail(surface, "listActions");
+      return evaluateOnSurface(surface, () => (window.__idexalOsControl.listActions()));
+    });
+  }
+}
+
+export class ProbeChannel implements Probe {
+  readonly #runtime: SpecRuntime;
+  readonly #surface: Surface | null;
+
+  constructor(runtime: SpecRuntime, surface: Surface | null) {
+    this.#runtime = runtime;
+    this.#surface = surface;
+  }
+
+  on(surface: Surface): Probe {
+    return new ProbeChannel(this.#runtime, surface);
+  }
+
+  zoom(): Promise<number> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("probe", "zoom", "zoom(Page.getLayoutMetrics)", surface, async () => {
+      const metrics = await surface.client.send("Page.getLayoutMetrics");
+      if (!isRecord(metrics) || !isRecord(metrics.cssVisualViewport)
+        || typeof metrics.cssVisualViewport.zoom !== "number"
+        || !Number.isFinite(metrics.cssVisualViewport.zoom) || metrics.cssVisualViewport.zoom <= 0) {
+        throw new Error("Chromium did not report its applied page zoom.");
+      }
+      return metrics.cssVisualViewport.zoom;
+    });
+  }
+
+  dom(selector: string) {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("probe", "dom", `dom(${JSON.stringify(redacted(selector))})`, surface, () => readDom(surface, selector));
+  }
+
+  browserState() {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("probe", "browserState", "browserState", surface, () => readBrowserState(surface));
+  }
+
+  browserTabMetrics(targetId: string) {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("probe", "browserTabMetrics", `browserTabMetrics(${targetId})`, surface, () => readBrowserTabMetrics(surface, targetId));
+  }
+
+  browserFixtureState(origin: string) {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("probe", "browserFixtureState", "browserFixtureState(GET /state)", surface, () => readBrowserFixtureState(surface, origin));
+  }
+
+  text(): Promise<string> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("probe", "text", "text", surface, async () => {
+      if (this.#runtime.adapters.probe?.text) return this.#runtime.adapters.probe.text(surface);
+      const value = await evaluateOnSurface(surface, () => (document.body.innerText));
+      if (typeof value !== "string") throw new Error("document.body.innerText was not a string.");
+      return value;
+    });
+  }
+
+  has(text: string): Promise<boolean> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("probe", "has", `has(${JSON.stringify(redacted(text))})`, surface, async () => {
+      const value = await callFunctionOnSurface(surface, (wanted) => document.body.innerText.includes(wanted), [text]);
+      if (typeof value !== "boolean") throw new Error("Text presence probe was not a boolean.");
+      return value;
+    });
+  }
+
+  composer() {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("probe", "composer", "composer", surface, () => readComposerState(surface));
+  }
+
+  connectorCatalog() {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("probe", "connectorCatalog", "connectorCatalog", surface, () => readConnectorCatalog(surface));
+  }
+
+  credentialInputState(selector: string, candidate = ""): Promise<CredentialInputState> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("probe", "credentialInputState", "credentialInputState(<masked>)", surface, async () => {
+      const value = await callFunctionOnSurface(surface, (selector, candidate) => {
+        const input = document.querySelector<HTMLInputElement>(selector);
+        const dialog = input?.closest('[role="dialog"]');
+        const storageValues = (storage: Storage) => Array.from({ length: storage.length }, (_, index) => {
+          const key = storage.key(index);
+          return key ? `${key}:${storage.getItem(key) ?? ""}` : "";
+        });
+        const contains = (text: string) => candidate.length > 0 && text.includes(candidate);
+        return {
+          dialogPresent: Boolean(dialog),
+          dialogExcludedFromCapture: dialog?.hasAttribute("data-ph-no-capture") === true,
+          inputExcludedFromCapture: input?.hasAttribute("data-ph-no-capture") === true,
+          inputType: input?.type ?? null,
+          autoComplete: input?.getAttribute("autocomplete") ?? null,
+          empty: input?.value === "",
+          inputContainsSecret: candidate.length > 0 && input?.value === candidate,
+          bodyContainsSecret: contains(document.body?.innerText ?? ""),
+          urlContainsSecret: [location.href, ...performance.getEntriesByType("resource").map(entry => entry.name)].some(contains),
+          historyContainsSecret: contains(JSON.stringify(history.state) ?? ""),
+          storageContainsSecret: [...storageValues(localStorage), ...storageValues(sessionStorage)].some(contains),
+          consoleContainsSecret: contains(JSON.stringify(Reflect.get(window, "__nativeProofConsole") ?? []) ?? ""),
+        };
+      }, [selector, candidate]);
+      if (!value || Object.values(value).some(field => typeof field !== "boolean" && typeof field !== "string" && field !== null)) {
+        throw new Error("Credential input probe returned an invalid masked projection.");
+      }
+      return value;
+    });
+  }
+
+  storage(key: string): Promise<unknown>;
+  storage<T>(key: string, pick: (value: unknown) => T): Promise<T>;
+  async storage<T>(key: string, pick?: (value: unknown) => T): Promise<unknown> {
+    const surface = requireSurface(this.#surface);
+    const value = await this.#runtime.call("probe", "storage", `storage(${key})`, surface, async () => {
+      const raw = await callFunctionOnSurface(surface, (storageKey) => localStorage.getItem(storageKey), [key]);
+      if (raw === null || raw === undefined || raw === "") return null;
+      if (typeof raw !== "string") throw new Error(`localStorage ${JSON.stringify(key)} was not a string.`);
+      try {
+        const parsed: unknown = JSON.parse(raw);
+        return parsed;
+      } catch {
+        return raw;
+      }
+    });
+    return pick ? pick(value) : value;
+  }
+
+  /** The page address, as shown in the browser's address bar. */
+  url(): Promise<string> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("probe", "url", "url", surface, async () => {
+      const value = await evaluateOnSurface(surface, () => window.location.href);
+      if (typeof value !== "string") throw new Error("location.href was not a string.");
+      return value;
+    });
+  }
+
+  /**
+   * What a person can read or copy from visible links and read-only fields
+   * matching `selector`: each link's destination and each field's shown text.
+   * Password and editable fields are never read.
+   */
+  linkTargets(selector: string): Promise<string[]> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("probe", "linkTargets", `linkTargets(${JSON.stringify(redacted(selector))})`, surface, async () => {
+      const values = await callFunctionOnSurface(surface, (input: string) => Array.from(document.querySelectorAll(input)).flatMap((element) => {
+        const box = element.getBoundingClientRect();
+        if (box.width === 0 || box.height === 0) return [];
+        if (element instanceof HTMLAnchorElement) return [element.href];
+        if (element instanceof HTMLInputElement && element.readOnly && element.type !== "password") return [element.value];
+        return [];
+      }), [selector]);
+      if (!Array.isArray(values) || !values.every((value) => typeof value === "string")) throw new Error("linkTargets returned an invalid list.");
+      return values;
+    });
+  }
+
+  hash(): Promise<string> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("probe", "hash", "hash", surface, async () => {
+      // The desktop routes by hash. The app in a browser routes by path, so its
+      // route is reported in the same "#/workspace/..." form.
+      const value = await evaluateOnSurface(surface, () => (
+        window.location.hash || (window.__IDEXAL_ELECTRON__ || window.location.pathname === "/" ? "" : `#${window.location.pathname}`)
+      ));
+      if (typeof value !== "string") throw new Error("window.location.hash was not a string.");
+      return value;
+    });
+  }
+
+  eval<T>(expression: BrowserEvaluation<T>, options?: ProbeEvalOptions): Promise<Awaited<T>>;
+  eval<T>(surface: Surface, expression: BrowserEvaluation<T>, options?: ProbeEvalOptions): Promise<Awaited<T>>;
+  eval<T>(surfaceOrExpression: Surface | BrowserEvaluation<T>, expressionOrOptions?: BrowserEvaluation<T> | ProbeEvalOptions, explicitOptions: ProbeEvalOptions = {}): Promise<Awaited<T>> {
+    const bound = typeof surfaceOrExpression === "function" || "callback" in surfaceOrExpression;
+    const surface = bound ? requireSurface(this.#surface) : surfaceOrExpression;
+    const expression = bound ? surfaceOrExpression : expressionOrOptions;
+    if (!expression || !(typeof expression === "function" || "callback" in expression)) throw new Error("probe.eval requires a browser callback");
+    const options = bound && expressionOrOptions && typeof expressionOrOptions !== "function" && !("callback" in expressionOrOptions)
+      ? expressionOrOptions : explicitOptions;
+    return this.#runtime.call("probe:raw", "eval", "[probe:raw] eval(<callback>)", surface,
+      () => evalIn(surface, expression, options));
+  }
+
+  connectState(app: Surface) {
+    return this.#runtime.call("probe", "connectState", "connectState", app, () => readConnectState(app));
+  }
+
+  api(session: import("@idexal/behaviors").DenSession, path: string, init: RequestInit = {}) {
+    const method = init.method?.toUpperCase() ?? "GET";
+    return this.#runtime.call("probe", "api", `api(GET ${path})`, null, () => {
+      if (method !== "GET") throw new Error(`probe.api is read-only; ${method} is not allowed.`);
+      const headers = new Headers(init.headers);
+      headers.set("authorization", `Bearer ${session.token}`);
+      return denFetch(session, path, { ...init, method: "GET", headers });
+    });
+  }
+
+  desktopApi(path: string): Promise<{ status: number; body: unknown }> {
+    const surface = requireSurface(this.#surface);
+    return this.#runtime.call("probe", "desktopApi", `desktopApi(GET ${path})`, surface, async () => {
+      if (!path.startsWith("/") || path.startsWith("//") || /[\\\s]/.test(path)) {
+        throw new Error("probe.desktopApi requires a root-relative server path.");
+      }
+      const value = await callFunctionOnSurface(surface, async (path) => {
+        // Desktop: the bridge reports the embedded server. App in a browser:
+        // the app keeps the same address and token in localStorage.
+        const info = await window.__IDEXAL_ELECTRON__?.invokeDesktop?.("idexalOsServerInfo");
+        let baseUrl = info?.running && info.baseUrl ? String(info.baseUrl) : "";
+        let token = baseUrl ? String(info?.ownerToken ?? info?.clientToken ?? "") : "";
+        if (!baseUrl) {
+          const override = (localStorage.getItem("idexal-os.server.urlOverride") ?? "").trim();
+          const port = (localStorage.getItem("idexal-os.server.port") ?? "").trim();
+          baseUrl = override || (port ? "http://127.0.0.1:" + port : "");
+          token = (localStorage.getItem("idexal-os.server.token") ?? "").trim();
+        }
+        if (!baseUrl) return { status: 0, body: { error: "local_server_unavailable" } };
+        const response = await fetch(baseUrl.replace(/\/+$/, "") + path, {
+          method: "GET",
+          headers: { Authorization: "Bearer " + token },
+          redirect: "error",
+          signal: AbortSignal.timeout(15_000),
+        });
+        const text = await response.text();
+        let body = text;
+        try { body = text ? JSON.parse(text) : null; } catch {}
+        return { status: response.status, body };
+      }, [path], { awaitPromise: true, timeoutMs: 20_000 }).catch(namePageFailure(`probe.desktopApi(GET ${path})`));
+      if (!isRecord(value) || typeof value.status !== "number" || !("body" in value)) {
+        throw new Error("Invalid desktop API probe response.");
+      }
+      return { status: value.status, body: value.body };
+    });
+  }
+
+  toolCalls(mock: import("@idexal/env").MockHandle, options: Parameters<import("@idexal/env").MockHandle["toolCalls"]>[0] = {}) {
+    return this.#runtime.call("probe", "toolCalls", `toolCalls(${options.name ?? "any"})`, null, () => mock.toolCalls(options));
+  }
+
+  eventually<T>(fn: () => Promise<T> | T, options: import("@idexal/env").EventuallyOptions<T>): Promise<T> {
+    return this.#runtime.call("probe", "eventually", `eventually(${options.label ?? "condition"})`, null, () => eventually(fn, options));
+  }
+}
+
+export function channels(runtime: SpecRuntime): { seed: Seed; user: User; agent: Agent; probe: Probe; step: Step } {
+  return {
+    seed: new SeedChannel(runtime),
+    user: new UserChannel(runtime, runtime.primary),
+    agent: new AgentChannel(runtime, runtime.primary),
+    probe: new ProbeChannel(runtime, runtime.primary),
+    step: runtime.step,
+  };
+}
+
+export async function registerWorldDisposable(stack: AsyncDisposableStack, world: unknown): Promise<void> {
+  if (isAsyncDisposable(world) && !isSurface(world)) {
+    if (stack.disposed) await world[Symbol.asyncDispose]();
+    else stack.use(world);
+  }
+}

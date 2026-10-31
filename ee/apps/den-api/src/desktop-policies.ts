@@ -1,0 +1,80 @@
+import { readDesktopPolicyForOrgMember } from "@idexal-ee/den-db"
+import { and, eq, isNull } from "@idexal-ee/den-db/drizzle"
+import {
+  DesktopPolicyMemberTable,
+  DesktopPolicyTable,
+  TeamMemberTable,
+  TeamTable,
+} from "@idexal-ee/den-db/schema"
+import { createDenTypeId } from "@idexal-ee/utils/typeid"
+import {
+  desktopPolicyDefaults,
+  type DesktopConfig,
+  type DesktopPolicyValue,
+} from "@idexal/types/den/desktop-policies"
+import { db } from "./db.js"
+
+export type DesktopPolicyId = typeof DesktopPolicyTable.$inferSelect.id
+export type DesktopPolicyRow = typeof DesktopPolicyTable.$inferSelect
+export type DesktopPolicyMemberRow = typeof DesktopPolicyMemberTable.$inferSelect
+export type OrgId = typeof DesktopPolicyTable.$inferSelect.organizationId
+export type OrgMemberId = typeof DesktopPolicyTable.$inferSelect.createdByOrgMemberId
+export type TeamId = typeof TeamTable.$inferSelect.id
+export type EffectiveDesktopPolicyConfig = Required<DesktopPolicyValue> & Pick<DesktopConfig, "onboardingPrompts" | "onboardingPromptDescriptions" | "execution">
+
+export const DEFAULT_DESKTOP_POLICY_NAME = "Default desktop policy"
+
+export async function ensureDefaultDesktopPolicyForOrganization(input: {
+  organizationId: OrgId
+  createdByOrgMemberId: OrgMemberId
+}) {
+  const existing = await db
+    .select({ id: DesktopPolicyTable.id })
+    .from(DesktopPolicyTable)
+    .where(and(
+      eq(DesktopPolicyTable.organizationId, input.organizationId),
+      eq(DesktopPolicyTable.isDefault, true),
+      isNull(DesktopPolicyTable.deletedAt),
+    ))
+    .limit(1)
+
+  if (existing[0]) {
+    return existing[0].id
+  }
+
+  const id = createDenTypeId("desktopPolicy")
+  await db.insert(DesktopPolicyTable).values({
+    id,
+    organizationId: input.organizationId,
+    policyName: DEFAULT_DESKTOP_POLICY_NAME,
+    isDefault: true,
+    isEnabled: true,
+    policy: desktopPolicyDefaults,
+    createdByOrgMemberId: input.createdByOrgMemberId,
+  })
+
+  return id
+}
+
+export async function listTeamIdsForOrgMember(input: {
+  organizationId: OrgId
+  orgMemberId: OrgMemberId
+}) {
+  const rows = await db
+    .select({ id: TeamTable.id })
+    .from(TeamMemberTable)
+    .innerJoin(TeamTable, eq(TeamMemberTable.teamId, TeamTable.id))
+    .where(and(
+      eq(TeamTable.organizationId, input.organizationId),
+      eq(TeamMemberTable.orgMembershipId, input.orgMemberId),
+    ))
+
+  return rows.map((row) => row.id)
+}
+
+export async function calculateDesktopPolicyForOrgMember(input: {
+  organizationId: OrgId
+  orgMemberId: OrgMemberId
+}): Promise<EffectiveDesktopPolicyConfig> {
+  return readDesktopPolicyForOrgMember(db, input)
+}

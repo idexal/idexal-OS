@@ -1,0 +1,1 @@
+ALTER TABLE `scim_group_member` MODIFY COLUMN `remote_user_id` varchar(191);

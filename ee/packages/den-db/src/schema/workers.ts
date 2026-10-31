@@ -1,0 +1,148 @@
+import { bigint, char, index, json, mysqlEnum, mysqlTable, timestamp, uniqueIndex, varchar } from "drizzle-orm/mysql-core"
+import { compatJsonColumn, denTypeIdColumn, timestamps } from "../columns"
+import type { AuditEventEnvelope } from "../audit-log"
+
+export const WorkerDestination = ["local", "cloud"] as const
+export const WorkerStatus = ["provisioning", "healthy", "failed", "stopped"] as const
+export const TokenScope = ["client", "host", "activity"] as const
+
+export const WorkerTable = mysqlTable(
+  "worker",
+  {
+    id: denTypeIdColumn("worker", "id").notNull().primaryKey(),
+    org_id: denTypeIdColumn("org", "org_id").notNull(),
+    created_by_user_id: denTypeIdColumn("user", "created_by_user_id"),
+    name: varchar("name", { length: 255 }).notNull(),
+    description: varchar("description", { length: 1024 }),
+    destination: mysqlEnum("destination", WorkerDestination).notNull(),
+    status: mysqlEnum("status", WorkerStatus).notNull(),
+    image_version: varchar("image_version", { length: 128 }),
+    workspace_path: varchar("workspace_path", { length: 1024 }),
+    sandbox_backend: varchar("sandbox_backend", { length: 64 }),
+    cloud_failure_code: varchar("cloud_failure_code", { length: 64 }),
+    cloud_failure_stage: varchar("cloud_failure_stage", { length: 32 }),
+    cloud_failure_reference: varchar("cloud_failure_reference", { length: 64 }),
+    cloud_failure_at: timestamp("cloud_failure_at", { fsp: 3 }),
+    last_heartbeat_at: timestamp("last_heartbeat_at", { fsp: 3 }),
+    last_active_at: timestamp("last_active_at", { fsp: 3 }),
+    ...timestamps,
+  },
+  (table) => [
+    index("worker_org_id").on(table.org_id),
+    index("worker_created_by_user_id").on(table.created_by_user_id),
+    index("worker_status").on(table.status),
+    index("worker_last_heartbeat_at").on(table.last_heartbeat_at),
+    index("worker_last_active_at").on(table.last_active_at),
+    index("worker_claimable_updated").on(table.destination, table.sandbox_backend, table.status, table.updated_at),
+  ],
+)
+
+export const WorkerInstanceTable = mysqlTable(
+  "worker_instance",
+  {
+    id: denTypeIdColumn("workerInstance", "id").notNull().primaryKey(),
+    worker_id: denTypeIdColumn("worker", "worker_id").notNull(),
+    provider: varchar("provider", { length: 64 }).notNull(),
+    region: varchar("region", { length: 64 }),
+    url: varchar("url", { length: 2048 }).notNull(),
+    status: mysqlEnum("status", WorkerStatus).notNull(),
+    ...timestamps,
+  },
+  (table) => [index("worker_instance_worker_id").on(table.worker_id)],
+)
+
+export const DaytonaSandboxTable = mysqlTable(
+  "daytona_sandbox",
+  {
+    id: denTypeIdColumn("daytonaSandbox", "id").notNull().primaryKey(),
+    worker_id: denTypeIdColumn("worker", "worker_id").notNull(),
+    sandbox_id: varchar("sandbox_id", { length: 128 }).notNull(),
+    workspace_volume_id: varchar("workspace_volume_id", { length: 128 }).notNull(),
+    data_volume_id: varchar("data_volume_id", { length: 128 }).notNull(),
+    signed_preview_url: varchar("signed_preview_url", { length: 2048 }).notNull(),
+    signed_preview_url_expires_at: timestamp("signed_preview_url_expires_at", { fsp: 3 }).notNull(),
+    region: varchar("region", { length: 64 }),
+    ...timestamps,
+  },
+  (table) => [
+    uniqueIndex("daytona_sandbox_worker_id").on(table.worker_id),
+    uniqueIndex("daytona_sandbox_sandbox_id").on(table.sandbox_id),
+  ],
+)
+
+/**
+ * Provider-neutral record of the host instance behind a Cloud worker. The
+ * provider reference is opaque JSON owned by the provider that created it.
+ * `daytona_sandbox` stays dual-written until every deployment reads from here.
+ */
+export const CloudRuntimeInstanceTable = mysqlTable(
+  "cloud_runtime_instance",
+  {
+    id: denTypeIdColumn("cloudRuntimeInstance", "id").notNull().primaryKey(),
+    worker_id: denTypeIdColumn("worker", "worker_id").notNull(),
+    provider_id: varchar("provider_id", { length: 64 }).notNull(),
+    provider_ref: json("provider_ref").$type<Record<string, string>>().notNull(),
+    workspace_volume_id: varchar("workspace_volume_id", { length: 128 }).notNull(),
+    data_volume_id: varchar("data_volume_id", { length: 128 }).notNull(),
+    endpoint_url: varchar("endpoint_url", { length: 2048 }).notNull(),
+    endpoint_expires_at: timestamp("endpoint_expires_at", { fsp: 3 }).notNull(),
+    endpoint_kind: varchar("endpoint_kind", { length: 32 }).notNull(),
+    region: varchar("region", { length: 64 }),
+    ...timestamps,
+  },
+  (table) => [
+    uniqueIndex("cloud_runtime_instance_worker_id").on(table.worker_id),
+    index("cloud_runtime_instance_provider").on(table.provider_id),
+  ],
+)
+
+export const WorkerTokenTable = mysqlTable(
+  "worker_token",
+  {
+    id: denTypeIdColumn("workerToken", "id").notNull().primaryKey(),
+    worker_id: denTypeIdColumn("worker", "worker_id").notNull(),
+    scope: mysqlEnum("scope", TokenScope).notNull(),
+    token: varchar("token", { length: 128 }).notNull(),
+    created_at: timestamps.created_at,
+    revoked_at: timestamp("revoked_at", { fsp: 3 }),
+  },
+  (table) => [index("worker_token_worker_id").on(table.worker_id), uniqueIndex("worker_token_token").on(table.token)],
+)
+
+export const WorkerBundleTable = mysqlTable(
+  "worker_bundle",
+  {
+    id: denTypeIdColumn("workerBundle", "id").notNull().primaryKey(),
+    worker_id: denTypeIdColumn("worker", "worker_id").notNull(),
+    storage_url: varchar("storage_url", { length: 2048 }).notNull(),
+    status: varchar("status", { length: 64 }).notNull(),
+    created_at: timestamps.created_at,
+  },
+  (table) => [index("worker_bundle_worker_id").on(table.worker_id)],
+)
+
+export const AuditEventTable = mysqlTable(
+  "audit_event",
+  {
+    id: denTypeIdColumn("auditEvent", "id").notNull().primaryKey(),
+    org_id: denTypeIdColumn("org", "org_id").notNull(),
+    worker_id: denTypeIdColumn("worker", "worker_id"),
+    actor_user_id: denTypeIdColumn("user", "actor_user_id"),
+    action: varchar("action", { length: 128 }).notNull(),
+    payload: json("payload"),
+    operation_id: denTypeIdColumn("auditOperation", "operation_id"),
+    sequence: bigint("sequence", { mode: "number", unsigned: true }),
+    envelope: compatJsonColumn<AuditEventEnvelope>("envelope"),
+    logical_bytes: bigint("logical_bytes", { mode: "number", unsigned: true }),
+    idempotency_key: char("idempotency_key", { length: 64 }),
+    content_hash: char("content_hash", { length: 64 }),
+    created_at: timestamps.created_at,
+  },
+  (table) => [
+    index("audit_event_org_id").on(table.org_id),
+    index("audit_event_worker_id").on(table.worker_id),
+    uniqueIndex("audit_event_org_sequence").on(table.org_id, table.sequence),
+    uniqueIndex("audit_event_idempotency").on(table.org_id, table.operation_id, table.idempotency_key),
+    index("audit_event_operation_sequence").on(table.org_id, table.operation_id, table.sequence),
+  ],
+)
