@@ -72,7 +72,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@hyzyla/pdfium": "2.1.13",
+    "@hyzyla/pdfium": "3.0.0",
     "@idexal/paths": "workspace:*",
     "@idexal/workbook": "workspace:*",
     "@types/better-sqlite3": "^7.6.13",
